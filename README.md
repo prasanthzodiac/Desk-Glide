@@ -163,6 +163,8 @@ Move the pointer off the screen edge toward the other PC (the Layout card says w
 
 The **microphone** is the default microphone of the PC with the headphones. On the other PC, DeskGlide plays it into **CABLE Input**; choose **CABLE Output** as the microphone in Teams, Zoom, Discord and so on. VB-Cable's license doesn't allow DeskGlide to include or download it, so install it yourself from [vb-audio.com/Cable](https://vb-audio.com/Cable/) (it needs a restart).
 
+VB-Cable's installer may make **CABLE Input** that PC's default speaker. Then its sound goes nowhere and the microphone comes back as its sound; DeskGlide's Sound card says so on both PCs. Set the real speakers as the default again (Win+R, `mmsys.cpl`, Playback, Set Default). Sound and microphone use one UDP port (6990) both ways, with a keepalive, so they also work when one PC's firewall blocks connections in.
+
 ### Copy and paste files
 
 Copy files or folders in Explorer, move the mouse to the other PC, press **Ctrl+V**. DeskGlide pulls them when the mouse arrives, saves them in `Downloads\DeskGlide` (an existing name gets ` (2)`), and puts them on that PC's clipboard. A notification says when they're ready. Text and pictures work the same way with keyboard and mouse sharing on (Synergy copies them when it is off). Only one of the two PCs needs to accept connections: if a firewall you can't change blocks them on one PC (a company laptop, say), that PC connects out to the other instead.

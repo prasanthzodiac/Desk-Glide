@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.3.2'
+$Version = '5.3.3'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = 'prasanthzodiac/Desk-Glide'   # 'owner/repo' on GitHub for auto-update (its latest release); empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -198,7 +198,8 @@ function Merge-Settings($cfg, $m) {
 # its time and the PC it showed), fo (files copied here: { id; n = how many; b = bytes; names }), mc (microphone mode) and
 # vc (VB-Cable is installed here). DeskGlide 5 adds lk (DeskGlide Link on), ls (lock both PCs together) and co (text or a
 # picture copied here: { id; k = 'text' or 'png'; b = bytes }). DeskGlide 5.2 adds as (admin control: this PC's service
-# receives the keyboard and mouse) and, in their own messages, adm (pairing that service: offer, answer, done).
+# receives the keyboard and mouse) and, in their own messages, adm (pairing that service: offer, answer, done). 5.3 adds,
+# in their own messages, rv (connect out to here for a transfer); 5.3.3 adds oc (VB-Cable is this PC's default speaker).
 function State-Json($cfg) {
   @{ n = $Name; t = $S.t; s = $S.server; sa = ($S.active -eq 'me'); i = (My-Input); h = ($cfg.hp -eq $Name)
      m = $cfg.monitor; am = $cfg.audio; p = $cfg.paused; st = $cfg.syncAt; hp = $cfg.hp; v = $cfg.vol; ly = $cfg.layout
@@ -206,7 +207,7 @@ function State-Json($cfg) {
      ver = $Proto; sn = $S.screen; kh = $cfg.kmHost; mi = $cfg.inputs; mo = @($cfg.monOff)
      hk = $(if ((Now-Ms) - [long]$S.hk -lt 10000) { $S.hk } else { 0 }); ha = $S.hkTo
      fo = $(if ($cfg.files) { $S.offer } else { $null }); mc = $cfg.mic; vc = ($S.cable -ge 0)
-     lk = [bool]$cfg.link; ls = [bool]$cfg.lockSync; co = $S.clipOffer; as = (Svc-On $S.svc) } | ConvertTo-Json -Compress -Depth 4
+     lk = [bool]$cfg.link; ls = [bool]$cfg.lockSync; co = $S.clipOffer; as = (Svc-On $S.svc); oc = [bool]$S.outCable } | ConvertTo-Json -Compress -Depth 4
 }
 # The notice for files on the clipboard: small, so it fits in the state message; the names are only for the window
 function File-Offer([string]$id, [string[]]$paths, [long]$bytes) {
@@ -293,6 +294,14 @@ function Edge-Links([string]$server, [string]$client, [string]$dir) {
   "section: links`n`t${server}:`n`t`t$dir = $client`n`t${client}:`n`t`t$($opp[$dir]) = $server`nend`n"
 }
 # Why sound is or isn't playing, in plain words.
+# VB-Cable as a PC's default speaker (its installer may set that): that PC's sound goes nowhere, and the microphone played
+# into CABLE Input there comes back as its sound. Said before anything else in the Sound card, for this PC or the other.
+function Out-Warning([bool]$here, [string]$name, [bool]$there, [string]$peer, [string]$audio) {
+  if ($audio -eq 'off') { return '' }
+  if ($here) { return "Windows plays this PC's sound into $name, so nobody hears it. Set your real speakers as the default in Sound settings (Win+R, mmsys.cpl, Playback). CABLE Input is only for the microphone." }
+  if ($there) { return "$peer plays its sound into VB-Cable (CABLE Input is its default speaker), so you hear nothing from it. On $peer, set the real speakers as the default in Sound settings (Win+R, mmsys.cpl, Playback)." }
+  ''
+}
 function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active, [int]$peerVer = 4) {
   $peer = $cfg.peer
   if (-not $paired) { return 'Off: pair with your other PC first.' }
@@ -415,7 +424,7 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         code = ''; myAddrs = ''; pairStart = Get-Date; pairErr = ''; addrErr = ''; unpairAt = $null; volAt = $null
         wiz = 0; wizDone = $false; iconState = 3; dark = $null; shownAt = $null
         peerVer = 0; peerScreen = ''; upd = $null; newer = $null; updMsg = ''; startedAt = Get-Date
-        cable = -1; cableAt = [DateTime]::MinValue; peerCable = $false
+        cable = -1; cableAt = [DateTime]::MinValue; peerCable = $false; outName = ''; outCable = $false; peerOutCable = $false
         offer = $null; peerOffer = $null; fetchedId = ''; pasted = ''; fileMsg = ''; fileErr = $false; fileSaved = @()
         hk = [long]0; hkTo = ''; hkSeen = [long]0; lastSa = $null; hkSig = ''; hkErr = ''; msgWin = $null
         mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{}
@@ -502,6 +511,19 @@ if ($Test) {
   $q.hp = 'PC-B'; Check ((Audio-Status $q $true $true 'me') -match 'headphones on PC-B') 'status: sending'
   $q.audio = 'off'; Check ((Audio-Status $q $true $true 'me') -match '^Off\.') 'reason: audio off'
   $q.paused = $true; Check ((Audio-Status $q $true $true 'me') -match 'paused') 'reason: paused'
+  # VB-Cable as the default speaker (its installer may set it): said first, here or on the other PC
+  Check ([Dg]::IsVirtualCable('CABLE Input (VB-Audio Virtual Cable)') -and [Dg]::IsVirtualCable('CABLE In 16ch (VB-Audio Virtual Cable)') -and -not [Dg]::IsVirtualCable('Speakers (Senary Audio)') -and -not [Dg]::IsVirtualCable('')) 'VB-Cable recognised as a speaker'
+  Check ((Out-Warning $true 'CABLE Input (VB-Audio Virtual Cable)' $false 'PC-B' 'follow') -match "this PC's sound into CABLE Input" -and (Out-Warning $false '' $true 'PC-B' 'both') -match '^PC-B plays its sound into VB-Cable' -and (Out-Warning $true 'x' $true 'PC-B' 'off') -eq '' -and (Out-Warning $false '' $false 'PC-B' 'follow') -eq '') 'VB-Cable speaker warning: here, there, not when sound is off'
+  $S.outCable = $true; Check ((Msg $PA 'PC-A').oc -eq $true) 'VB-Cable speaker flag sent'; $S.outCable = $false
+  # audio: one socket on the audio port both ways, so a firewall that blocks the port lets the other PC's answer in;
+  # while receiving, a keepalive from that port keeps it open; arriving keepalives aren't counted as bad packets
+  $ap = 47700 + $PID % 200; $pu = New-Object Net.Sockets.UdpClient(0); $pu.Client.ReceiveTimeout = 3000
+  [Dg]::Key = [Dg]::DeriveKey('abcd-efgh'); [Dg]::Target = New-Object Net.IPEndPoint([Net.IPAddress]::Loopback, $pu.Client.LocalEndPoint.Port); [Dg]::RecvMode = [Dg]::Sound; [Dg]::StartAudio($ap)
+  $ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0); $ka = $null; try { $ka = $pu.Receive([ref]$ep) } catch {}
+  Check ($ka -and [Text.Encoding]::ASCII.GetString($ka) -eq 'DGKA' -and $ep.Port -eq $ap) "audio keepalive sent from the audio port itself: $($ep.Port)"
+  $bad = [Dg]::Bad; [void]$pu.Send($ka, $ka.Length, '127.0.0.1', $ap); Start-Sleep -Milliseconds 300
+  Check ([Dg]::Bad -eq $bad) 'audio keepalive ignored on arrival, not counted as bad'
+  [Dg]::RecvMode = 0; [Dg]::Target = $null; [Dg]::Key = $null; $pu.Close()
 
   Check ((Parse-Address ' 192.168.1.20 ') -eq '192.168.1.20' -and (Parse-Address '100.101.5.7 (Tailscale)') -eq '100.101.5.7') 'address: IPv4'
   Check ((Parse-Address 'LAPTOP') -eq 'LAPTOP' -and (Parse-Address 'pc.tail1234.ts.net') -eq 'pc.tail1234.ts.net') 'address: names'
@@ -1171,7 +1193,7 @@ function Receive-Control {
     $S.peerAddr = $ep.Address; $S.peerSeen = Get-Date; $S.peerInput = [int]$m.i
     if ($null -ne $m.as -and [bool]$m.as -ne [bool]$C.peerAdmin) { $C.peerAdmin = [bool]$m.as; Save-Config }   # kept: the sign-in screen sends nothing
     $S.peerVer = [int]$m.ver; $S.peerScreen = if ($m.sn) { [string]$m.sn } else { [string]$m.n }
-    $S.peerInputs = To-Hash $m.mi; $S.peerOffer = $m.fo; $S.peerCable = [bool]$m.vc; $S.peerClip = $m.co
+    $S.peerInputs = To-Hash $m.mi; $S.peerOffer = $m.fo; $S.peerCable = [bool]$m.vc; $S.peerClip = $m.co; $S.peerOutCable = [bool]$m.oc
     # remember the address for the next start; only replace it once it went quiet, so a peer on two adapters doesn't flip-flop
     if ($S.fixedIp -and $S.fixedIp.Equals($ep.Address)) { $S.fixedSeen = Get-Date }
     elseif (((Get-Date) - $S.fixedSeen).TotalSeconds -gt 10) { $C.peerAddress = "$($ep.Address)"; $S.fixedIp = $ep.Address; $S.fixedSeen = Get-Date; Save-Config }
@@ -1563,7 +1585,11 @@ function Tick {
   }
 
   # audio: the PC with the headphones receives the other PC's sound and sends its microphone; the other PC the opposite
-  if (($now - $S.cableAt).TotalSeconds -ge 30) { $S.cableAt = $now; $S.cable = [Dg]::FindOutput('CABLE Input') }
+  if (($now - $S.cableAt).TotalSeconds -ge 30) {
+    $S.cableAt = $now; $S.cable = [Dg]::FindOutput('CABLE Input')
+    $was = $S.outCable; $S.outName = [Dg]::DefaultOutputName(); $S.outCable = [Dg]::IsVirtualCable($S.outName)
+    if ($S.outCable -and -not $was) { Say (Out-Warning $true $S.outName $false '' 'follow') error }
+  }
   $a = Audio-Modes $C $online $S.active $S.peerVer $S.peerCable $S.cable
   [Dg]::Key = $S.key
   [Dg]::Target = if ($S.peerAddr) { New-Object Net.IPEndPoint($S.peerAddr, $AudioPort) } else { $null }
@@ -2307,7 +2333,8 @@ function Update-Ui {
   $ui.VolLabel.Text = "Volume of $sender"
   if (-not $S.volAt -and $ui.Vol.Value -ne $C.vol) { $ui.Vol.Value = $C.vol }
   $ui.VolPct.Text = "$($C.vol)%"
-  $ui.AudioWhy.Text = Audio-Status $C $paired $online $S.active $S.peerVer
+  $w = Out-Warning $S.outCable $S.outName ($online -and $S.peerOutCable) (Peer-Label) $C.audio
+  $ui.AudioWhy.Text = if ($w) { $w } else { Audio-Status $C $paired $online $S.active $S.peerVer }
   $ui.AudioDot.Fill = Brush $(if ([Dg]::SendMode -eq [Dg]::Sound -or [Dg]::RecvMode -eq [Dg]::Sound) { 'Good' } else { 'Fg2' })
 
   # update (footer)

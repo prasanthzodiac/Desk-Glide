@@ -576,15 +576,31 @@ public static class Dg {
     while (true) {
       try {
         if (SendMode != capMode) StopCapture();   // switched between sound and microphone
-        if (SendMode != 0) { if (udp == null) udp = new UdpClient(); Sent += PumpSend(100); } else Thread.Sleep(100);
+        if (SendMode != 0 && udp != null) Sent += PumpSend(100); else Thread.Sleep(100);
       } catch (Exception e) { LastError = e.Message; Thread.Sleep(1000); }
     }
   }
+  // One socket on the audio port sends and receives: what comes back from the other PC's audio port then answers what this
+  // PC sent there, so a firewall that blocks the port (a company laptop's) lets it in. While receiving, a 4-byte keepalive
+  // each second keeps that open even when this PC has nothing to send (no sound playing, loopback sends nothing).
+  static readonly byte[] KeepAlive = { (byte)'D', (byte)'G', (byte)'K', (byte)'A' };
   static void RecvLoop(int port) {
+    int kaAt = Environment.TickCount - 1000;
     while (true) {
       try {
-        if (RecvMode != 0) { if (rx == null) { rx = new UdpClient(port); rx.Client.ReceiveTimeout = 20; } Got += PumpReceive(100); }
-        else { CloseOut(); if (rx != null) { rx.Close(); rx = null; } Thread.Sleep(100); }
+        if (rx == null) {
+          rx = new UdpClient(port); rx.Client.ReceiveTimeout = 20;
+          rx.Client.IOControl(-1744830452, new byte[4], null);   // SIO_UDP_CONNRESET off: a send to a closed port must not fail the next receive
+          udp = rx;
+        }
+        if (RecvMode != 0) {
+          IPEndPoint t = Target;
+          if (t != null && Environment.TickCount - kaAt >= 1000) { kaAt = Environment.TickCount; rx.Send(KeepAlive, KeepAlive.Length, t); }
+          Got += PumpReceive(100);
+        } else {   // not receiving: nothing plays, and old packets don't pile up for later
+          CloseOut(); while (rx.Available > 0) { IPEndPoint ep = null; rx.Receive(ref ep); }
+          Thread.Sleep(100);
+        }
       } catch (Exception e) { LastError = e.Message; Thread.Sleep(1000); }
     }
   }
@@ -615,7 +631,25 @@ public static class Dg {
   [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
   interface IMMDevice {
     int Activate(ref Guid iid, int ctx, IntPtr p, [MarshalAs(UnmanagedType.IUnknown)] out object o);
+    int OpenPropertyStore(int access, out IntPtr store);
+    int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
   }
+  // The default speaker as Sound settings shows it, "Speakers (USB Audio Device)", or "" if unknown. Windows keeps each
+  // endpoint's names under its id in the registry (readable by any user), which saves the property-store interop.
+  public static string DefaultOutputName() {
+    try {
+      var en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCo(); IMMDevice dev; string id;
+      if (en.GetDefaultAudioEndpoint(0, 0, out dev) < 0 || dev.GetId(out id) < 0 || id == null) return "";
+      using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\" + id.Substring(id.LastIndexOf('.') + 1) + @"\Properties")) {
+        if (k == null) return "";
+        string n = k.GetValue("{a45c254e-df1c-4efd-8020-67d146a850e0},2") as string ?? "", d = k.GetValue("{b3f8fa53-0004-438e-9003-51a46e139bfc},6") as string ?? "";
+        return d == "" ? n : n + " (" + d + ")";
+      }
+    } catch { return ""; }
+  }
+  // VB-Cable as the default speaker: this PC's sound goes into the virtual cable (silent), and on the PC that gets the
+  // microphone, the microphone played into CABLE Input comes back out as this PC's sound. VB-Cable's installer may set it.
+  public static bool IsVirtualCable(string output) { return output.IndexOf("VB-Audio", StringComparison.OrdinalIgnoreCase) >= 0 || output.StartsWith("CABLE ", StringComparison.OrdinalIgnoreCase); }
   [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
   interface IAudioClient {
     int Initialize(int shareMode, int flags, long bufferDuration, long periodicity, IntPtr format, IntPtr session);
@@ -742,6 +776,7 @@ public static class Dg {
     while (DateTime.UtcNow < end) {
       byte[] p; IPEndPoint ep = null;
       try { p = rx.Receive(ref ep); } catch (SocketException) { Feed(); continue; }
+      if (p.Length == KeepAlive.Length) continue;   // the other PC keeping its firewall open
       int rate, ch; p = OpenPacket(Key, p, out rate, out ch);
       if (p == null) { Bad++; continue; }
       got++;
