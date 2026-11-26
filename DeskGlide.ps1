@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.2.2'
+$Version = '5.2.3'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -336,6 +336,7 @@ function Svc-State([string]$line) {   # 'ok enabled=1 paired=1 ...' -> @{ enable
   $h = @{}; foreach ($kv in $line.Substring(3) -split ' ') { $k, $v = $kv -split '=', 2; if ($k) { $h[$k] = $v } }; $h
 }
 function Svc-On($svc) { [bool]($svc -and $svc.enabled -eq '1' -and $svc.paired -eq '1') }
+function Link-Used { [bool]$S.link -or (Svc-On $S.svc) }   # keyboard and mouse sharing: this app's Link, or (admin control) the service's
 function Admin-Status($cfg, $svc, [bool]$installed, [bool]$busy, [bool]$want, [bool]$hasKey) {
   $peer = if ($cfg.peer) { $cfg.peer } else { 'the other PC' }
   if ($busy) { if ($want) { return "Finish in the admin window that Windows opened: check that $peer shows the same number." } else { return 'Finish in the admin window that Windows opened.' } }
@@ -586,6 +587,7 @@ if ($Test) {
   Check ((Admin-Status $L5 $null $false $false $false $false) -match '^Turn this on in DeskGlide on PC-B') 'admin status: keyboard PC'
   $L5.peerAdmin = $true; Check (((Admin-Status $L5 $null $false $false $false $true) -match '^On at PC-B') -and ((Admin-Status $L5 $null $false $false $false $false) -match 'not paired with this PC')) 'admin status: the other PC has it'
   $L5.peerAdmin = $false
+  $S.svc = Svc-State 'ok enabled=1 paired=1 up=1'; Check ((-not $S.link) -and (Link-Used)) 'clipboard: text and pictures still shared while the admin service has the Link (5.2.2 stopped)'; $S.svc = $null
 
   # hotkeys: RegisterHotKey values
   $k = Parse-Hotkey 'Ctrl+Alt+Right'; Check ($k.mods -eq 3 -and $k.vk -eq 0x27 -and $k.text -eq 'Ctrl+Alt+Right') 'hotkey: default'
@@ -884,7 +886,7 @@ if ($Test) {
   $sp = Start-Process "$sb\DeskGlideService.exe" "-Console -Data `"$sd`" -Pipe $pipe -Port $($lp + 1) -PeerPort $lp -NoInject -SeedKey $([Convert]::ToBase64String($pk))" -PassThru -WindowStyle Hidden
   try {
     [Link]::NoInject = $true; $A = New-Link $one 'PC-A'; $A.Sender = $true; $A.Dir = 'r'; $A.SetCursor(1900, 540); $A.Start($lp, $lp + 1)
-    Check ((Until { $A.Up -and $A.HasRemote } 8000) -and (Logged 'helper: input desktop: ')) 'service: connected; its helper follows the input desktop and reports the monitors'
+    Check ((Until { $A.Up -and $A.HasRemote } 15000) -and (Until { Logged 'helper: input desktop: ' } 5000))   # the helper can take 8+ s to start on a busy PC 'service: connected; its helper follows the input desktop and reports the monitors'
     $A.FeedMouse(30, 0, 0, 0); Check ((Until { $A.Active }) -and (Until { Logged 'would inject mouse -?\d+,-?\d+ data 0 flags C001' })) 'service: across the edge, an absolute move through the helper'
     $A.FeedKey(0x41, 0x1E, 0, 1); $A.FeedKey(0x41, 0x1E, 0x80, 2)
     Check (Until { (Logged 'would inject key vk 00 sc 1E flags 8') -and (Logged 'would inject key vk 00 sc 1E flags 10') }) 'service: a key down and up by scan code'
@@ -1268,9 +1270,9 @@ function Check-Clipboard {   # the clipboard changed: offer copied files (and wi
   $list = @(); $text = $null; $img = $null
   try {
     if ([Windows.Forms.Clipboard]::ContainsFileDropList()) { $list = @([Windows.Forms.Clipboard]::GetFileDropList()) }
-    elseif ($S.link -and ((Get-Date) - $S.clipSetAt).TotalSeconds -gt 1) {   # not the change DeskGlide just made
+    elseif ((Link-Used) -and ((Get-Date) - $S.clipSetAt).TotalSeconds -gt 1) {   # not the change DeskGlide just made
       if ([Windows.Forms.Clipboard]::ContainsText()) { $text = [Windows.Forms.Clipboard]::GetText() } elseif ([Windows.Forms.Clipboard]::ContainsImage()) { $img = [Windows.Forms.Clipboard]::GetImage() }
-    } elseif ($S.link) { return }
+    } elseif (Link-Used) { return }
   } catch { return }   # busy: next change
   Offer-Clip $text $img
   if (-not $C.files) { return }
@@ -1300,7 +1302,7 @@ function Offer-Clip($text, $img) {   # text or a picture for the other PC, pulle
 }
 function Fetch-Clip {   # the mouse arrived here (Link): pull the text or picture copied on the other PC
   $o = $S.peerClip
-  if (-not $S.link -or -not $o -or -not $o.id -or $o.id -eq $S.clipGot -or [Clip]::Status -eq 'busy' -or -not $S.peerAddr) { return }
+  if (-not (Link-Used) -or -not $o -or -not $o.id -or $o.id -eq $S.clipGot -or [Clip]::Status -eq 'busy' -or -not $S.peerAddr) { return }
   $S.clipGot = [string]$o.id; [Clip]::Fetch("$($S.peerAddr)", $PeerPort + 1, $S.key, [string]$o.id)
 }
 function Poll-Clip {
