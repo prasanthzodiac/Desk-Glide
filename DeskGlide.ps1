@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.3.1'
+$Version = '5.3.2'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = 'prasanthzodiac/Desk-Glide'   # 'owner/repo' on GitHub for auto-update (its latest release); empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -35,12 +35,21 @@ $mutedPath = Join-Path $ConfigDir 'muted.txt'   # apps we muted, so a crash or k
 $logPath   = Join-Path $ConfigDir 'deskglide.log'
 $icoPath   = Join-Path $PSScriptRoot 'DeskGlide.ico'
 $lnk       = Join-Path ([Environment]::GetFolderPath('Startup')) 'DeskGlide.lnk'
+$appLnks   = @('Programs', 'Desktop') | % { Join-Path ([Environment]::GetFolderPath($_)) 'DeskGlide.lnk' }   # Start menu and Desktop: open the window
 $opp       = @{ left = 'right'; right = 'left'; up = 'down'; down = 'up' }
 
 # DeskGlide runs from its own copy in $appDir, so the downloaded folder can be moved or deleted and updates have one place to go
 $appDir   = Join-Path $DataDir 'app'
 $appFiles = 'DeskGlide.ps1', 'DeskGlide.cs', 'DeskGlideService.cs', 'DeskGlideHelper.cs', 'DeskGlide.ico', 'README.md', 'LICENSE', 'Install.cmd', 'Uninstall.cmd'
 function Arg-Line([string]$ps1) { "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ps1`"" }
+function Ensure-Icon { if (-not (Test-Path $icoPath)) { [Dg]::SaveIco($icoPath, 0, [int[]](16, 24, 32, 48, 256)) } }
+function New-Lnk([string]$path, [string]$ps1, [string]$extra) {   # a shortcut that runs DeskGlide hidden (a second start only shows the window)
+  Ensure-Icon
+  $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+  $sc.TargetPath = "$PSHOME\powershell.exe"; $sc.Arguments = (Arg-Line $ps1) + $extra; $sc.WorkingDirectory = Split-Path $ps1
+  $sc.IconLocation = Join-Path (Split-Path $ps1) 'DeskGlide.ico'; $sc.Description = 'DeskGlide: one keyboard, mouse and monitor for two PCs'; $sc.Save()
+}
+function Set-Startup([bool]$on, [string]$ps1 = $PSCommandPath) { if ($on) { New-Lnk $lnk $ps1 '' } else { Remove-Item $lnk -ErrorAction SilentlyContinue } }
 $svcName = 'DeskGlideService'; $svcDir = Join-Path $env:ProgramFiles 'DeskGlide'; $svcData = Join-Path $env:ProgramData 'DeskGlide\service'
 function Build-Service([string]$src, [string]$out) {
   $csc = "$env:windir\Microsoft.NET\Framework64\v4.0.30319\csc.exe"; if (-not (Test-Path $csc)) { $csc = "$env:windir\Microsoft.NET\Framework\v4.0.30319\csc.exe" }
@@ -949,6 +958,9 @@ if ($Test) {
   Check ($copied.Count -ge 6 -and ($names -join ',') -eq (($appFiles | ? { Test-Path (Join-Path $PSScriptRoot $_) } | sort) -join ',') -and (Test-Path "$to\DeskGlide.ps1") -and -not (Test-Path "$to\docs") -and -not (Test-Path "$to\.git")) "install copies the app files only: $($names -join ',')"
   Check ((Arg-Line "$to\DeskGlide.ps1") -eq "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$to\DeskGlide.ps1`"") 'startup arguments'
   Check ($appDir -eq (Join-Path $DataDir 'app')) 'app folder'
+  New-Lnk "$to\t.lnk" "$to\DeskGlide.ps1" ' -ShowWindow'; $sc = (New-Object -ComObject WScript.Shell).CreateShortcut("$to\t.lnk")
+  Check ($sc.TargetPath -eq "$PSHOME\powershell.exe" -and $sc.Arguments -eq "$(Arg-Line "$to\DeskGlide.ps1") -ShowWindow" -and $sc.IconLocation -like "$to\DeskGlide.ico*") "app shortcut opens the window: $($sc.Arguments)"
+  Check (@($appLnks).Count -eq 2 -and ($appLnks | ? { $_ -like '*\DeskGlide.lnk' }).Count -eq 2) 'app shortcuts: Start menu and Desktop'
   Remove-Item -Recurse $to
 
   $bmp = [Dg]::DrawIcon(16, 1); Check ($bmp.GetPixel(4, 7).R -lt 60 -and $bmp.GetPixel(11, 7).R -gt 100) 'icon: this PC half highlighted'
@@ -984,13 +996,6 @@ function Restore-Muted {   # unmute the apps a previous run muted (crash, kill, 
   if (-not (Test-Path $mutedPath)) { return }
   Get-Content $mutedPath | % { [void][Dg]::Muted.Add($_) }
   [Dg]::MuteOthers($false, $PID); Remove-Item $mutedPath
-}
-function Ensure-Icon { if (-not (Test-Path $icoPath)) { [Dg]::SaveIco($icoPath, 0, [int[]](16, 24, 32, 48, 256)) } }
-function Set-Startup([bool]$on, [string]$ps1 = $PSCommandPath) {
-  if (-not $on) { Remove-Item $lnk -ErrorAction SilentlyContinue; return }
-  Ensure-Icon
-  $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-  $sc.TargetPath = "$PSHOME\powershell.exe"; $sc.Arguments = Arg-Line $ps1; $sc.WorkingDirectory = Split-Path $ps1; $sc.IconLocation = Join-Path (Split-Path $ps1) 'DeskGlide.ico'; $sc.Save()
 }
 
 # ---------------------------------------------------------------- admin control (optional, elevated)
@@ -1095,7 +1100,7 @@ if ($Install -or $Uninstall) {
       'Removing admin control (Windows asks for permission)...'
       try { Start-Process "$PSHOME\powershell.exe" "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ServiceRemove" -Verb RunAs -Wait } catch { "Admin control stays installed: $($_.Exception.Message)" }
     }
-    Set-Startup $false
+    Set-Startup $false; $appLnks | % { Remove-Item -LiteralPath $_ -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
     "DeskGlide removed. Your settings are kept in $ConfigDir"; return
   }
@@ -1103,9 +1108,9 @@ if ($Install -or $Uninstall) {
   # downloaded from the internet: without this Windows asks before every start
   $files | ? { $_ -is [string] -and (Test-Path -LiteralPath $_) } | % { Unblock-File -LiteralPath $_ }
   $app = Join-Path $appDir 'DeskGlide.ps1'
-  Set-Startup $true $app
+  Set-Startup $true $app; $appLnks | % { New-Lnk $_ $app ' -ShowWindow' }
   Start-Process "$PSHOME\powershell.exe" "$(Arg-Line $app) -ShowWindow" -WindowStyle Hidden
-  "DeskGlide is installed in $appDir and running. Its window is open, and its icon is in the taskbar tray."; return
+  "DeskGlide is installed in $appDir and running. Its window is open, and its icon is in the taskbar tray. Open it again from the Start menu or the Desktop shortcut."; return
 }
 
 # ---------------------------------------------------------------- the app
@@ -1620,7 +1625,7 @@ function Set-Audio([string]$a) { if ($C.audio -ne $a) { $C.audio = $a; Changed }
 function Set-Hp([string]$pc) { if ($pc -and $C.hp -ne $pc) { $C.hp = $pc; Changed } }
 function Update-Menu {
   if (-not $tray) { return }
-  $miMon.Checked = $C.monitor; $miPause.Checked = $C.paused
+  $miMon.Checked = $C.monitor; $miPause.Checked = $C.paused; $miStart.Checked = Test-Path $lnk
   $miFollow.Checked = $C.audio -eq 'follow'; $miBoth.Checked = $C.audio -eq 'both'; $miOff.Checked = $C.audio -eq 'off'
   $miHpMe.Text = "$Name (this PC)"; $miHpMe.Checked = $C.hp -eq $Name
   $miHpPeer.Text = Peer-Label; $miHpPeer.Enabled = [bool]$C.peer; $miHpPeer.Checked = $C.hp -and $C.hp -eq $C.peer
@@ -2017,7 +2022,9 @@ $xaml = @'
           <TextBlock Style="{StaticResource Glyph}" Text="&#xE73E;" FontSize="40" HorizontalAlignment="Left" Margin="0,0,0,14"/>
           <TextBlock Style="{StaticResource Big}" Text="You're all set"/>
           <TextBlock x:Name="Summary" Style="{StaticResource Body}"/>
-          <TextBlock Style="{StaticResource Sub}" Margin="0,18,0,0" Text="DeskGlide keeps running in the taskbar tray. Double-click its icon to open this window again."/>
+          <CheckBox x:Name="WizStartup" Style="{StaticResource Switch}" Margin="0,18,0,0"><StackPanel>
+            <TextBlock Text="Start DeskGlide with Windows"/><TextBlock Style="{StaticResource Sub}" Text="Recommended: the PCs find each other without you opening anything. Change it later in Settings or the tray menu."/></StackPanel></CheckBox>
+          <TextBlock Style="{StaticResource Sub}" Margin="0,18,0,0" Text="DeskGlide keeps running in the taskbar tray. Double-click its icon, or use the DeskGlide shortcut in the Start menu or on the Desktop, to open this window again."/>
         </StackPanel>
       </Grid></ScrollViewer>
     </Border>
@@ -2073,6 +2080,7 @@ function New-Window {
   On PauseToggle Checked, Unchecked { if ($C.paused -ne [bool]$ui.PauseToggle.IsChecked) { $C.paused = -not $C.paused; Changed } }
   On DetachToggle Checked, Unchecked { if ($C.detach -ne [bool]$ui.DetachToggle.IsChecked) { $C.detach = -not $C.detach; Save-Config; if (-not $C.detach) { Reattach-Monitors } } }
   On StartupToggle Checked, Unchecked { $want = [bool]$ui.StartupToggle.IsChecked; if ((Test-Path $lnk) -ne $want) { Set-Startup $want } }
+  On WizStartup Checked, Unchecked { $want = [bool]$ui.WizStartup.IsChecked; if ((Test-Path $lnk) -ne $want) { Set-Startup $want } }
   On AFollow Checked { Set-Audio 'follow' }
   On ABoth Checked { Set-Audio 'both' }
   On AOff Checked { Set-Audio 'off' }
@@ -2338,7 +2346,7 @@ function Update-Ui {
   if ($S.addrErr) { $ui.PairMsg.Text = $S.addrErr; $ui.PairMsg.Foreground = Brush 'Bad' }
 
   # settings (text boxes are refreshed only while the user isn't typing in them)
-  $ui.StartupToggle.IsChecked = Test-Path $lnk; $ui.PauseToggle.IsChecked = $C.paused; $ui.DetachToggle.IsChecked = $C.detach
+  $ui.StartupToggle.IsChecked = Test-Path $lnk; $ui.WizStartup.IsChecked = Test-Path $lnk; $ui.PauseToggle.IsChecked = $C.paused; $ui.DetachToggle.IsChecked = $C.detach
   $ui.HkMsg.Text = if ($S.hkErr) { $S.hkErr } else { 'The mouse stays where it is.' }
   $ui.HkMsg.Foreground = Brush $(if ($S.hkErr) { 'Bad' } else { 'Fg2' })
   foreach ($p in @(@('LogPath', 'synergyLog'), @('AddrSet', 'peerAddress'), @('Script', 'onSwitch'), @('HkPeer', 'hotkeyPeer'), @('HkMe', 'hotkeyMe'), @('FileLimit', 'fileLimitMB'), @('PanicKey', 'panicKey'))) {
@@ -2410,6 +2418,7 @@ try {
     $miHpMe = Item $miHp.DropDownItems $Name { Set-Hp $Name }
     $miHpPeer = Item $miHp.DropDownItems 'the other PC' { Set-Hp $C.peer }
     $miPause = Item $menu.Items 'Pause' { $C.paused = -not $C.paused; Changed }
+    $miStart = Item $menu.Items 'Start with Windows' { Set-Startup (-not (Test-Path $lnk)) }
     [void]$menu.Items.Add('-')
     [void](Item $menu.Items 'Quit' { [Windows.Forms.Application]::Exit() })
     $tray.ContextMenuStrip = $menu

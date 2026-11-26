@@ -61,7 +61,7 @@ How to record it with Snipping Tool (built into Windows 11):
 - **Layout editor:** drag the other PC's screen to where it sits, like Windows' display settings.
 - **Live latency and packet loss** of the keyboard and mouse link in the window.
 - **Setup guide, light and dark theme, tray icon** that shows which PC has the mouse.
-- **Auto-update** from GitHub releases, SHA256-checked (once the repository is published).
+- **Auto-update** from this repository's GitHub releases, SHA256-checked.
 
 ### DeskGlide Link vs others
 
@@ -102,7 +102,7 @@ On **each** PC:
 2. Double-click **Install.cmd**. If Windows asks whether to run it, choose **Run**.
 3. If Windows Firewall asks about PowerShell, allow it on **Private networks**. The PCs can't find each other without this.
 
-Install.cmd unblocks DeskGlide's files, copies them to `%LOCALAPPDATA%\DeskGlide\app` and runs them from there, so you can delete the downloaded folder. DeskGlide starts with Windows from then on; its icon is in the taskbar tray (maybe under the **^** arrow).
+Install.cmd unblocks DeskGlide's files, copies them to `%LOCALAPPDATA%\DeskGlide\app` and runs them from there, so you can delete the downloaded folder. It adds a **DeskGlide** shortcut to the Start menu and the Desktop (it opens the window, or brings up the one already running) and starts DeskGlide with Windows; turn that off in Settings, the tray menu or the last page of the setup guide. Its icon is in the taskbar tray (maybe under the **^** arrow).
 
 ### The setup guide
 
@@ -119,7 +119,7 @@ Everything in the guide is also in the main window. On the PC being controlled, 
 
 ### Admin control (optional)
 
-Windows keeps normal apps, DeskGlide included, out of admin windows, UAC prompts, the lock and sign-in screen and Ctrl+Alt+Del. To control those on the other PC too, do this once **on the PC being controlled** (the one the keyboard and mouse are *not* plugged into), with DeskGlide 5.2 running on both PCs:
+Windows keeps normal apps, DeskGlide included, out of admin windows, UAC prompts, the lock and sign-in screen and Ctrl+Alt+Del. To control those on the other PC too, do this once **on the PC being controlled** (the one the keyboard and mouse are *not* plugged into), with DeskGlide 5.3.1 or newer running on both PCs:
 
 1. In the **Keyboard & mouse** card, turn on **Control admin windows, UAC prompts and the lock screen on this PC** (or click **Set up admin control...** in step 3 of the setup guide) and read the short explanation.
 2. Windows asks for permission (UAC): use this PC's own keyboard and mouse to click **Yes**. A DeskGlide admin window opens, installs the service and contacts the other PC.
@@ -148,7 +148,9 @@ Settings that both PCs share (sound mode, headphones, microphone mode, monitors 
 Move the pointer off the screen edge toward the other PC (the Layout card says which edge) and the keyboard and mouse work there; move back across the opposite edge to return. The corners don't switch, so you can still reach a corner's buttons. **Ctrl+Alt+Pause** (the panic key, changeable in the card) brings them back to this PC at once and releases every key.
 
 - **Pointer speed:** DeskGlide reads the mouse's raw movement and scales it by the two monitors' DPI. If the other PC feels slower or faster than this one (Windows' "Enhance pointer precision" isn't applied there), move the slider.
-- **Game mode:** while a game on the other PC holds the pointer, DeskGlide sends raw movement instead of positions, so the camera turns instead of spinning. Come back with the panic key. While a game holds the pointer on *this* PC, the pointer never leaves it.
+- **Games on this PC:** while a game runs in exclusive full screen or keeps the cursor inside its window, the pointer never leaves this PC, game mode or not, so it can't slip to the other PC mid-game. A borderless-windowed game that doesn't hold the cursor looks like any other window: the pointer can cross there, so use exclusive full screen.
+- **Game mode** is for playing a game on the *other* PC with this PC's mouse. Normally DeskGlide sends exact pointer positions; while a game there holds the pointer, game mode sends the mouse's raw movement instead, as if the mouse were plugged into that PC, so the camera turns instead of spinning. It switches back by itself when the game lets go. Come back with the panic key. It doesn't change latency: both ways use the same 1 ms packets. It needs the normal app on the other PC: with admin control on there, the service can't see that PC's games.
+- **Latency** is mostly the network's: DeskGlide itself adds well under a millisecond. Ethernet (or a home router) is steadier than a phone hotspot; the Keyboard & mouse card shows the round trip, jitter, loss and a Good/Fair/Poor badge.
 - **Lock both PCs together:** Win+L on either PC locks the other one too.
 
 ### Sound and microphone
@@ -163,7 +165,7 @@ The **microphone** is the default microphone of the PC with the headphones. On t
 
 ### Copy and paste files
 
-Copy files or folders in Explorer, move the mouse to the other PC, press **Ctrl+V**. DeskGlide pulls them when the mouse arrives, saves them in `Downloads\DeskGlide` (an existing name gets ` (2)`), and puts them on that PC's clipboard. A notification says when they're ready. Text and pictures work the same way with keyboard and mouse sharing on (Synergy copies them when it is off).
+Copy files or folders in Explorer, move the mouse to the other PC, press **Ctrl+V**. DeskGlide pulls them when the mouse arrives, saves them in `Downloads\DeskGlide` (an existing name gets ` (2)`), and puts them on that PC's clipboard. A notification says when they're ready. Text and pictures work the same way with keyboard and mouse sharing on (Synergy copies them when it is off). Only one of the two PCs needs to accept connections: if a firewall you can't change blocks them on one PC (a company laptop, say), that PC connects out to the other instead.
 
 ### Hotkeys
 
@@ -186,7 +188,8 @@ DeskGlide finds the other PC with a network broadcast. Where broadcast doesn't r
 | Sound | Follow mouse / Hear both / Off |
 | Headphones are plugged into | This PC or the other one |
 | Pause | Stop switching and sound until you uncheck it |
-| Quit | Stop DeskGlide until the next login (closing the window only hides it) |
+| Start with Windows | Start DeskGlide when you sign in (checked by default) |
+| Quit | Stop DeskGlide until the next login, or until you open it from the Start menu or Desktop shortcut (closing the window only hides it) |
 
 ## Security
 
@@ -211,14 +214,15 @@ Admin control needs a Windows service running as SYSTEM, the most powerful accou
 
 ## Limits
 
-- **Windows only,** both PCs.
+- **Windows only,** both PCs, and **exactly two PCs** (not three or more).
+- **Win+L and Ctrl+Alt+Del** always act on the PC whose keyboard pressed them; Windows lets no program pass them on. To lock only the other PC, press Ctrl+Alt+End (with admin control) and choose Lock, or turn on **Lock both PCs together**.
 - **Unsigned:** DeskGlide is a showcase project without a code-signing certificate, so Windows SmartScreen or your antivirus may warn when you run Install.cmd. Install.cmd unblocks only DeskGlide's own files.
 - **Lock screen, UAC prompts, admin windows and Ctrl+Alt+Del:** without [admin control](#admin-control-optional), DeskGlide runs as your user, so it can't type into admin windows (Task Manager, installers) or on the other PC's secure desktop (lock screen, UAC prompts), and Ctrl+Alt+Del can't be sent; the card says when Windows refuses input. With admin control they work, Ctrl+Alt+Del as Ctrl+Alt+End. Setting it up needs one UAC prompt on the controlled PC, which you answer with that PC's own mouse.
-- **Admin control** has been tested with the service's logic in a test mode (as the user, no injection, over loopback, also with a DeskGlide 5.1 sender) and its security checks; not yet installed on a second PC, so UAC prompts, the lock screen and Ctrl+Alt+Del are untested in practice. It can't detect games on the controlled PC (game mode needs the normal app there), and Lock both PCs together doesn't lock a PC whose service receives. While it's on, that PC can't be the keyboard PC: turn it off first. Auto-update doesn't touch the installed service (that needs Windows' permission): after an update, turn admin control off and on again to rebuild it.
-- **Games** that hold the pointer need game mode (above).
+- **Admin control** works on a second PC for admin windows, UAC prompts and the taskbar; signing in on the lock screen and Ctrl+Alt+End are not tested on real PCs yet. It can't detect games on the controlled PC (game mode needs the normal app there), and Lock both PCs together doesn't lock a PC whose service receives. While it's on, that PC can't be the keyboard PC: turn it off first. Auto-update doesn't touch the installed service (that needs Windows' permission): after an update, turn admin control off and on again to rebuild it.
+- **Games** on the other PC need game mode, and a borderless-windowed game on this PC doesn't stop the pointer crossing (see [Keyboard and mouse](#keyboard-and-mouse)).
+- **Microphone** needs VB-Cable, a driver that takes administrator rights to install (a company laptop may not allow it); the microphone path is self-tested but not yet tried between two real PCs.
 - **Keyboard layouts:** keys are sent as scan codes, so both PCs should use the same layout.
 - **Pen tablets** and other absolute pointing devices only click on the other PC; they don't move its pointer.
-- **Keyboard and mouse sharing** has been tested with two DeskGlide engines on one PC (loopback), not yet between two PCs.
 - **Delay:** sound arrives 50-100 ms late on a home network: fine for music and video, noticeable in games.
 - **Surround** sound is sent as stereo.
 - **Identical monitors:** two monitors of the same model are told apart by their order, which can differ between the PCs.
@@ -277,10 +281,10 @@ Click **Open log** at the bottom of the window to see what DeskGlide saw and did
 
 ## Tested on
 
-- Windows 11 with Synergy and an MSI monitor (DisplayPort + HDMI)
-- DeskGlide Link: two engines and two DeskGlide windows on one Windows 11 PC over loopback
-- Admin control: the service's logic in its test mode on one Windows 11 PC over loopback, with DeskGlide 5.2 and 5.1 senders (not installed as a service yet)
-- Sound between two Windows PCs on the same Wi-Fi network
+- Two real PCs, a Windows 11 desktop and a company-managed Windows laptop, sharing one MSI monitor (DisplayPort + HDMI) over a phone hotspot: the monitor following the mouse, keyboard and mouse sharing, admin control (admin windows, UAC prompts, the taskbar), and copying text and files both ways with the laptop's firewall blocking connections in
+- Sound between two Windows PCs on the same Wi-Fi network (earlier versions)
+- The self-check (`-Test`) on Windows 11: two engines over loopback for latency, loss and outages, and the admin service in its test mode with its security checks
+- Not yet on real PCs: the microphone, signing in on the lock screen and Ctrl+Alt+End through admin control, game mode, the second network path
 
 ## Credits
 
