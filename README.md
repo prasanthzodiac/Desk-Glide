@@ -42,7 +42,7 @@ How to record it with Snipping Tool (built into Windows 11):
 - **Monitor:** DeskGlide tells the monitor to change its input over DDC/CI (VCP code 0x60) with `dxva2.dll`, which ships with Windows.
 - **Sound:** WASAPI loopback captures the other PC's sound; DeskGlide sends it as 16-bit PCM over UDP and plays it with `winmm`.
 - **Microphone:** WASAPI captures the headset microphone; the other PC plays it into VB-Audio Virtual Cable, which apps there use as a microphone.
-- **Files, text and pictures:** a clipboard listener (`AddClipboardFormatListener`) notices what you copy; the other PC pulls it over TCP when the mouse arrives and puts it on its clipboard.
+- **Files, text and pictures:** a clipboard listener (`AddClipboardFormatListener`) notices what you copy; the other PC pulls it over TCP when the mouse arrives and puts it on its clipboard. If a firewall stops it connecting in (a company laptop, say), the PC you copied on connects out instead, so only one of the two PCs needs to accept connections.
 - **Pairing and security:** a one-time code becomes a key (PBKDF2); messages are signed with HMAC-SHA256, and keyboard and mouse, sound, microphone and files are encrypted with AES-256-CBC plus HMAC-SHA256. The key is stored with Windows DPAPI.
 - **Finding each other:** UDP broadcast on every network adapter, with a typed address as a fallback (Tailscale, ZeroTier, a direct cable).
 - **App:** one PowerShell script and one C# file compiled on the fly (`Add-Type`); a WPF window and a tray icon. Nothing to install but DeskGlide itself.
