@@ -2,7 +2,7 @@
 using System; using System.Text; using System.Net; using System.Net.Sockets; using System.Threading; using System.IO;
 using System.Collections.Generic; using System.Runtime.InteropServices; using System.Security.Cryptography;
 using System.Drawing; using System.Drawing.Drawing2D; using System.Drawing.Imaging;
-using System.IO.Compression;
+using System.IO.Compression; using System.Collections.Concurrent; using System.Diagnostics; using System.Net.NetworkInformation;
 
 // One background download (or GET when path is null) with progress. DeskGlide.ps1 polls it from its timer.
 public class Job {
@@ -97,6 +97,7 @@ public static class Files {
         byte[] nr = ReadN(s, 16), ns = Dg.Random(16); s.Write(ns, 0, 16);
         byte[] k = Dg.SessionKey(Key, "files", Cat(nr, ns)); long rx = 0, tx = 0;
         string id = Encoding.UTF8.GetString(ReadFrame(s, k, 'R', rx++));   // a PC without the pairing key fails here, before anything is sent
+        if (id.StartsWith("clip:")) { Clip.Serve(s, k, id.Substring(5), ref tx); return; }   // text or a picture (DeskGlide Link)
         string[] paths = OfferPaths;
         if (paths == null || id != OfferId) { WriteFrame(s, k, 'S', tx++, Encoding.UTF8.GetBytes("gone"), 0, 4); return; }
         var list = new List<KeyValuePair<string, string>>(); var m = new StringBuilder();   // relative path -> full path
@@ -185,11 +186,11 @@ public static class Files {
   }
 
   // frame: [length:4][Dg.Encrypt(key, direction + sequence, data)]. The sequence in the MAC stops reordering and replay.
-  static void WriteFrame(Stream s, byte[] k, char dir, long seq, byte[] b, int off, int n) {
+  internal static void WriteFrame(Stream s, byte[] k, char dir, long seq, byte[] b, int off, int n) {
     byte[] e = Dg.Encrypt(k, Ad(dir, seq), b, off, n);
     s.Write(BitConverter.GetBytes(e.Length), 0, 4); s.Write(e, 0, e.Length);
   }
-  static byte[] ReadFrame(Stream s, byte[] k, char dir, long seq) {
+  internal static byte[] ReadFrame(Stream s, byte[] k, char dir, long seq) {
     int n = BitConverter.ToInt32(ReadN(s, 4), 0);
     if (n < 0 || n > 70000) throw new IOException("bad frame");
     byte[] d = Dg.Decrypt(k, Ad(dir, seq), ReadN(s, n), 0, n);
@@ -197,12 +198,12 @@ public static class Files {
     return d;
   }
   static byte[] Ad(char dir, long seq) { var a = new byte[9]; a[0] = (byte)dir; BitConverter.GetBytes(seq).CopyTo(a, 1); return a; }
-  static byte[] ReadN(Stream s, int n) {
+  internal static byte[] ReadN(Stream s, int n) {
     var b = new byte[n]; int got = 0;
     while (got < n) { int r = s.Read(b, got, n - got); if (r <= 0) throw new IOException("the connection closed"); got += r; }
     return b;
   }
-  static byte[] Cat(byte[] a, byte[] b) { var o = new byte[a.Length + b.Length]; a.CopyTo(o, 0); b.CopyTo(o, a.Length); return o; }
+  internal static byte[] Cat(byte[] a, byte[] b) { var o = new byte[a.Length + b.Length]; a.CopyTo(o, 0); b.CopyTo(o, a.Length); return o; }
 }
 
 public static class Dg {
@@ -807,5 +808,814 @@ public static class Dg {
     }
     if (!mute) Muted.Clear();
     Marshal.ReleaseComObject(list); Marshal.ReleaseComObject(mgr); Marshal.ReleaseComObject(dev); Marshal.ReleaseComObject(en);
+  }
+}
+
+// ======================= DeskGlide Link: DeskGlide's own keyboard and mouse sharing =======================
+// The PC the keyboard and mouse are plugged into (the sender) reads the mouse with Raw Input. While the other PC has
+// control, low-level hooks swallow local input (they only enqueue and return) and the sender moves its own model of the
+// other PC's pointer over that PC's monitors, sending absolute positions: a lost packet never shifts the pointer. Keys,
+// buttons and the wheel go on a reliable stream. One UDP datagram:
+//   'D' 'L' [protocol] [kind: 0 hello, 1 session] [sender nonce:8]  Dg.Encrypt(key, those 12 bytes, body)
+// hello (the same in every protocol version): key = SessionKey(pairing, "link hello"), body = [their nonce we know:8][time ms:8][name]
+// session: key = SessionKey(pairing, "link", lower nonce + higher nonce), body = [type][ack:4] then
+//   H heartbeat [seq:4][time us:4][echo:4][held us:4][flags: 1 = a game holds the pointer][pointer x:4 y:4][n][n x (l t r b:4, dpi:2)]
+//   M mouse     [seq:4][mode: 0 absolute, 1 relative running sums][x:4][y:4]
+//   R reliable  [seq:4] + E enter [x:4 y:4] | L leave | K key [scan][flags: 1 up, 2 extended][vk][modifiers]
+//               | B button [b][down][relative][x:4 y:4] | W wheel [horizontal][delta:2] | X lock this PC too
+//   A ack only
+
+public struct Mon {   // a monitor in physical pixels; R and B exclusive
+  public int L, T, R, B, Dpi;
+  public Mon(int l, int t, int r, int b, int dpi) { L = l; T = t; R = r; B = b; Dpi = dpi > 0 ? dpi : 96; }
+  public bool Has(int x, int y) { return x >= L && x < R && y >= T && y < B; }
+}
+
+// Screen geometry: where the pointer leaves one PC and enters the other. Edges are 'l', 'r', 'u', 'd'.
+public static class Geo {
+  public static int Find(Mon[] ms, int x, int y) { for (int i = 0; i < ms.Length; i++) if (ms[i].Has(x, y)) return i; return -1; }
+  public static int F(double v) { return (int)Math.Floor(v); }
+  public static char Opp(char d) { return d == 'l' ? 'r' : d == 'r' ? 'l' : d == 'u' ? 'd' : 'u'; }
+  static bool Side(char d) { return d == 'l' || d == 'r'; }   // a left or right edge: positions along it are y
+  static void Span(Mon[] ms, bool side, out int a, out int b) {   // the whole desktop along such an edge: [a, b)
+    a = int.MaxValue; b = int.MinValue;
+    foreach (var m in ms) { a = Math.Min(a, side ? m.T : m.L); b = Math.Max(b, side ? m.B : m.R); }
+  }
+  public static void Bounds(Mon[] ms, out int x, out int y, out int w, out int h) {
+    int l = int.MaxValue, t = int.MaxValue, r = int.MinValue, b = int.MinValue;
+    foreach (var m in ms) { l = Math.Min(l, m.L); t = Math.Min(t, m.T); r = Math.Max(r, m.R); b = Math.Max(b, m.B); }
+    x = l; y = t; w = r - l; h = b - t;
+  }
+  // Where along this PC's 'dir' edge the pointer leaves (0..1 over the whole desktop), or -1: it isn't pushing out through
+  // an outer edge (another monitor is there), or it is in a corner's dead zone.
+  public static double Leave(Mon[] ms, int x, int y, double dx, double dy, char dir, int dead) {
+    int i = Find(ms, x, y); if (i < 0) return -1;
+    Mon m = ms[i];
+    bool o = dir == 'r' ? dx > 0 && x >= m.R - 1 && Find(ms, m.R, y) < 0
+           : dir == 'l' ? dx < 0 && x <= m.L && Find(ms, m.L - 1, y) < 0
+           : dir == 'd' ? dy > 0 && y >= m.B - 1 && Find(ms, x, m.B) < 0
+           : dir == 'u' && dy < 0 && y <= m.T && Find(ms, x, m.T - 1) < 0;
+    if (!o) return -1;
+    bool s = Side(dir); int at = s ? y : x, lo = s ? m.T : m.L, hi = s ? m.B : m.R;
+    if (at < lo + dead || at >= hi - dead) return -1;
+    int a, b; Span(ms, s, out a, out b);
+    return (at - a + 0.5) / (b - a);
+  }
+  // Where the pointer enters through this PC's 'side' edge at f (0..1): on the outermost monitor there, at the same relative
+  // position, so a pointer leaving halfway down one PC's screens enters halfway down the other's.
+  public static void Entry(Mon[] ms, char side, double f, out int x, out int y) {
+    bool s = Side(side); int a, b; Span(ms, s, out a, out b);
+    int at = Math.Max(a, Math.Min(b - 1, a + F(f * (b - a)))), best = 0; long bMiss = long.MaxValue, bOut = long.MaxValue;
+    for (int i = 0; i < ms.Length; i++) {
+      Mon m = ms[i]; int lo = s ? m.T : m.L, hi = s ? m.B : m.R;
+      long miss = at < lo ? lo - at : at >= hi ? at - hi + 1 : 0, outer = side == 'l' ? m.L : side == 'r' ? -m.R : side == 'u' ? m.T : -m.B;
+      if (miss < bMiss || (miss == bMiss && outer < bOut)) { bMiss = miss; bOut = outer; best = i; }
+    }
+    Mon w = ms[best];
+    if (s) { x = side == 'l' ? w.L : w.R - 1; y = Math.Max(w.T, Math.Min(w.B - 1, at)); }
+    else { y = side == 'u' ? w.T : w.B - 1; x = Math.Max(w.L, Math.Min(w.R - 1, at)); }
+  }
+  // Moves the pointer (x, y) by (dx, dy) over the monitors ms; off every monitor it stays on its own, clamped.
+  // Returns where along the 'back' edge it leaves (see Leave), or -1. back '\0' = never leaves.
+  public static double Move(Mon[] ms, ref double x, ref double y, double dx, double dy, char back, int dead) {
+    if (ms.Length == 0) return -1;
+    double nx = x + dx, ny = y + dy;
+    if (Find(ms, F(nx), F(ny)) >= 0) { x = nx; y = ny; return -1; }
+    int i = Find(ms, F(x), F(y)); Mon m = ms[i < 0 ? 0 : i];
+    x = Math.Max(m.L, Math.Min(m.R - 1, nx)); y = Math.Max(m.T, Math.Min(m.B - 1, ny));
+    return back == '\0' ? -1 : Leave(ms, F(x), F(y), dx, dy, back, dead);
+  }
+  public static int DpiAt(Mon[] ms, double x, double y) { int i = Find(ms, F(x), F(y)); return i < 0 ? 96 : ms[i].Dpi; }
+  // Mouse counts on the sender -> pixels on the receiver: the user's speed times the receiver's DPI over the sender's
+  public static double Scale(int speedPct, int dpiFrom, int dpiTo) { return speedPct / 100.0 * (dpiTo > 0 ? dpiTo : 96) / (dpiFrom > 0 ? dpiFrom : 96); }
+  // A pixel -> SendInput's 0..65535 across the virtual desktop (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)
+  public static int Norm(int v, int origin, int size) { return size <= 1 ? 0 : (int)Math.Round((v - origin) * 65535.0 / (size - 1)); }
+}
+
+// Relative movement (game mode): float deltas add up, whole pixels go out, the fraction stays for the next packet.
+public class Coalescer {
+  public double X, Y;
+  public void Add(double dx, double dy) { X += dx; Y += dy; }
+  public bool Take(out int dx, out int dy) { dx = (int)X; dy = (int)Y; X -= dx; Y -= dy; return dx != 0 || dy != 0; }
+}
+
+public static class KeyMap {
+  // Every key packet carries all modifiers as bits: 0 LShift, 1 RShift, 2 LCtrl, 3 RCtrl, 4 LAlt, 5 RAlt, 6 LWin, 7 RWin
+  public static readonly int[] Vk = { 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C };
+  public static readonly int[] Sc = { 0x2A, 0x36, 0x1D, 0x1D, 0x38, 0x38, 0x5B, 0x5C };
+  public static readonly bool[] Ext = { false, false, false, true, false, true, true, true };
+  public static int Apply(int mods, int vk, bool up) { int b = Array.IndexOf(Vk, vk); return b < 0 ? mods : up ? mods & ~(1 << b) : mods | (1 << b); }
+  // What the receiver presses (bit | 0x100) or releases (bit) so its modifiers (have) match the sender's (want)
+  public static List<int> Reconcile(int want, int have) {
+    var o = new List<int>();
+    for (int b = 0; b < 8; b++) { int w = (want >> b) & 1; if (w != ((have >> b) & 1)) o.Add(b | (w << 8)); }
+    return o;
+  }
+  // AltGr arrives as a fake LCtrl (scan code 0x21D) plus RAlt; the receiver's own layout adds its own fake LCtrl
+  public static bool FakeCtrl(int vk, int sc) { return vk == 0xA2 && (sc & 0x200) != 0; }
+  // Modifier bits -> RegisterHotKey's (1 Alt, 2 Ctrl, 4 Shift, 8 Win)
+  public static int HotMods(int mods) { return ((mods & 0x0C) != 0 ? 2 : 0) | ((mods & 0x30) != 0 ? 1 : 0) | ((mods & 3) != 0 ? 4 : 0) | ((mods & 0xC0) != 0 ? 8 : 0); }
+}
+
+// What the receiver injected and hasn't released: on leave or loss all of it goes up.
+public class Held {
+  readonly HashSet<int> keys = new HashSet<int>(); int buttons;   // key: scan | 0x100 extended, or 0x10000 | vk
+  public void Key(int code, bool up) { if (up) keys.Remove(code); else keys.Add(code); }
+  public void Button(int b, bool down) { if (down) buttons |= 1 << b; else buttons &= ~(1 << b); }
+  public int Mods() { int m = 0; for (int b = 0; b < 8; b++) if (keys.Contains(KeyMap.Sc[b] | (KeyMap.Ext[b] ? 0x100 : 0))) m |= 1 << b; return m; }
+  public List<int> TakeKeys() { var o = new List<int>(keys); keys.Clear(); return o; }
+  public List<int> TakeButtons() { var o = new List<int>(); for (int b = 0; b < 5; b++) if ((buttons & 1 << b) != 0) o.Add(b); buttons = 0; return o; }
+}
+
+// Keys, buttons and the wheel: numbered, resent until acknowledged, delivered once and in order.
+public class Reliable {
+  public class Item { public uint Seq; public byte[] Data; public long SentAt; }
+  uint next = 1, rxNext = 1;
+  readonly List<Item> outq = new List<Item>(); readonly Dictionary<uint, byte[]> early = new Dictionary<uint, byte[]>();
+  public uint Ack { get { return rxNext - 1; } }   // everything up to here arrived
+  public int Pending { get { return outq.Count; } }
+  public Item Add(byte[] data, long now) { var it = new Item { Seq = next++, Data = data, SentAt = now }; outq.Add(it); return it; }
+  public void Acked(uint ack) { outq.RemoveAll(i => (int)(ack - i.Seq) >= 0); }
+  public List<Item> Due(long now, int rto) { var o = new List<Item>(); foreach (var i in outq) if (now - i.SentAt >= rto) { i.SentAt = now; o.Add(i); } return o; }
+  public List<byte[]> Got(uint seq, byte[] data) {   // what can be delivered now, in order
+    var o = new List<byte[]>(); int ahead = (int)(seq - rxNext);
+    if (ahead < 0 || ahead > 4096) return o;   // a duplicate, or nonsense
+    early[seq] = data;
+    byte[] d; while (early.TryGetValue(rxNext, out d)) { early.Remove(rxNext); o.Add(d); rxNext++; }
+    return o;
+  }
+}
+
+// The link's heartbeat, loss and reconnect timing (ms). Tick says what to send.
+public class Conn {
+  public const int Beat = 250, LostAfter = 1500, MaxBackoff = 2000;
+  public bool Up; public long LastRx; long nextHello, nextBeat; int backoff;
+  public int Backoff { get { return backoff; } }
+  public void Kick(long now) { backoff = 0; nextHello = now; }   // network change, wake-up, unlock: try now
+  public bool Rx(long now) { LastRx = now; if (Up) return false; Up = true; backoff = 0; nextBeat = now; return true; }
+  // 1 = send a hello, 2 = send a heartbeat, 4 = the link was just lost
+  public int Tick(long now) {
+    int r = 0;
+    if (Up && now - LastRx > LostAfter) { Up = false; r |= 4; Kick(now); }
+    if (Up) { if (now >= nextBeat) { nextBeat = now + Beat; r |= 2; } }
+    else if (now >= nextHello) { r |= 1; backoff = backoff == 0 ? 100 : Math.Min(backoff * 2, MaxBackoff); nextHello = now + backoff; }
+    return r;
+  }
+}
+
+public class LossMeter {   // heartbeats that never arrived, per window of 40 (10 s)
+  uint first; int got; bool any; public double Pct;
+  public void Got(uint seq) {
+    if (!any || (int)(seq - first) < 0) { first = seq; got = 0; any = true; }
+    got++; int expected = (int)(seq - first) + 1;
+    if (expected >= 40) { Pct = Math.Max(0, 100.0 * (expected - got) / expected); any = false; }
+  }
+}
+
+// Windows silently removes a low-level hook that is slow once. Every 2 s a tagged probe goes through both hooks;
+// if one doesn't see it within 500 ms, the hooks are installed again.
+public class Watchdog {
+  public volatile int SeenBits; long at = long.MinValue / 2; bool waiting;   // bits: 1 keyboard, 2 mouse
+  public void Seen(int bit) { SeenBits |= bit; }
+  public void Reset(long now) { at = now; waiting = false; }
+  public int Tick(long now) {   // 1 = send the probes, 2 = a probe went missing: reinstall
+    if (waiting && now - at >= 500) { waiting = false; at = now; if (SeenBits != 3) return 2; }
+    if (!waiting && now - at >= 2000) { waiting = true; at = now; SeenBits = 0; return 1; }
+    return 0;
+  }
+}
+
+public static class LinkProto {
+  public const byte Version = 1;
+  public static readonly byte[] Empty = new byte[0];
+  public static byte[] Seal(byte[] key, byte kind, byte[] nonce, byte[] body, int len, byte ver) {
+    var p = new byte[12]; p[0] = (byte)'D'; p[1] = (byte)'L'; p[2] = ver; p[3] = kind; Buffer.BlockCopy(nonce, 0, p, 4, 8);
+    byte[] e = Dg.Encrypt(key, p, body, 0, len), o = new byte[12 + e.Length];
+    p.CopyTo(o, 0); e.CopyTo(o, 12); return o;
+  }
+  // The body, or null if it isn't a DeskGlide Link packet under this key (the header, version included, is authenticated)
+  public static byte[] Open(byte[] key, byte[] p, int n, out int ver, out int kind, out byte[] nonce) {
+    ver = -1; kind = -1; nonce = null;
+    if (key == null || p == null || n < 12 + Dg.CryptoOverhead || n > p.Length || p[0] != 'D' || p[1] != 'L') return null;
+    ver = p[2]; kind = p[3]; nonce = new byte[8]; Buffer.BlockCopy(p, 4, nonce, 0, 8);
+    var h = new byte[12]; Buffer.BlockCopy(p, 0, h, 0, 12);
+    return Dg.Decrypt(key, h, p, 12, n - 12);
+  }
+  public static string VersionText(int theirs, string peer) {
+    return theirs > Version ? "DeskGlide on " + peer + " is newer. Update DeskGlide on this PC to share the keyboard and mouse."
+                            : "DeskGlide on " + peer + " is older. Update DeskGlide on " + peer + " to share the keyboard and mouse.";
+  }
+}
+
+// The network adapter to reach the other PC through: one whose subnet holds it; a real one before a virtual one.
+public static class Nic {
+  public static bool Virtual(string desc) { return System.Text.RegularExpressions.Regex.IsMatch(desc ?? "", "Hyper-V|VirtualBox|VMware|vEthernet|WSL|Npcap|Loopback|Virtual|TAP-|Tailscale|ZeroTier|WireGuard", System.Text.RegularExpressions.RegexOptions.IgnoreCase); }
+  public static int Pick(IPAddress peer, int[] index, IPAddress[] ip, IPAddress[] mask, bool[] virt) {   // -1 = leave it to Windows' routing
+    byte[] p = peer.GetAddressBytes(); if (p.Length != 4 || IPAddress.IsLoopback(peer)) return -1;
+    int best = -1; bool bestVirt = true;
+    for (int i = 0; i < index.Length; i++) {
+      byte[] a = ip[i].GetAddressBytes(), m = mask[i].GetAddressBytes(); bool same = a.Length == 4 && m.Length == 4;
+      for (int k = 0; same && k < 4; k++) same = (a[k] & m[k]) == (p[k] & m[k]);
+      if (same && (best < 0 || (bestVirt && !virt[i]))) { best = index[i]; bestVirt = virt[i]; }
+    }
+    return best;
+  }
+  public static int ForPeer(IPAddress peer) {
+    var idx = new List<int>(); var ip = new List<IPAddress>(); var mk = new List<IPAddress>(); var vt = new List<bool>();
+    foreach (var ni in NetworkInterface.GetAllNetworkInterfaces()) {
+      if (ni.OperationalStatus != OperationalStatus.Up) continue;
+      IPv4InterfaceProperties p4; try { p4 = ni.GetIPProperties().GetIPv4Properties(); } catch { continue; }
+      if (p4 == null) continue;
+      foreach (var u in ni.GetIPProperties().UnicastAddresses)
+        if (u.Address.AddressFamily == AddressFamily.InterNetwork && u.IPv4Mask != null) { idx.Add(p4.Index); ip.Add(u.Address); mk.Add(u.IPv4Mask); vt.Add(Virtual(ni.Description + " " + ni.Name)); }
+    }
+    return Pick(peer, idx.ToArray(), ip.ToArray(), mk.ToArray(), vt.ToArray());
+  }
+}
+
+// The engine: one per PC, on its own threads. DeskGlide.ps1 sets the fields below and reads Up/Active/Controlled.
+public class Link {
+  // ---- set by DeskGlide.ps1 (or the self-test) ----
+  public volatile byte[] Key;                 // the pairing key
+  public volatile IPAddress Peer;             // from discovery; then wherever the other PC's authenticated packets come from
+  public volatile bool Sender;                // the keyboard and mouse are plugged into this PC
+  public volatile char Dir = 'r';             // the side of this PC where the other PC is
+  public volatile int Speed = 100, Dead = 8;  // pointer speed on the other PC (percent); corner dead zone (pixels)
+  public volatile bool Game, LockSync;
+  public volatile int PanicMods = 3, PanicVk = 0x13;   // RegisterHotKey style; Ctrl+Alt+Pause
+  public string Name = "";
+  public static volatile bool NoInject;       // -NoInject: no hooks, no Raw Input, no SendInput; what would be injected goes to Injected
+  public volatile int DropPct;                // self-test: lose this share of sent packets
+  public volatile bool TestBlocked;           // self-test: "a game holds the pointer here"
+  // ---- read by DeskGlide.ps1 ----
+  public volatile bool Up, Active, Controlled, Uipi;   // Active: this PC's keyboard and mouse drive the other PC; Controlled: the reverse
+  public volatile string VersionMsg = "", InjectError = "";
+  public double Rtt = -1, Loss;               // ms (smoothed), percent
+  public int InjectFails, Stale;
+  public readonly ConcurrentQueue<string> Log = new ConcurrentQueue<string>(), Injected = new ConcurrentQueue<string>();
+  public readonly ConcurrentQueue<long> Fed = new ConcurrentQueue<long>();
+  public bool HasRemote { get { var r = remote; return r != null && r.Length > 0; } }
+  public static long NowUs { get { return (long)(clock.Elapsed.TotalMilliseconds * 1000); } }
+  public int Queued { get { return evq.Count; } }
+  public int ProbeSeen { get { return wd.SeenBits; } }
+
+  const long OwnTag = 0x44474C4B, ProbeTag = 0x44475052;   // dwExtraInfo of DeskGlide's own input: "DGLK", "DGPR"
+  static readonly Stopwatch clock = Stopwatch.StartNew();
+  static long Ms { get { return clock.ElapsedMilliseconds; } }
+  static uint Us { get { return (uint)NowUs; } }
+  readonly object gate = new object(), injGate = new object();
+  struct Ev { public int Kind, A, B, C, D; }
+  readonly ConcurrentQueue<Ev> evq = new ConcurrentQueue<Ev>();
+  readonly AutoResetEvent wake = new AutoResetEvent(false);
+  readonly ManualResetEvent winReady = new ManualResetEvent(false);
+  readonly Random rnd = new Random();
+  Socket sock; int peerPort; volatile bool running, kick, lockEvt, endPending, panic; Thread net, pump, msgs; Win win; IntPtr rawBuf;
+  byte[] myNonce = Dg.Random(8), peerNonce, sessKey, helloKey, helloKeyFor; long lastHelloT; volatile string peerName = "the other PC";
+  Conn conn = new Conn(); Reliable rel = new Reliable(); readonly LossMeter loss = new LossMeter(); readonly Watchdog wd = new Watchdog();
+  uint hbSeq, mSeq, rxMSeq, peerT, peerTAt, flushedUs;
+  volatile Mon[] local = new Mon[0], remote; bool fixedMons; long monsAt = -100000, uipiAt, errAt = -100000, lockedAt = -100000;
+  double mx, my, cx, cy; bool dirty, relMode, rawOn, timer1; Coalescer co = new Coalescer(); int sumX, sumY, mods, localDpi = 96;   // sender
+  readonly bool[] phys = new bool[256]; volatile bool remoteGame; volatile int remoteX, remoteY;
+  readonly Held held = new Held(); int lastX = int.MinValue, lastY, rxSumX, rxSumY; bool rxRel; uint exec; IPAddress ifFor;   // receiver
+
+  // ---------- start / stop ----------
+  public void Start(int port, int peerPort) {
+    this.peerPort = peerPort; running = true;
+    sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+    sock.Bind(new IPEndPoint(IPAddress.Any, port));
+    try { sock.IOControl(-1744830452, new byte[4], null); } catch {}   // SIO_UDP_CONNRESET off: ignore "port unreachable"
+    msgs = Run(MsgLoop); winReady.WaitOne(3000);
+    net = Run(NetLoop); pump = Run(PumpLoop);
+    NetworkChange.NetworkAddressChanged += OnNetChange;
+  }
+  public void Stop() {   // gives control back and releases every key first
+    NetworkChange.NetworkAddressChanged -= OnNetChange;
+    running = false; wake.Set();
+    if (pump != null) pump.Join(3000);
+    try { sock.Close(); } catch {}
+    if (net != null) net.Join(3000);
+    if (msgs != null) msgs.Join(3000);
+  }
+  public void Panic() { panic = true; wake.Set(); }   // the panic hotkey while this PC has control: release anything stuck
+  public void FeedMouse(int dx, int dy, int buttons, int wheel) { Fed.Enqueue(NowUs); Enq(0, dx, dy, buttons, wheel); }   // self-test: Raw Input usButtonFlags / usButtonData
+  public void FeedKey(int vk, int sc, int flags, int time) { Fed.Enqueue(NowUs); Enq(1, vk, sc, flags, time); }        // self-test: KBDLLHOOKSTRUCT fields
+  public void SetLocal(Mon[] ms) { local = ms; fixedMons = true; }   // self-test: this PC's monitors
+  public void SetCursor(int x, int y) { cx = x + 0.5; cy = y + 0.5; }   // self-test: this PC's pointer
+  void Enq(int kind, int a, int b, int c, int d) { evq.Enqueue(new Ev { Kind = kind, A = a, B = b, C = c, D = d }); wake.Set(); }
+  static Thread Run(ThreadStart f) { var t = new Thread(f); t.IsBackground = true; t.Start(); return t; }
+  void Note(string s) { if (Log.Count < 500) Log.Enqueue(s); }
+  void Would(string s) { if (Injected.Count < 100000) Injected.Enqueue(NowUs + "|" + s); }
+  void OnNetChange(object s, EventArgs e) { kick = true; wake.Set(); }
+  static void Dpi() { try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch {} }   // PerMonitorV2: physical pixels on this thread
+
+  // ---------- the pump: input events, mouse coalescing, heartbeats, resends, reconnects ----------
+  void PumpLoop() {
+    Dpi(); DateTime wall = DateTime.UtcNow;
+    while (running) {
+      wake.WaitOne(dirty ? 1 : 20);
+      try {
+        if ((DateTime.UtcNow - wall).TotalSeconds > 3) Kick("this PC woke up");   // the loop runs every 20 ms, so a gap means sleep
+        wall = DateTime.UtcNow;
+        if (kick) { kick = false; ifFor = null; Kick("the network changed"); }
+        if (endPending) { endPending = false; EndControl(); }
+        if (panic) { panic = false; if (Active) { Note("panic key: the keyboard and mouse are back on this PC"); Return(-1, true); } else ReleaseLocal(); }
+        if (lockEvt) { lockEvt = false; if (Active) Return(-1, true); if (LockSync && Up && Ms - lockedAt > 3000) { Rel(new[] { (byte)'X' }); Note("this PC locked: locking " + peerName + " too"); } }
+        Ev e; while (evq.TryDequeue(out e)) Process(e);
+        if (dirty && Us - flushedUs >= 1000) Flush();   // at most one mouse packet per millisecond
+        Periodic(Ms);
+      } catch (Exception x) { Note("error: " + x.Message); }
+    }
+    try { if (Active) Return(-1, true); EndControl(); Exec(true); if (timer1) { timeEndPeriod(1); timer1 = false; } } catch {}
+    if (win != null) PostMessage(win.Handle, 0x8003, IntPtr.Zero, IntPtr.Zero);
+  }
+  void Periodic(long now) {
+    if (!fixedMons && now - monsAt >= 2000) { monsAt = now; local = ReadMons(); }
+    bool wantRaw = Sender && !NoInject;
+    if (wantRaw != rawOn && win != null) { rawOn = wantRaw; PostMessage(win.Handle, 0x8002, (IntPtr)(wantRaw ? 1 : 0), IntPtr.Zero); }
+    if (!Sender && Active) Return(-1, true);
+    if (Controlled && !NoInject && now - uipiAt >= 500) { uipiAt = now; Uipi = ElevatedFront(); }
+    byte[] key = Key; IPAddress peer = Peer;
+    if (key == null) return;
+    if (key != helloKeyFor) { lock (gate) { helloKey = Dg.SessionKey(key, "link hello", LinkProto.Empty); helloKeyFor = key; } NewSession("a new pairing"); }
+    if (peer != null && !peer.Equals(ifFor)) { ifFor = peer; SetIf(peer); }
+    int f; lock (gate) { f = conn.Tick(now); Up = conn.Up; }
+    if ((f & 4) != 0) NewSession("no answer for 1.5 s");
+    if ((f & 1) != 0) SendHello();
+    if ((f & 2) != 0) SendBeat();
+    lock (gate) foreach (var it in rel.Due(now, Rto())) SendRel(it);
+    if (Active) {
+      bool wantRel = Game && remoteGame;
+      if (wantRel != relMode) { Flush(); relMode = wantRel; co = new Coalescer(); if (!wantRel) { mx = remoteX + 0.5; my = remoteY + 0.5; } Note(wantRel ? "game mode: sending raw movement" : "game mode off"); }
+      if (!NoInject) { int w = wd.Tick(now); if (w == 1) Probe(); else if (w == 2) { Note("the input hook stopped answering; installed it again"); Hooks(true); } }
+    }
+    Exec(false);
+    if (Active != timer1) { if (Active) timeBeginPeriod(1); else timeEndPeriod(1); timer1 = Active; }   // 1 ms waits only while in use
+  }
+  int Rto() { double r = Rtt; return r < 0 ? 50 : Math.Max(20, Math.Min(250, (int)(2 * r) + 10)); }
+  void Kick(string why) { bool down; lock (gate) { conn.Kick(Ms); down = !conn.Up; } if (down && Key != null) Note("reconnecting: " + why); }
+  void NewSession(string why) {   // a fresh nonce makes both PCs start a new session: no stale keys survive a loss
+    bool was = Up; EndControl();
+    lock (gate) { myNonce = Dg.Random(8); peerNonce = null; sessKey = null; rel = new Reliable(); conn = new Conn(); conn.Kick(Ms); Up = false; rxMSeq = 0; }
+    Rtt = -1; if (was) Note("lost " + peerName + ": " + why);
+  }
+  void EndControl() {   // leave or loss: control comes back here, everything held is released on this side
+    if (Active) Return(-1, false);
+    if (Controlled) { ReleaseAll(); Controlled = false; Note(peerName + " no longer controls this PC"); }
+  }
+  void Exec(bool off) {   // keep this PC awake while the other PC has control (sender), and its screen too while controlled
+    uint want = off ? 0 : Active ? 1u : Controlled ? 3u : 0u;
+    if (want == exec) return; exec = want;
+    if (!NoInject) SetThreadExecutionState(0x80000000u | want);   // ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+  }
+
+  // ---------- sender: input events ----------
+  static readonly int[] RawDown = { 1, 4, 0x10, 0x40, 0x100 }, RawUp = { 2, 8, 0x20, 0x80, 0x200 }, BtnVk = { 1, 2, 4, 5, 6 };   // L R M X1 X2
+  void Process(Ev e) {
+    if (e.Kind == 1) { if (Active) KeyOut(e.A, e.B, e.C); return; }
+    int dx = e.A, dy = e.B, bf = e.C;
+    for (int b = 0; b < 5; b++) { if ((bf & RawDown[b]) != 0) phys[BtnVk[b]] = true; if ((bf & RawUp[b]) != 0) phys[BtnVk[b]] = false; }
+    if (!Active) {
+      if (NoInject) Geo.Move(local, ref cx, ref cy, dx, dy, '\0', 0);   // the self-test's pointer
+      if ((dx != 0 || dy != 0) && Sender && Up && HasRemote && !Blocked()) {
+        int x, y; Cursor(out x, out y); double f = Geo.Leave(local, x, y, dx, dy, Dir, Dead);
+        if (f >= 0) Enter(f, x, y);
+      }
+      return;
+    }
+    if (dx != 0 || dy != 0) {
+      double s = Geo.Scale(Speed, localDpi, Geo.DpiAt(remote, mx, my));
+      if (relMode) co.Add(dx * s, dy * s);
+      else { double f = Geo.Move(remote, ref mx, ref my, dx * s, dy * s, Geo.Opp(Dir), Dead); if (f >= 0) { dirty = true; Flush(); Return(f, true); return; } }
+      dirty = true;
+    }
+    for (int b = 0; b < 5; b++) {
+      if ((bf & (RawDown[b] | RawUp[b])) == 0) continue;
+      Flush();   // the pointer gets there before the click
+      var d = new byte[12]; d[0] = (byte)'B'; d[1] = (byte)b; d[2] = (byte)((bf & RawDown[b]) != 0 ? 1 : 0); d[3] = (byte)(relMode ? 1 : 0);
+      Put(d, 4, (uint)Geo.F(mx)); Put(d, 8, (uint)Geo.F(my)); Rel(d);
+    }
+    if ((bf & 0x400) != 0) Wheel(false, e.D);   // raw deltas, small ones too (precision touchpads, free-spinning wheels)
+    if ((bf & 0x800) != 0) Wheel(true, e.D);
+  }
+  void Wheel(bool h, int delta) { var d = new byte[4]; d[0] = (byte)'W'; d[1] = (byte)(h ? 1 : 0); BitConverter.GetBytes((short)delta).CopyTo(d, 2); Rel(d); }
+  void KeyOut(int vk, int sc, int fl) {
+    if (KeyMap.FakeCtrl(vk, sc)) return;
+    bool up = (fl & 0x80) != 0; int before = mods;
+    mods = KeyMap.Apply(mods, vk, up); phys[vk & 0xFF] = !up;
+    if (!up && PanicMods != 0 && (vk == PanicVk || (PanicVk == 0x13 && vk == 3)) && (KeyMap.HotMods(before) & PanicMods) == PanicMods) {   // Ctrl+Pause arrives as Break
+      Note("panic key: the keyboard and mouse are back on this PC"); Return(-1, true); return;
+    }
+    Rel(new[] { (byte)'K', (byte)sc, (byte)((up ? 1 : 0) | ((fl & 1) != 0 ? 2 : 0)), (byte)vk, (byte)before });
+  }
+  void Enter(double f, int x, int y) {
+    int ex, ey; Geo.Entry(remote, Geo.Opp(Dir), f, out ex, out ey);
+    mx = ex + 0.5; my = ey + 0.5; localDpi = Geo.DpiAt(local, x, y); relMode = Game && remoteGame; co = new Coalescer(); dirty = false;
+    mods = 0; for (int b = 0; b < 8; b++) { int vk = KeyMap.Vk[b]; phys[vk] = Down(vk); if (phys[vk]) mods |= 1 << b; }   // held while crossing: the first key carries them
+    Active = true; wd.Reset(Ms); Hooks(true);
+    var d = new byte[9]; d[0] = (byte)'E'; Put(d, 1, (uint)ex); Put(d, 5, (uint)ey); Rel(d);
+    Note("keyboard and mouse -> " + peerName);
+  }
+  void Return(double f, bool tell) {   // f >= 0: the pointer came back across the edge there
+    if (!Active) return;
+    Active = false; dirty = false; Hooks(false);
+    if (tell) Rel(new[] { (byte)'L' });
+    if (f >= 0) { int x, y; Geo.Entry(local, Dir, f, out x, out y); if (NoInject) SetCursor(x, y); else SetCursorPos(x, y); }
+    ReleaseLocal();
+    Note("keyboard and mouse back on this PC");
+  }
+  void ReleaseLocal() {   // keys and buttons Windows here still thinks are down, though they were let go while the other PC had them
+    if (NoInject) return;
+    for (int b = 0; b < 8; b++) { int vk = KeyMap.Vk[b]; if (!phys[vk] && Down(vk)) SendKey(KeyMap.Sc[b], KeyMap.Ext[b], 0, true); }
+    for (int b = 0; b < 5; b++) if (!phys[BtnVk[b]] && Down(BtnVk[b])) SendMouse(0, 0, b == 3 ? 1u : b == 4 ? 2u : 0u, BtnUp[b]);
+  }
+  bool Down(int vk) { return NoInject ? phys[vk] : (GetAsyncKeyState(vk) & 0x8000) != 0; }
+  void Flush() {
+    if (!dirty || !Active) { dirty = false; return; }
+    dirty = false; flushedUs = Us;
+    var d = new byte[18]; d[0] = (byte)'M';
+    if (relMode) { int dx, dy; if (!co.Take(out dx, out dy)) return; sumX += dx; sumY += dy; d[9] = 1; Put(d, 10, (uint)sumX); Put(d, 14, (uint)sumY); }
+    else { Put(d, 10, (uint)Geo.F(mx)); Put(d, 14, (uint)Geo.F(my)); }
+    Put(d, 5, ++mSeq); SendSession(d);
+  }
+  void Cursor(out int x, out int y) {
+    if (NoInject) { x = Sender ? Geo.F(cx) : lastX; y = Sender ? Geo.F(cy) : lastY; return; }
+    PT p; GetCursorPos(out p); x = p.x; y = p.y;
+  }
+  bool Blocked() {   // a game holds the pointer here: ClipCursor, or a full-screen Direct3D app
+    if (NoInject) return TestBlocked;
+    Mon[] ms = local; if (ms.Length == 0) return false;
+    int vx, vy, vw, vh; Geo.Bounds(ms, out vx, out vy, out vw, out vh); RC c;
+    if (GetClipCursor(out c) && (c.l > vx || c.t > vy || c.r < vx + vw || c.b < vy + vh)) return true;
+    int q; return SHQueryUserNotificationState(out q) == 0 && q == 3;   // QUNS_RUNNING_D3D_FULL_SCREEN
+  }
+
+  // ---------- sending ----------
+  void Rel(byte[] d) { lock (gate) { if (sessKey == null || !conn.Up) return; SendRel(rel.Add(d, Ms)); } }
+  void SendRel(Reliable.Item it) { var b = new byte[9 + it.Data.Length]; b[0] = (byte)'R'; Put(b, 5, it.Seq); it.Data.CopyTo(b, 9); SendSession(b); }
+  void SendSession(byte[] b) {   // fills in the ack
+    byte[] k, me; lock (gate) { k = sessKey; me = myNonce; Put(b, 1, rel.Ack); }
+    if (k != null) Send(LinkProto.Seal(k, 1, me, b, b.Length, LinkProto.Version));
+  }
+  void SendHello() {
+    byte[] hk, me, known; lock (gate) { hk = helloKey; me = myNonce; known = peerNonce; }
+    if (hk == null) return;
+    byte[] nm = Encoding.UTF8.GetBytes(Name ?? ""), b = new byte[16 + Math.Min(nm.Length, 64)];
+    if (known != null) known.CopyTo(b, 0);
+    BitConverter.GetBytes(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()).CopyTo(b, 8);
+    Buffer.BlockCopy(nm, 0, b, 16, b.Length - 16);
+    Send(LinkProto.Seal(hk, 0, me, b, b.Length, LinkProto.Version));
+  }
+  void SendBeat() {
+    Mon[] ms = local; int n = Math.Min(ms.Length, 16); var b = new byte[31 + 18 * n];
+    b[0] = (byte)'H'; Put(b, 5, ++hbSeq); uint now = Us | 1, pt = peerT; Put(b, 9, now); Put(b, 13, pt); Put(b, 17, pt == 0 ? 0 : now - peerTAt);
+    b[21] = (byte)(Blocked() ? 1 : 0);
+    int x, y; Cursor(out x, out y); Put(b, 22, (uint)x); Put(b, 26, (uint)y); b[30] = (byte)n;
+    for (int i = 0; i < n; i++) { int o = 31 + 18 * i; Put(b, o, (uint)ms[i].L); Put(b, o + 4, (uint)ms[i].T); Put(b, o + 8, (uint)ms[i].R); Put(b, o + 12, (uint)ms[i].B); BitConverter.GetBytes((ushort)ms[i].Dpi).CopyTo(b, o + 16); }
+    SendSession(b);
+  }
+  void Send(byte[] p) {
+    IPAddress a = Peer; if (a == null) return;
+    if (DropPct > 0) lock (rnd) if (rnd.Next(100) < DropPct) return;
+    try { sock.SendTo(p, new IPEndPoint(a, peerPort)); } catch (Exception e) { if (running && Ms - errAt > 5000) { errAt = Ms; Note("can't send: " + e.Message); } }
+  }
+  void SetIf(IPAddress peer) {   // IP_UNICAST_IF: leave through the adapter whose subnet holds the other PC (not a VPN or Hyper-V one)
+    int i = -1; try { i = Nic.ForPeer(peer); } catch {}
+    try { sock.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, IPAddress.HostToNetworkOrder(Math.Max(i, 0))); } catch {}
+    if (i >= 0) Note("reaching " + peer + " through network adapter " + i);
+  }
+  static void Put(byte[] b, int o, uint v) { b[o] = (byte)v; b[o + 1] = (byte)(v >> 8); b[o + 2] = (byte)(v >> 16); b[o + 3] = (byte)(v >> 24); }
+  static uint U(byte[] b, int o) { return BitConverter.ToUInt32(b, o); }
+  static int I(byte[] b, int o) { return BitConverter.ToInt32(b, o); }
+  static bool Same(byte[] a, byte[] b) { if (a == null || b == null || a.Length != b.Length) return false; for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false; return true; }
+  static byte[] Order(byte[] a, byte[] b) { for (int i = 0; i < 8; i++) if (a[i] != b[i]) return a[i] < b[i] ? Files.Cat(a, b) : Files.Cat(b, a); return Files.Cat(a, b); }
+
+  // ---------- receiving ----------
+  void NetLoop() {
+    Dpi(); var buf = new byte[2048]; EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+    while (running) {
+      try {
+        if (!sock.Poll(100000, SelectMode.SelectRead)) continue;
+        int n = sock.ReceiveFrom(buf, ref from);
+        OnPacket(buf, n, ((IPEndPoint)from).Address);
+      } catch (ObjectDisposedException) { return; }
+      catch (Exception x) { if (running) { Note("network: " + x.Message); Thread.Sleep(200); } }
+    }
+  }
+  void OnPacket(byte[] p, int n, IPAddress src) {
+    byte[] hk = helloKey; int ver, kind; byte[] nonce;
+    if (hk == null || n < 12 || p[0] != 'D' || p[1] != 'L') return;
+    if (p[3] == 0) {
+      byte[] h = LinkProto.Open(hk, p, n, out ver, out kind, out nonce);
+      if (h == null || h.Length < 16) return;   // not paired with this PC
+      if (ver != LinkProto.Version) { VersionMsg = LinkProto.VersionText(ver, Encoding.UTF8.GetString(h, 16, h.Length - 16)); return; }
+      Hello(h, nonce, src); return;
+    }
+    byte[] sk = sessKey, pn = peerNonce; if (sk == null) return;
+    byte[] b = LinkProto.Open(sk, p, n, out ver, out kind, out nonce);
+    if (b == null || ver != LinkProto.Version || kind != 1 || !Same(nonce, pn)) return;
+    if (!src.Equals(Peer)) { Note(peerName + " is now at " + src); Peer = src; }
+    Session(b);
+  }
+  void Hello(byte[] h, byte[] nonce, IPAddress src) {
+    var known = new byte[8]; Buffer.BlockCopy(h, 0, known, 0, 8);
+    long t = BitConverter.ToInt64(h, 8); string name = Encoding.UTF8.GetString(h, 16, h.Length - 16);
+    bool reply, came = false;
+    lock (gate) {
+      if (!Same(nonce, peerNonce)) {   // the other PC (re)started its session
+        if (conn.Up && t <= lastHelloT) return;   // an old hello played back
+        if (conn.Up || Active || Controlled) { endPending = true; wake.Set(); }
+        peerNonce = nonce; lastHelloT = t; sessKey = Dg.SessionKey(Key, "link", Order(myNonce, nonce)); rel = new Reliable(); rxMSeq = 0;
+        conn = new Conn(); Up = false;
+      }
+      if (name != "") peerName = name;
+      VersionMsg = "";
+      reply = !Same(known, myNonce);
+      if (!reply) { came = conn.Rx(Ms); Up = true; }   // it knows this PC: the session is up
+    }
+    if (!src.Equals(Peer)) Peer = src;
+    if (reply) SendHello();
+    if (came) { Note("connected to " + peerName); wake.Set(); }
+  }
+  void Session(byte[] b) {
+    if (b.Length < 5) return;
+    bool came; lock (gate) { came = conn.Rx(Ms); Up = true; rel.Acked(U(b, 1)); }
+    if (came) { Note("connected to " + peerName); wake.Set(); }
+    switch ((char)b[0]) {
+      case 'H': Beat(b); break;
+      case 'M': if (b.Length >= 18) Mouse(U(b, 5), b[9], I(b, 10), I(b, 14)); break;
+      case 'R':
+        if (b.Length < 10) break;
+        var d = new byte[b.Length - 9]; Buffer.BlockCopy(b, 9, d, 0, d.Length);
+        List<byte[]> got; lock (gate) got = rel.Got(U(b, 5), d);
+        foreach (var g in got) Deliver(g);
+        SendSession(new[] { (byte)'A', (byte)0, (byte)0, (byte)0, (byte)0 });
+        break;
+    }
+  }
+  void Beat(byte[] b) {
+    if (b.Length < 31) return;
+    loss.Got(U(b, 5)); Loss = loss.Pct;
+    uint now = Us, t = U(b, 9), echo = U(b, 13), hold = U(b, 17);
+    if (echo != 0) { double r = (uint)(now - echo - hold) / 1000.0; if (r < 5000) Rtt = Rtt < 0 ? r : Rtt * 0.8 + r * 0.2; }
+    peerT = t; peerTAt = now;
+    remoteGame = (b[21] & 1) != 0; remoteX = I(b, 22); remoteY = I(b, 26);
+    int n = b[30]; if (n < 1 || n > 16 || b.Length < 31 + 18 * n) return;
+    var ms = new Mon[n];
+    for (int i = 0; i < n; i++) { int o = 31 + 18 * i; ms[i] = new Mon(I(b, o), I(b, o + 4), I(b, o + 8), I(b, o + 12), BitConverter.ToUInt16(b, o + 16)); if (ms[i].R <= ms[i].L || ms[i].B <= ms[i].T) return; }
+    remote = ms;
+  }
+  void Mouse(uint seq, int mode, int a, int b) {
+    if (!Controlled) return;
+    if (rxMSeq != 0 && (int)(seq - rxMSeq) <= 0) { Stale++; return; }   // older than what is already here
+    rxMSeq = seq;
+    if (mode == 0) { rxRel = false; InjMove(a, b); return; }
+    if (!rxRel) { rxRel = true; rxSumX = a; rxSumY = b; return; }   // running sums: a lost packet's movement still arrives
+    int dx = a - rxSumX, dy = b - rxSumY; rxSumX = a; rxSumY = b;
+    if (dx != 0 || dy != 0) InjRel(dx, dy);
+  }
+  void Deliver(byte[] d) {
+    switch ((char)d[0]) {
+      case 'E': if (d.Length < 9) return; Controlled = true; rxRel = false; lastX = int.MinValue; InjMove(I(d, 1), I(d, 5)); Note(peerName + " controls this PC"); break;
+      case 'L': if (Controlled) { ReleaseAll(); Controlled = false; Note(peerName + " no longer controls this PC"); } break;
+      case 'K': if (Controlled && d.Length >= 5) KeyIn(d[1], d[2], d[3], d[4]); break;
+      case 'B': if (Controlled && d.Length >= 12) { if (d[3] == 0) InjMove(I(d, 4), I(d, 8)); InjButton(d[1], d[2] != 0); } break;
+      case 'W': if (Controlled && d.Length >= 4) InjWheel(d[1] != 0, BitConverter.ToInt16(d, 2)); break;
+      case 'X': if (LockSync) { lockedAt = Ms; Note("locked together with " + peerName); if (NoInject) Would("lock"); else LockWorkStation(); } break;
+    }
+  }
+
+  // ---------- receiver: injection (never fatal: a refusal is counted and shown) ----------
+  void KeyIn(int sc, int fl, int vk, int want) {
+    lock (injGate) {
+      foreach (int c in KeyMap.Reconcile(want, HaveMods())) { int b = c & 0xFF; SendKey(KeyMap.Sc[b], KeyMap.Ext[b], KeyMap.Vk[b], (c & 0x100) == 0); }
+      SendKey(sc, (fl & 2) != 0, vk, (fl & 1) != 0);
+    }
+  }
+  int HaveMods() {
+    if (NoInject) return held.Mods();
+    int m = 0; for (int b = 0; b < 8; b++) if ((GetAsyncKeyState(KeyMap.Vk[b]) & 0x8000) != 0) m |= 1 << b; return m;
+  }
+  void SendKey(int sc, bool ext, int vk, bool up) {
+    bool byVk = sc == 0 || vk == 0x13 || vk == 3;   // ponytail: Pause/Break has no usable scan code; those go by virtual key
+    if (!Active) held.Key(byVk ? 0x10000 | vk : sc | (ext ? 0x100 : 0), up);   // the sender's own releases aren't the receiver's
+    if (NoInject) { Would("key " + (byVk ? "vk" + vk.ToString("X2") : sc.ToString("X2")) + (ext ? " ext" : "") + (up ? " up" : " down")); return; }
+    var i = new INPUT { type = 1 }; i.u.k.vk = (ushort)(byVk ? vk : 0); i.u.k.sc = (ushort)(byVk ? 0 : sc);
+    i.u.k.flags = (uint)((byVk ? 0 : 8) | (ext ? 1 : 0) | (up ? 2 : 0)); i.u.k.extra = (IntPtr)OwnTag;   // KEYEVENTF_SCANCODE, EXTENDEDKEY, KEYUP
+    Inject(i);
+  }
+  void InjMove(int x, int y) {
+    if (x == lastX && y == lastY) return;
+    lastX = x; lastY = y;
+    if (NoInject) { Would("move " + x + "," + y); return; }
+    Mon[] ms = local; if (ms.Length == 0) return;
+    int vx, vy, vw, vh; Geo.Bounds(ms, out vx, out vy, out vw, out vh);
+    SendMouse(Geo.Norm(x, vx, vw), Geo.Norm(y, vy, vh), 0, 0x8000 | 0x4000 | 1);   // ABSOLUTE | VIRTUALDESK | MOVE: no pointer acceleration
+  }
+  void InjRel(int dx, int dy) { if (NoInject) Would("rel " + dx + "," + dy); else SendMouse(dx, dy, 0, 1); }
+  static readonly uint[] BtnDown = { 2, 8, 0x20, 0x80, 0x80 }, BtnUp = { 4, 0x10, 0x40, 0x100, 0x100 };
+  void InjButton(int b, bool down) {
+    if (b > 4) return;
+    lock (injGate) {
+      held.Button(b, down);
+      if (NoInject) { Would("button " + b + (down ? " down" : " up")); return; }
+      SendMouse(0, 0, b == 3 ? 1u : b == 4 ? 2u : 0u, down ? BtnDown[b] : BtnUp[b]);   // X buttons: XBUTTON1 / XBUTTON2
+    }
+  }
+  void InjWheel(bool h, int delta) { if (NoInject) Would((h ? "hwheel " : "wheel ") + delta); else SendMouse(0, 0, (uint)delta, h ? 0x1000u : 0x800u); }
+  void ReleaseAll() {
+    lock (injGate) {
+      foreach (int k in held.TakeKeys()) { if ((k & 0x10000) != 0) SendKey(0, false, k & 0xFF, true); else SendKey(k & 0xFF, (k & 0x100) != 0, 0, true); }
+      foreach (int b in held.TakeButtons()) InjButton(b, false);
+    }
+  }
+  void SendMouse(int dx, int dy, uint data, uint flags) {
+    var i = new INPUT { type = 0 }; i.u.m.dx = dx; i.u.m.dy = dy; i.u.m.data = data; i.u.m.flags = flags; i.u.m.extra = (IntPtr)OwnTag; Inject(i);
+  }
+  void Inject(INPUT i) {
+    if (SendInput(1, new[] { i }, Marshal.SizeOf(typeof(INPUT))) == 1) { if (InjectError != "" && Ms - errAt > 5000) InjectError = ""; return; }
+    int e = Marshal.GetLastWin32Error(); InjectFails++;
+    InjectError = e == 5 ? "Windows refused input from " + peerName + ": the lock screen or an admin prompt is in front on this PC."
+                         : "Windows refused input from " + peerName + " (error " + e + ").";
+    if (Ms - errAt > 5000) { errAt = Ms; Note(InjectError); }
+  }
+  static bool ElevatedFront() {   // UIPI: Windows silently drops input to an admin window, so look for one in front
+    uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid); if (pid == 0) return false;
+    IntPtr p = OpenProcess(0x1000, false, pid); if (p == IntPtr.Zero) return false;   // PROCESS_QUERY_LIMITED_INFORMATION
+    try {
+      IntPtr t; if (!OpenProcessToken(p, 8, out t)) return true;   // TOKEN_QUERY refused: it runs above this PC's user
+      try { int elev, n; return GetTokenInformation(t, 20, out elev, 4, out n) && elev != 0; } finally { CloseHandle(t); }   // TokenElevation
+    } finally { CloseHandle(p); }
+  }
+  void Probe() {   // the hook watchdog's probes: a zero move and a key-up of a key that doesn't exist, both swallowed by the hooks
+    var m = new INPUT { type = 0 }; m.u.m.flags = 1; m.u.m.extra = (IntPtr)ProbeTag;
+    var k = new INPUT { type = 1 }; k.u.k.vk = 0xFF; k.u.k.flags = 2; k.u.k.extra = (IntPtr)ProbeTag;
+    SendInput(2, new[] { m, k }, Marshal.SizeOf(typeof(INPUT)));
+  }
+
+  // ---------- the message thread: Raw Input, the hooks, lock and session notifications ----------
+  class Win : System.Windows.Forms.NativeWindow {
+    public Link L;
+    protected override void WndProc(ref System.Windows.Forms.Message m) { try { L.OnMsg(m.Msg, m.WParam, m.LParam); } catch {} base.WndProc(ref m); }
+  }
+  void MsgLoop() {
+    Dpi();
+    try {
+      var cp = new System.Windows.Forms.CreateParams(); cp.Parent = new IntPtr(-3);   // HWND_MESSAGE
+      win = new Win { L = this }; win.CreateHandle(cp); rawBuf = Marshal.AllocHGlobal(256);
+      WTSRegisterSessionNotification(win.Handle, 0);
+    } catch (Exception e) { Note("no message window: " + e.Message); win = null; }
+    winReady.Set();
+    if (win == null) return;
+    System.Windows.Forms.Application.Run();
+    SetHooks(false); if (rawOn) SetRaw(false); WTSUnRegisterSessionNotification(win.Handle); win.DestroyHandle(); Marshal.FreeHGlobal(rawBuf);
+  }
+  void OnMsg(int msg, IntPtr w, IntPtr l) {
+    if (msg == 0xFF) {   // WM_INPUT
+      uint size = 256; int dx, dy, bf, bd;
+      if (GetRawInputData(l, 0x10000003, rawBuf, ref size, (uint)HdrSize) != uint.MaxValue && ParseRaw(rawBuf, out dx, out dy, out bf, out bd)) Enq(0, dx, dy, bf, bd);
+    }
+    else if (msg == 0x2B1) { if (w.ToInt32() == 7) lockEvt = true; else kick = true; wake.Set(); }   // WM_WTSSESSION_CHANGE: 7 = locked
+    else if (msg == 0x8001) SetHooks(w != IntPtr.Zero);
+    else if (msg == 0x8002) SetRaw(w != IntPtr.Zero);
+    else if (msg == 0x8003) System.Windows.Forms.Application.ExitThread();
+  }
+  void Hooks(bool on) { if (win != null) PostMessage(win.Handle, 0x8001, (IntPtr)(on ? 1 : 0), IntPtr.Zero); }
+  void SetRaw(bool on) {
+    var r = new RID { page = 1, usage = 2, flags = on ? 0x100u : 1u, hwnd = on ? win.Handle : IntPtr.Zero };   // the mouse; RIDEV_INPUTSINK / RIDEV_REMOVE
+    if (!RegisterRawInputDevices(new[] { r }, 1, Marshal.SizeOf(typeof(RID))) && on) Note("can't read the mouse (Raw Input error " + Marshal.GetLastWin32Error() + ")");
+  }
+  static readonly int HdrSize = IntPtr.Size == 8 ? 24 : 16;   // RAWINPUTHEADER
+  public static int RawHeader { get { return HdrSize; } }
+  // A RAWINPUT -> movement, usButtonFlags and usButtonData; false if it isn't from a real mouse (injected input has no device)
+  public static bool ParseRaw(IntPtr p, out int dx, out int dy, out int buttons, out int data) {
+    dx = dy = buttons = data = 0;
+    if (Marshal.ReadInt32(p, 0) != 0 || Marshal.ReadIntPtr(p, 8) == IntPtr.Zero) return false;   // RIM_TYPEMOUSE, hDevice
+    int o = HdrSize, flags = Marshal.ReadInt16(p, o) & 0xFFFF;
+    buttons = Marshal.ReadInt16(p, o + 4) & 0xFFFF; data = Marshal.ReadInt16(p, o + 6);
+    if ((flags & 1) == 0) { dx = Marshal.ReadInt32(p, o + 12); dy = Marshal.ReadInt32(p, o + 16); }   // ponytail: absolute devices (pens, remote desktop) only click
+    return true;
+  }
+  // Low-level hooks: installed only while the other PC has control. The callbacks only enqueue and return.
+  delegate IntPtr HookProc(int c, IntPtr w, IntPtr l);
+  static readonly HookProc kbProc = KbProc, msProc = MsProc;
+  static volatile Link hookFor; static IntPtr kbHook, msHook;
+  void SetHooks(bool on) {
+    if (kbHook != IntPtr.Zero) UnhookWindowsHookEx(kbHook);
+    if (msHook != IntPtr.Zero) UnhookWindowsHookEx(msHook);
+    kbHook = msHook = IntPtr.Zero;
+    if (!on || NoInject || !Active) return;
+    hookFor = this; IntPtr mod = GetModuleHandle(null);
+    kbHook = SetWindowsHookEx(13, kbProc, mod, 0); msHook = SetWindowsHookEx(14, msProc, mod, 0);
+    if (kbHook == IntPtr.Zero || msHook == IntPtr.Zero) Note("couldn't install the input hook (error " + Marshal.GetLastWin32Error() + ")");
+  }
+  static IntPtr KbProc(int c, IntPtr w, IntPtr l) {   // KBDLLHOOKSTRUCT: vk 0, scan 4, flags 8, time 12, extra 16
+    Link o = hookFor;
+    if (c >= 0 && o != null) {
+      long x = Marshal.ReadIntPtr(l, 16).ToInt64();
+      if (x == ProbeTag) { o.wd.Seen(1); return (IntPtr)1; }
+      if (x != OwnTag && o.Active) { o.Enq(1, Marshal.ReadInt32(l, 0), Marshal.ReadInt32(l, 4), Marshal.ReadInt32(l, 8), Marshal.ReadInt32(l, 12)); return (IntPtr)1; }
+    }
+    return CallNextHookEx(IntPtr.Zero, c, w, l);
+  }
+  static IntPtr MsProc(int c, IntPtr w, IntPtr l) {   // MSLLHOOKSTRUCT: extra at 24 (x64); the movement itself comes from Raw Input
+    Link o = hookFor;
+    if (c >= 0 && o != null) {
+      long x = Marshal.ReadIntPtr(l, IntPtr.Size == 8 ? 24 : 20).ToInt64();
+      if (x == ProbeTag) { o.wd.Seen(2); return (IntPtr)1; }
+      if (x != OwnTag && o.Active) return (IntPtr)1;
+    }
+    return CallNextHookEx(IntPtr.Zero, c, w, l);
+  }
+  public static int HookTest(Link l, bool keyboard, IntPtr data) {   // self-test: one hook callback on a made-up struct; 1 = swallowed
+    hookFor = l; try { return (keyboard ? KbProc(0, IntPtr.Zero, data) : MsProc(0, IntPtr.Zero, data)).ToInt32(); } finally { hookFor = null; }
+  }
+  delegate bool MonEnum(IntPtr h, IntPtr dc, ref RC r, IntPtr p);
+  static Mon[] ReadMons() {   // physical pixels (this thread is PerMonitorV2) and each monitor's DPI
+    var o = new List<Mon>();
+    MonEnum cb = (IntPtr h, IntPtr dc, ref RC r, IntPtr p) => { uint x, y; int dpi = 96; try { if (GetDpiForMonitor(h, 0, out x, out y) == 0) dpi = (int)x; } catch {} o.Add(new Mon(r.l, r.t, r.r, r.b, dpi)); return true; };
+    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
+    return o.ToArray();
+  }
+
+  [StructLayout(LayoutKind.Sequential)] struct RC { public int l, t, r, b; }
+  [StructLayout(LayoutKind.Sequential)] struct PT { public int x, y; }
+  [StructLayout(LayoutKind.Sequential)] struct RID { public ushort page, usage; public uint flags; public IntPtr hwnd; }
+  [StructLayout(LayoutKind.Sequential)] struct MOUSEIN { public int dx, dy; public uint data, flags, time; public IntPtr extra; }
+  [StructLayout(LayoutKind.Sequential)] struct KEYIN { public ushort vk, sc; public uint flags, time; public IntPtr extra; }
+  [StructLayout(LayoutKind.Explicit)] struct UNION { [FieldOffset(0)] public MOUSEIN m; [FieldOffset(0)] public KEYIN k; }
+  [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public UNION u; }
+  [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] i, int size);
+  [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+  [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out PT p);
+  [DllImport("user32.dll")] static extern bool GetClipCursor(out RC r);
+  [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc f, IntPtr mod, uint thread);
+  [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h, int c, IntPtr w, IntPtr l);
+  [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RID[] d, uint n, int size);
+  [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr h, uint cmd, IntPtr data, ref uint size, uint header);
+  [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] static extern bool LockWorkStation();
+  [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonEnum f, IntPtr p);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
+  [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string n);
+  [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint f);
+  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("advapi32.dll")] static extern bool OpenProcessToken(IntPtr p, uint access, out IntPtr t);
+  [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr t, int cls, out int info, int len, out int ret);
+  [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr h, int type, out uint x, out uint y);
+  [DllImport("shell32.dll")] static extern int SHQueryUserNotificationState(out int state);
+  [DllImport("wtsapi32.dll")] static extern bool WTSRegisterSessionNotification(IntPtr h, int flags);
+  [DllImport("wtsapi32.dll")] static extern bool WTSUnRegisterSessionNotification(IntPtr h);
+  [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
+  [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
+}
+
+// Text and pictures for the other PC (with DeskGlide Link; Synergy did this before). The PC where they were copied serves
+// them on the file port; the other PC pulls them when the mouse arrives: its own channel, off the input path, in chunks,
+// capped, with timeouts.
+public static class Clip {
+  public const int Max = 32 << 20;
+  public static volatile string OfferId = ""; static string kind; static byte[] data;
+  public static bool Offer(string k, byte[] d) {
+    if (d != null && d.Length > Max) d = null;
+    kind = k; data = d; OfferId = d == null ? "" : Dg.Hex(Dg.Random(8)); return d != null;
+  }
+  internal static void Serve(Stream s, byte[] k, string id, ref long tx) {
+    byte[] d = data; string kd = kind;
+    if (d == null || id != OfferId) { var g = Encoding.UTF8.GetBytes("gone"); Files.WriteFrame(s, k, 'S', tx++, g, 0, g.Length); return; }
+    var h = Encoding.UTF8.GetBytes("ok\n" + kd + "\n" + d.Length); Files.WriteFrame(s, k, 'S', tx++, h, 0, h.Length);
+    for (int o = 0; o < d.Length; o += 65536) Files.WriteFrame(s, k, 'S', tx++, d, o, Math.Min(65536, d.Length - o));
+    Files.WriteFrame(s, k, 'S', tx++, d, 0, 0);
+  }
+  public static volatile string Status = "";   // "" idle, "busy", "ok", or "error: ..."
+  public static string ResultKind; public static byte[] Result;
+  public static void Fetch(string host, int port, byte[] key, string id) {
+    Status = "busy"; Result = null;
+    var t = new Thread(() => { try { FetchRun(host, port, key, id); Status = "ok"; } catch (Exception e) { Status = "error: " + e.Message; } });
+    t.IsBackground = true; t.Start();
+  }
+  static void FetchRun(string host, int port, byte[] key, string id) {
+    using (var c = new TcpClient()) {
+      if (!c.ConnectAsync(host, port).Wait(5000)) throw new IOException("the other PC didn't answer");
+      c.ReceiveTimeout = 15000; c.SendTimeout = 15000; var s = c.GetStream();
+      byte[] nr = Dg.Random(16); s.Write(nr, 0, 16); byte[] ns = Files.ReadN(s, 16);
+      byte[] k = Dg.SessionKey(key, "files", Files.Cat(nr, ns)); long rx = 0;
+      byte[] ib = Encoding.UTF8.GetBytes("clip:" + id); Files.WriteFrame(s, k, 'R', 0, ib, 0, ib.Length);
+      string[] h = Encoding.UTF8.GetString(Files.ReadFrame(s, k, 'S', rx++)).Split('\n');
+      if (h[0] != "ok" || h.Length != 3) throw new IOException("gone");
+      int n = int.Parse(h[2]); if (n < 0 || n > Max) throw new IOException("too large");
+      var o = new byte[n]; int got = 0;
+      while (true) {
+        byte[] b = Files.ReadFrame(s, k, 'S', rx++); if (b.Length == 0) break;
+        if (got + b.Length > n) throw new IOException("bad length");
+        Buffer.BlockCopy(b, 0, o, got, b.Length); got += b.Length;
+      }
+      if (got != n) throw new IOException("cut short");
+      ResultKind = h[1]; Result = o;
+    }
   }
 }
