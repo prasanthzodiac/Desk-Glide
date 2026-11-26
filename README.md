@@ -145,6 +145,7 @@ Good to know:
 ## Tested on
 
 - Windows 11 with Synergy 3 and an MSI monitor (DisplayPort + HDMI)
+- `deskglide-audio.ps1` between two Windows PCs on the same Wi-Fi network
 
 Deskflow support relies on Deskflow writing the same `switch from "A" to "B"` log line as Synergy. If it doesn't work for you, please open an issue.
 
