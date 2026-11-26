@@ -20,7 +20,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.0'
+$Version = '5.1'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -52,7 +52,7 @@ function Load-Config {
           paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
           kmHost = ''; inputs = @{}; monOff = @(); detach = $false
           hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048; mic = 'off'; updateAt = 0
-          link = -not (Test-Path $cfgPath); linkSpeed = 100; game = $false; lockSync = $false; panicKey = 'Ctrl+Alt+Pause' }   # Link: on for new installs
+          link = -not (Test-Path $cfgPath); linkSpeed = 100; game = $false; lockSync = $false; panicKey = 'Ctrl+Alt+Pause'; dualPath = $true }   # Link: on for new installs; dualPath: Ethernet + Wi-Fi both
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
   $c.inputs = To-Hash $c.inputs; $c.monOff = @($c.monOff | ? { $_ })
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
@@ -307,6 +307,19 @@ function Link-Status($cfg, [bool]$paired, [bool]$online, [int]$peerVer, $l, [boo
   if ($l.Controlled) { return "The keyboard and mouse of $peer are on this PC." }
   "Connected. The keyboard and mouse of $peer come here when its pointer crosses the edge."
 }
+# The connection in one word: round trip and its jitter (ms), packet loss (%)
+function Link-Quality([double]$rtt, [double]$jitter, [double]$loss) {
+  if ($rtt -ge 80 -or $jitter -ge 30 -or $loss -ge 5) { 'Poor' } elseif ($rtt -ge 20 -or $jitter -ge 10 -or $loss -ge 1) { 'Fair' } else { 'Good' }
+}
+# Wi-Fi power saving from 'powercfg /q' (no admin): the current AC and DC values, in that order; 0 = Maximum Performance
+function PowerSave-On([string]$text, [bool]$onAC) {
+  $v = @([regex]::Matches($text, '0x([0-9a-fA-F]{8})') | % { [Convert]::ToInt32($_.Groups[1].Value, 16) })
+  $v.Count -ge 2 -and $v[$(if ($onAC) { 0 } else { 1 })] -gt 0
+}
+function Wifi-PowerSave {
+  $q = (powercfg /q SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 2>$null) -join "`n"
+  PowerSave-On $q ([Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus -ne 'Offline')
+}
 
 # What this PC's audio threads do: send and recv are 0, Sound (1) or Mic (2); dev is the waveOut device to play into (-1 = default).
 # The headphones PC receives the other PC's sound and sends its microphone; the other PC sends sound and plays the mic into VB-Cable.
@@ -354,7 +367,7 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         offer = $null; peerOffer = $null; fetchedId = ''; pasted = ''; fileMsg = ''; fileErr = $false; fileSaved = @()
         hk = [long]0; hkTo = ''; hkSeen = [long]0; lastSa = $null; hkSig = ''; hkErr = ''; msgWin = $null
         mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{}
-        link = $null; linkAt = [DateTime]::MinValue; linkWant = $null; synergy = $false; synAt = [DateTime]::MinValue; speedAt = $null
+        link = $null; linkAt = [DateTime]::MinValue; linkWant = $null; synergy = $false; synAt = [DateTime]::MinValue; speedAt = $null; psave = $false; psaveAt = [DateTime]::MinValue
         clipOffer = $null; peerClip = $null; clipGot = ''; clipSig = ''; clipSetAt = [DateTime]::MinValue }
 $tray = $null; $win = $null; $ui = @{}; $icons = @(); $logos = @()
 
@@ -595,11 +608,11 @@ if ($Test) {
   $lk = [Dg]::SessionKey($pk, 'link', [byte[]](1..16)); $nonce = [byte[]](1..8); $body = [byte[]](72, 1, 2, 3); $ver = 0; $kind = 0; $nn = $null
   $p = [LinkProto]::Seal($lk, 1, $nonce, $body, 4, [LinkProto]::Version)
   $o = [LinkProto]::Open($lk, $p, $p.Length, [ref]$ver, [ref]$kind, [ref]$nn)
-  Check ($o -and [Dg]::Hex($o) -eq '48010203' -and $ver -eq 1 -and $kind -eq 1 -and [Dg]::Hex($nn) -eq [Dg]::Hex($nonce) -and $p.Length -le 12 + 4 + [Dg]::CryptoOverhead) 'link packet round trip'
+  Check ($o -and [Dg]::Hex($o) -eq '48010203' -and $ver -eq [LinkProto]::Version -and $kind -eq 1 -and [Dg]::Hex($nn) -eq [Dg]::Hex($nonce) -and $p.Length -le 12 + 4 + [Dg]::CryptoOverhead) 'link packet round trip'
   foreach ($i in 2, 3, 5, 20, ($p.Length - 1)) { $t = [byte[]]$p.Clone(); $t[$i] = $t[$i] -bxor 1; Check ($null -eq [LinkProto]::Open($lk, $t, $t.Length, [ref]$ver, [ref]$kind, [ref]$nn)) "tampered link byte $i accepted" }
   Check ($null -eq [LinkProto]::Open($pk, $p, $p.Length, [ref]$ver, [ref]$kind, [ref]$nn) -and $null -eq [LinkProto]::Open($lk, $p, 40, [ref]$ver, [ref]$kind, [ref]$nn)) 'link packet: other key or cut short accepted'
-  $p2 = [LinkProto]::Seal($lk, 0, $nonce, $body, 4, 2); Check ([LinkProto]::Open($lk, $p2, $p2.Length, [ref]$ver, [ref]$kind, [ref]$nn) -and $ver -eq 2) 'version byte authenticated and readable'
-  Check (([LinkProto]::VersionText(2, 'PC-B')) -match 'Update DeskGlide on this PC' -and ([LinkProto]::VersionText(0, 'PC-B')) -match 'Update DeskGlide on PC-B') 'version mismatch: says which PC to update'
+  $nv = [LinkProto]::Version + 1; $p2 = [LinkProto]::Seal($lk, 0, $nonce, $body, 4, $nv); Check ([LinkProto]::Open($lk, $p2, $p2.Length, [ref]$ver, [ref]$kind, [ref]$nn) -and $ver -eq $nv) 'version byte authenticated and readable'
+  Check (([LinkProto]::VersionText($nv, 'PC-B')) -match 'Update DeskGlide on this PC' -and ([LinkProto]::VersionText(0, 'PC-B')) -match 'Update DeskGlide on PC-B') 'version mismatch: says which PC to update'
   # game mode: float deltas, whole pixels out, the remainder kept
   $co = New-Object Coalescer; $dx = 0; $dy = 0; 1..3 | % { $co.Add(0.4, -0.4) }
   Check ($co.Take([ref]$dx, [ref]$dy) -and $dx -eq 1 -and $dy -eq -1 -and [Math]::Abs($co.X - 0.2) -lt 1e-9 -and [Math]::Abs($co.Y + 0.2) -lt 1e-9) 'coalesce: whole pixels out, remainder kept'
@@ -635,14 +648,31 @@ if ($Test) {
   $mx = 10.5; $my = 700.5; $f = [Geo]::Move($two, [ref]$mx, [ref]$my, -20, 0, 'l', 8)
   Check ([Math]::Abs($f - 700.5 / 1440) -lt 1e-9 -and $mx -eq 0) 'pointer model leaves through the edge back to this PC'
   $mx = 10.5; $my = 3.5; Check ([Geo]::Move($two, [ref]$mx, [ref]$my, -20, 0, 'l', 8) -lt 0 -and $mx -eq 0) 'no way back through a corner'
-  Check ([Geo]::Norm(0, 0, 4480) -eq 0 -and [Geo]::Norm(4479, 0, 4480) -eq 65535 -and [Geo]::Norm(0, -1920, 3840) -eq 32776) 'absolute coordinates over the virtual desktop'
+  # absolute coordinates: every pixel round-trips whether Windows truncates (n * size / 65536) or rounds (n * (size - 1) / 65535);
+  # 100%, 125% and 150% layouts in physical pixels, one with a monitor left of the main one
+  $lays = @{ '100%' = @([Mon]::new(0, 0, 1920, 1080, 96)); '125%' = @([Mon]::new(0, 0, 2560, 1600, 120), [Mon]::new(2560, 0, 4480, 1080, 96))
+             '150%' = @([Mon]::new(-1920, 0, 0, 1080, 96), [Mon]::new(0, 0, 3840, 2160, 144)) }
+  foreach ($k in $lays.Keys) {
+    $ms = [Mon[]]$lays[$k]; $vx = 0; $vy = 0; $vw = 0; $vh = 0; [Geo]::Bounds($ms, [ref]$vx, [ref]$vy, [ref]$vw, [ref]$vh); $bad = @()
+    foreach ($m in $ms) {
+      $pts = @(@($m.L, $m.T), @(($m.L + 1), ($m.T + 1)), @([int](($m.L + $m.R) / 2), [int](($m.T + $m.B) / 2)), @(($m.R - 2), ($m.B - 2)), @(($m.R - 1), ($m.B - 1)))
+      foreach ($pt in $pts) { foreach ($a in 0, 1) {
+        $v = $pt[$a]; $o = @($vx, $vy)[$a]; $sz = @($vw, $vh)[$a]
+        $n = [Geo]::Norm($v, $o, $sz); $t = $o + [Math]::Floor($n * $sz / 65536); $r = $o + [Math]::Round($n * ($sz - 1) / 65535)
+        if ($t -ne $v -or $r -ne $v -or $n -lt 0 -or $n -gt 65535) { $bad += "$v -> $n -> $t/$r" } } }
+    }
+    $nx = [Geo]::Norm($vx + $vw - 1, $vx, $vw); $ny = [Geo]::Norm($vy + $vh - 1, $vy, $vh)
+    Check ($bad.Count -eq 0 -and $nx -ge 65500 -and $ny -ge 65500) "absolute coordinates, $k layout: bottom-right pixel -> $nx,$ny and back $($bad -join '; ')"
+  }
+  $cx = 5000; $cy = 1200; [Geo]::Clamp($two, [ref]$cx, [ref]$cy); $cx2 = 100; $cy2 = 1500; [Geo]::Clamp($two, [ref]$cx2, [ref]$cy2)
+  Check ($cx -eq 4479 -and $cy -eq 1200 -and $cx2 -eq 100 -and $cy2 -eq 1439) 'clamped onto the nearest monitor: the edge rows stay reachable'
   # reliable stream: out of order held back, delivered once and in order, resent until acknowledged
   $tx = New-Object Reliable; $rx = New-Object Reliable
   $i1 = $tx.Add([byte[]](1), 0); $i2 = $tx.Add([byte[]](2), 0); $i3 = $tx.Add([byte[]](3), 0)
   Check (@($rx.Got(2, $i2.Data)).Count -eq 0 -and @($rx.Got(3, $i3.Data)).Count -eq 0 -and $rx.Ack -eq 0) 'reliable: out of order held back'
   $d = @($rx.Got(1, $i1.Data)); Check ($d.Count -eq 3 -and $d[0][0] -eq 1 -and $d[1][0] -eq 2 -and $d[2][0] -eq 3 -and $rx.Ack -eq 3) 'reliable: delivered in order'
   Check (@($rx.Got(2, $i2.Data)).Count -eq 0 -and @($rx.Got(9000, $i2.Data)).Count -eq 0) 'reliable: duplicate or nonsense dropped'
-  Check (@($tx.Due(10, 30)).Count -eq 0 -and @($tx.Due(30, 30)).Count -eq 3 -and @($tx.Due(40, 30)).Count -eq 0) 'reliable: resent after the timeout'
+  Check (@($tx.Due(4, 30)).Count -eq 0 -and @($tx.Due(5, 30)).Count -eq 3 -and @($tx.Due(34, 30)).Count -eq 0 -and @($tx.Due(35, 30)).Count -eq 3) 'reliable: a second copy after 5 ms, then resent every timeout'
   $tx.Acked(2); $due = @($tx.Due(70, 30)); Check ($tx.Pending -eq 1 -and $due.Count -eq 1 -and $due[0].Seq -eq 3) 'reliable: an ack removes up to it, the rest is resent'
   $tx.Acked(3); Check ($tx.Pending -eq 0) 'reliable: all acknowledged'
   # heartbeat, loss and reconnect backoff (ms)
@@ -651,20 +681,39 @@ if ($Test) {
   Check ((@(5001..9000 | ? { $cn.Tick($_) -band 1 }) -join ',') -eq '5100,7100') 'reconnect backoff capped at 2 s, forever'
   $cn.Kick(9001); Check ($cn.Tick(9001) -band 1) 'network change or wake-up: hello right away'
   Check ($cn.Rx(9100) -and $cn.Up -and ($cn.Tick(9100) -band 2) -and -not ($cn.Tick(9200) -band 2) -and ($cn.Tick(9350) -band 2)) 'up: heartbeat every 250 ms'
-  Check (-not ($cn.Tick(10600) -band 4) -and $cn.Up) 'not lost at 1.5 s'
-  $f = $cn.Tick(10601); Check (($f -band 4) -and ($f -band 1) -and -not $cn.Up) 'lost after 1.5 s of silence, hello at once'
+  $cn.Fast = $true; Check (-not ($cn.Tick(9400) -band 2) -and ($cn.Tick(9600) -band 2) -and -not ($cn.Tick(9699) -band 2) -and ($cn.Tick(9700) -band 2)) 'while a PC has control: a keep-alive every 100 ms'
+  $cn.Fast = $false; [void]$cn.Rx(9100); $cn.Slack = 120
+  Check (-not ($cn.Tick(10720) -band 4) -and $cn.Up) 'not lost at 1.5 s plus the resend timeout'
+  $f = $cn.Tick(10721); Check (($f -band 4) -and ($f -band 1) -and -not $cn.Up) 'lost after 1.5 s (plus the resend timeout) without any packet, hello at once'
+  # round trip, jitter and the resend timeout
+  $re = New-Object RttEst; Check ($re.Rto -eq 50) 'resend timeout before any round trip: 50 ms'
+  $re.Add(2); Check ($re.Rto -eq 10) 'fast LAN: resend timeout 10 ms at least'
+  1..20 | % { $re.Add($(if ($_ % 2) { 20 } else { 120 })) }; Check ($re.Rto -eq 200 -and $re.Var -gt 30) 'jittery hotspot: resend timeout capped at 200 ms'
+  $re = New-Object RttEst; 1..40 | % { $re.Add(30) }; Check ([Math]::Abs($re.Srtt - 30) -lt 0.01 -and $re.Var -lt 1 -and $re.Rto -eq 30) 'steady 30 ms: the timeout follows it'
+  # connection quality in the window, Wi-Fi power saving from powercfg
+  Check ((Link-Quality 2 0.5 0) -eq 'Good' -and (Link-Quality 35 8 0) -eq 'Fair' -and (Link-Quality 12 3 2) -eq 'Fair' -and (Link-Quality 40 35 0) -eq 'Poor' -and (Link-Quality 5 1 10) -eq 'Poor') 'connection quality: Good, Fair, Poor'
+  $pq = "Possible Setting Index: 000`nCurrent AC Power Setting Index: 0x00000000`nCurrent DC Power Setting Index: 0x00000002"
+  Check (-not (PowerSave-On $pq $true) -and (PowerSave-On $pq $false) -and -not (PowerSave-On '' $true)) 'Wi-Fi power saving: per power source, nothing when unknown'
+  # keeping awake: only while input went to the other PC in the last 5 minutes
+  Check ([Awake]::Want($true, 1000, 1000 + 299999) -and -not [Awake]::Want($true, 1000, 1000 + 300000) -and -not [Awake]::Want($false, 1000, 1001)) 'sender stays awake 5 minutes after the last forwarded input, then sleeps'
   $lm = New-Object LossMeter; foreach ($s in 1..40) { if ($s -notin 5, 15, 25, 35) { $lm.Got($s) } }; Check ([Math]::Abs($lm.Pct - 10) -lt 1e-9) 'packet loss 10%'
   # the network adapter whose subnet holds the other PC; a real one before a virtual one
   $ips = [Net.IPAddress[]]@('192.168.1.5', '192.168.56.1', '10.0.0.5', '192.168.1.20', '100.64.0.3'); $masks = [Net.IPAddress[]]@('255.255.255.0', '255.255.255.0', '255.0.0.0', '255.255.255.0', '255.192.0.0')
   $idx = [int[]](6, 7, 8, 9, 10); $virt = [bool[]]($true, $true, $false, $false, $true)
   function Nic($ip) { [Nic]::Pick([Net.IPAddress]::Parse($ip), $idx, $ips, $masks, $virt) }
   Check ((Nic '192.168.1.30') -eq 9 -and (Nic '192.168.56.101') -eq 7 -and (Nic '100.100.1.1') -eq 10 -and (Nic '8.8.8.8') -eq -1 -and (Nic '127.0.0.1') -eq -1) 'adapter: real before virtual, VPN only when nothing else'
+  $via = 0; $sp = [Nic]::Second([Net.IPAddress[]]@('192.168.1.30', '192.168.56.101', '10.0.0.7'), [Net.IPAddress]::Parse('192.168.1.30'), 9, $idx, $ips, $masks, $virt, [ref]$via)
+  $none = [Nic]::Second([Net.IPAddress[]]@('192.168.1.30', '192.168.56.101'), [Net.IPAddress]::Parse('192.168.1.30'), 9, $idx, $ips, $masks, $virt, [ref]$via)
+  Check ("$sp" -eq '10.0.0.7' -and $null -eq $none) 'second path: another address through another real adapter, never a virtual one'
   Check ([Nic]::Virtual('Hyper-V Virtual Ethernet Adapter') -and [Nic]::Virtual('VirtualBox Host-Only Ethernet Adapter') -and -not [Nic]::Virtual('Intel(R) Ethernet Connection I219-V')) 'virtual adapters'
-  # hook watchdog: a probe every 2 s; a missing one means reinstall
-  $wd = New-Object Watchdog; $wd.Reset(0)
-  Check ($wd.Tick(1999) -eq 0 -and $wd.Tick(2000) -eq 1) 'watchdog: probe every 2 s'
-  $wd.Seen(1); $wd.Seen(2); Check ($wd.Tick(2500) -eq 0 -and $wd.Tick(4000) -eq 0 -and $wd.Tick(4500) -eq 1) 'watchdog: both seen, no reinstall'
-  $wd.Seen(1); Check ($wd.Tick(5000) -eq 2) 'watchdog: mouse probe missing, reinstall'
+  # hook watch: Raw Input saw real input and the hook none of it within 200 ms = reinstall; nothing injected, idle = nothing
+  $hw = New-Object HookWatch 0, 0, 0
+  Check (@(0..5000 | ? { $hw.Tick(0, 0, $_) }).Count -eq 0) 'hook watch: idle, nothing happens'
+  Check (-not $hw.Tick(1, 1, 5010) -and -not $hw.Tick(5, 4, 5100) -and -not $hw.Tick(9, 8, 5400)) 'hook watch: the hook sees the input, fine'
+  Check (-not $hw.Tick(9, 9, 6000) -and -not $hw.Tick(10, 9, 6250) -and -not $hw.Tick(10, 10, 6280)) 'hook watch: the hook a moment after Raw Input, fine'
+  Check (-not $hw.Tick(10, 11, 7000) -and -not $hw.Tick(11, 11, 7010) -and -not $hw.Tick(12, 11, 7150)) 'hook watch: Raw Input just after a hook call is the same event'
+  Check (-not $hw.Tick(13, 11, 7500) -and -not $hw.Tick(14, 11, 7699) -and $hw.Tick(15, 11, 7700)) 'hook watch: input the hook missed for 200 ms, reinstall'
+  Check (-not $hw.Tick(16, 11, 7800) -and -not $hw.Tick(16, 12, 7850) -and -not $hw.Tick(20, 16, 9000)) 'hook watch: once, then the new hook answers'
   # capture: made-up Raw Input and hook structs through the real parsers and callbacks
   $h = [Link]::RawHeader; $raw = New-Object byte[] ($h + 24)
   [BitConverter]::GetBytes([long]1).CopyTo($raw, 8); [BitConverter]::GetBytes([uint16]0x400).CopyTo($raw, $h + 4); [BitConverter]::GetBytes([int16]-60).CopyTo($raw, $h + 6)
@@ -674,11 +723,12 @@ if ($Test) {
   Check ([Link]::ParseRaw($mem, [ref]$b1, [ref]$b2, [ref]$b3, [ref]$b4) -and $b1 -eq 3 -and $b2 -eq -2 -and $b3 -eq 0x400 -and $b4 -eq -60) 'raw input: movement, wheel flag and a sub-120 delta'
   [Runtime.InteropServices.Marshal]::WriteInt64($mem, 8, 0); Check (-not [Link]::ParseRaw($mem, [ref]$b1, [ref]$b2, [ref]$b3, [ref]$b4)) 'raw input: injected input (no device) ignored'
   $hl = New-Object Link; [Runtime.InteropServices.Marshal]::Copy((New-Object byte[] 64), 0, $mem, 64); [Runtime.InteropServices.Marshal]::WriteInt32($mem, 0, 0x41)
-  Check ([Link]::HookTest($hl, $true, $mem) -eq 0 -and $hl.Queued -eq 0) 'hook: passes everything while this PC has control'
+  Check ([Link]::HookTest($hl, $true, $mem) -eq 0 -and $hl.Queued -eq 0 -and $hl.HookKb -eq 1) 'hook: passes everything while this PC has control; real keys counted'
   $hl.Active = $true; Check ([Link]::HookTest($hl, $true, $mem) -eq 1 -and $hl.Queued -eq 1 -and [Link]::HookTest($hl, $false, $mem) -eq 1) 'hook: swallows and enqueues while the other PC has control'
   [Runtime.InteropServices.Marshal]::WriteInt64($mem, 16, 0x44474C4B); Check ([Link]::HookTest($hl, $true, $mem) -eq 0) "hook: DeskGlide's own input passes"
-  [Runtime.InteropServices.Marshal]::WriteInt64($mem, 16, 0x44475052); [Runtime.InteropServices.Marshal]::WriteInt64($mem, 24, 0x44475052)
-  Check ([Link]::HookTest($hl, $true, $mem) -eq 1 -and [Link]::HookTest($hl, $false, $mem) -eq 1 -and $hl.ProbeSeen -eq 3 -and $hl.Queued -eq 1) 'hook: watchdog probes seen and swallowed'
+  Check ($hl.HookKb -eq 3 -and $hl.HookMs -eq 1) 'hook watch: real keys and mouse counted'
+  [Runtime.InteropServices.Marshal]::WriteInt64($mem, 16, 0); [Runtime.InteropServices.Marshal]::WriteInt32($mem, 8, 0x10); [Runtime.InteropServices.Marshal]::WriteInt32($mem, 12, 1)
+  Check ([Link]::HookTest($hl, $true, $mem) -eq 1 -and [Link]::HookTest($hl, $false, $mem) -eq 1 -and $hl.HookKb -eq 3 -and $hl.HookMs -eq 1) "hook: other programs' injected input swallowed, not counted as real"
   [Runtime.InteropServices.Marshal]::FreeHGlobal($mem)
 
   # two engines over loopback UDP: the sender fed made-up input, the receiver records what it would inject
@@ -728,6 +778,23 @@ if ($Test) {
   $seq = @(Took); $want = foreach ($i in 0..99) { 'key {0:X2} down' -f (0x10 + $i % 10); 'key {0:X2} up' -f (0x10 + $i % 10) }
   Check (($seq -join ';') -eq ($want -join ';')) 'loss: once each, in order'
   $A.DropPct = 0; $B.DropPct = 0
+  # a phone hotspot: 10% loss and 0..50 ms jitter each way, then a 300 ms outage. No cursor jumps, every key once and in
+  # order, control kept through the outage.
+  $script:rtt = $A.Rtt; $script:got = @(); function Pull { $script:got += @(Took) }
+  $script:want = @(); $script:kn = 0
+  function Keys($n) { foreach ($i in 1..$n) { $script:kn++; $c = $script:kn % 10; $A.FeedKey(0x41 + $c, 0x10 + $c, 0, $kn); $A.FeedKey(0x41 + $c, 0x10 + $c, 0x80, $kn); $script:want += ('key {0:X2} down' -f (0x10 + $c)), ('key {0:X2} up' -f (0x10 + $c)) } }
+  function GotKeys { @($script:got | ? { $_ -like 'key *' }) }
+  $A.DropPct = 10; $B.DropPct = 10; $A.JitterMs = 50; $B.JitterMs = 50; [void](Until { $false } 500); [void](Took); $j0 = $B.Jumps; $st0 = $B.Stale
+  foreach ($i in 1..300) { $A.FeedMouse($(if ($i -le 150) { 4 } else { -4 }), $(if ($i -le 150) { 1 } else { -1 }), 0, 0); if ($i % 15 -eq 0) { Keys 1 }; Start-Sleep -Milliseconds 2; if ($i % 50 -eq 0) { Pull } }
+  [void](Until { Pull; (GotKeys).Count -ge $want.Count } 3000); [void](Until { $false } 300); Pull
+  $last = @($got | ? { $_ -like 'move *' })[-1]
+  Check ($B.Jumps -eq $j0 -and $last -eq "move $($A.Pointer)") "hotspot: no cursor jumps ($($B.Jumps - $j0)), pointer ends where the sender has it ($last / $($A.Pointer))"
+  $A.Outage(300); $B.Outage(300); $t0 = Get-Date; Keys 10
+  $ok = Until { Pull; (GotKeys).Count -ge $want.Count } 4000; $script:recMs = ((Get-Date) - $t0).TotalMilliseconds - 300
+  Check ($ok -and ((GotKeys) -join ';') -eq ($want -join ';')) "hotspot: all $($want.Count) key events once and in order, through the outage"
+  Check ($A.Active -and $B.Controlled -and $A.Up -and $B.Up -and $B.Jumps -eq $j0) 'hotspot: a 300 ms outage keeps control and the session'
+  $script:jumps = $B.Jumps - $j0; $script:hot = 'rtt {0:0} ms, jitter {1:0} ms, loss {2:0}%, {3} stale mouse packets dropped' -f $A.Rtt, $A.Jitter, $A.Loss, ($B.Stale - $st0)
+  $A.DropPct = 0; $B.DropPct = 0; $A.JitterMs = 0; $B.JitterMs = 0; [void](Until { $false } 200); [void](Took)
   # losing the link: control comes back, keys released, then it reconnects by itself
   $A.FeedKey(0x42, 0x30, 0, 1); [void](Until { $B.Injected.Count }); [void](Took)
   $t0 = Get-Date; $A.DropPct = 100; $B.DropPct = 100
@@ -735,16 +802,17 @@ if ($Test) {
   $script:lossMs = ((Get-Date) - $t0).TotalMilliseconds
   $A.DropPct = 0; $B.DropPct = 0; $t0 = Get-Date
   Check (Until { $A.Up -and $B.Up } 3000) 'link: reconnects by itself (backoff at most 2 s)'
-  $script:backMs = ((Get-Date) - $t0).TotalMilliseconds; $script:rtt = $A.Rtt
+  $script:backMs = ((Get-Date) - $t0).TotalMilliseconds
   # the other PC restarts: a new engine on the same port, found again
   $B.Stop(); $B = New-Link $two 'PC-B'; $B.Start($lp + 1, $lp)
   Check (Until { $A.Up -and $B.Up } 4000) 'link: the other PC restarted and was found again'
   # an older or newer DeskGlide says so, instead of "wrong key"
   $hk = [Dg]::SessionKey($pk, 'link hello', [byte[]]@()); $hb = New-Object byte[] 20; [Text.Encoding]::UTF8.GetBytes('PC-C').CopyTo($hb, 16)
-  $vp = [LinkProto]::Seal($hk, 0, [byte[]](9..16), $hb, $hb.Length, 2); $u = New-Object Net.Sockets.UdpClient; [void]$u.Send($vp, $vp.Length, '127.0.0.1', $lp); $u.Close()
+  $vp = [LinkProto]::Seal($hk, 0, [byte[]](9..16), $hb, $hb.Length, [LinkProto]::Version + 1); $u = New-Object Net.Sockets.UdpClient; [void]$u.Send($vp, $vp.Length, '127.0.0.1', $lp); $u.Close()
   Check ((Until { $A.VersionMsg }) -and $A.VersionMsg -match 'PC-C is newer. Update DeskGlide on this PC') "version mismatch shown: $($A.VersionMsg)"
   $A.Stop(); $B.Stop(); [Link]::NoInject = $false
   "link loopback: moves p50/p99/max $latMove, keys $latKey, heartbeat RTT $('{0:0.00}' -f $rtt) ms, loss noticed after $([int]$lossMs) ms, back after $([int]$backMs) ms"
+  "link hotspot (10% loss, 0..50 ms jitter, 300 ms outage): cursor jumps $jumps, keys in order, recovered $([int]$recMs) ms after the outage; $hot"
 
   # monitors: each PC's input per monitor, unchecked monitors stay put, DeskGlide 3 peers have one input for all
   $mons = @(@{ id = 'MSI4CE8'; path = 'p1'; name = 'MAG 275QF' }, @{ id = 'DEL4321'; path = 'p2'; name = 'DELL U2720Q' }, @{ id = 'DEL4321-2'; path = 'p3'; name = 'DELL U2720Q' })
@@ -1038,7 +1106,8 @@ function Poll-Link {
   $l.Key = $S.key; if ($S.peerAddr) { $l.Peer = $S.peerAddr } elseif ($S.fixedIp -and -not $l.Peer) { $l.Peer = $S.fixedIp }
   $l.Sender = $C.kmHost -eq $Name
   $lay = (Current-Layout).show; $l.Dir = [char]$(if ($lay) { $lay.dir[0] } else { 'r' })
-  $l.Speed = [Math]::Max(25, [Math]::Min(400, [int]$C.linkSpeed)); $l.Game = [bool]$C.game; $l.LockSync = [bool]$C.lockSync
+  $l.Speed = [Math]::Max(25, [Math]::Min(400, [int]$C.linkSpeed)); $l.Game = [bool]$C.game; $l.LockSync = [bool]$C.lockSync; $l.DualPath = $C.dualPath -ne $false
+  if ($l.Up -and $l.Wireless -and ((Get-Date) - $S.psaveAt).TotalSeconds -ge 300) { $S.psaveAt = Get-Date; $S.psave = Wifi-PowerSave }
   $pk = Parse-Hotkey $C.panicKey; $l.PanicMods = $(if ($pk) { $pk.mods } else { 0 }); $l.PanicVk = $(if ($pk) { $pk.vk } else { 0 })
   $msg = $null; while ($l.Log.TryDequeue([ref]$msg)) { Say "Link: $msg" }
   if ($NoInject) { while ($l.Injected.TryDequeue([ref]$msg)) { Say "Link would inject: $($msg -replace '^\d+\|')" } }
@@ -1478,7 +1547,7 @@ $xaml = @'
             <Border Style="{StaticResource InsetBox}" Padding="12,9" Margin="0,14,0,0"><Grid>
               <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
               <Ellipse x:Name="LinkDot" Width="8" Height="8" Margin="0,6,10,0" VerticalAlignment="Top"/>
-              <StackPanel Grid.Column="1"><TextBlock x:Name="LinkWhy" Style="{StaticResource Body}"/><TextBlock x:Name="LinkStats" Style="{StaticResource Sub}" Margin="0,4,0,0"/></StackPanel>
+              <StackPanel Grid.Column="1"><TextBlock x:Name="LinkWhy" Style="{StaticResource Body}"/><TextBlock x:Name="LinkStats" Style="{StaticResource Sub}" Margin="0,4,0,0"/><TextBlock x:Name="LinkTip" Style="{StaticResource Sub}" Margin="0,4,0,0"/></StackPanel>
             </Grid></Border>
             <StackPanel x:Name="LinkMore">
               <Grid Margin="0,16,0,0"><TextBlock Text="Pointer speed on the other PC" TextTrimming="CharacterEllipsis" Margin="0,0,44,0"/><TextBlock x:Name="SpeedPct" HorizontalAlignment="Right" Foreground="{DynamicResource Fg2}"/></Grid>
@@ -1909,7 +1978,18 @@ function Update-Ui {
   $ui.LinkToggle.IsChecked = [bool]$C.link; $l = $S.link; $up = $l -and $l.Up
   $ui.LinkWhy.Text = Link-Status $C $paired $online $S.peerVer $l $S.synergy
   $ui.LinkDot.Fill = Brush $(if ($up -and -not $S.synergy -and -not $l.InjectError) { 'Good' } elseif ($C.link) { 'Warn' } else { 'Fg2' })
-  Show-If $ui.LinkStats $up; if ($up) { $ui.LinkStats.Text = 'Latency (round trip) {0}   Packet loss {1:0.#}%' -f $(if ($l.Rtt -ge 0) { '{0:0.0} ms' -f $l.Rtt } else { '...' }), $l.Loss }
+  Show-If $ui.LinkStats $up; $tips = @()
+  if ($up) {
+    $ui.LinkStats.Inlines.Clear()
+    if ($l.Rtt -ge 0) {
+      $q = Link-Quality $l.Rtt $l.Jitter $l.Loss; $badge = New-Object Windows.Documents.Run $q; $badge.FontWeight = 'SemiBold'
+      $badge.Foreground = Brush $(@{ Good = 'Good'; Fair = 'Warn'; Poor = 'Bad' }[$q]); $ui.LinkStats.Inlines.Add($badge)
+      $ui.LinkStats.Inlines.Add((New-Object Windows.Documents.Run ('   Latency (round trip) {0:0.0} ms   Jitter {1:0.0} ms   Packet loss {2:0.#}%' -f $l.Rtt, $l.Jitter, $l.Loss)))
+      if ($q -eq 'Poor') { $tips += 'Use a direct Ethernet cable or your home router instead of a phone hotspot for the best experience.' }
+    } else { $ui.LinkStats.Inlines.Add((New-Object Windows.Documents.Run 'Measuring the connection...')) }
+    if ($l.Wireless -and $S.psave) { $tips += 'Your Wi-Fi saves power between packets; for smoother control set Power mode to Best performance or use a cable.' }
+  }
+  $ui.LinkTip.Text = $tips -join "`n"; Show-If $ui.LinkTip $tips.Count
   Show-If $ui.LinkMore $C.link
   if (-not $S.speedAt -and $ui.Speed.Value -ne $C.linkSpeed) { $ui.Speed.Value = $C.linkSpeed }; $ui.SpeedPct.Text = "$($C.linkSpeed)%"
   $ui.GameToggle.IsChecked = [bool]$C.game; $ui.LockToggle.IsChecked = [bool]$C.lockSync

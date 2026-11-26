@@ -69,21 +69,22 @@ What DeskGlide Link does about problems reported in the issue trackers of Deskfl
 | Reported elsewhere | What DeskGlide Link does |
 |---|---|
 | The pointer freezes and jumps; network work inside the input hook | Raw Input on its own thread; the hooks only hold input back (enqueue and return) |
-| Clicks stop until a restart: Windows removed a slow hook | A watchdog sends a tagged probe through the hooks every 2 s and reinstalls them if it doesn't arrive |
+| Clicks stop until a restart: Windows removed a slow hook | A passive watch: if Raw Input sees real input the hooks didn't within 200 ms, they are installed again; nothing is injected |
 | Drift with fast mice; wrong speed across DPI; Windows' pointer acceleration applied twice | Absolute positions from a model of the other PC's monitors (physical pixels, per-monitor DPI), fractions kept, 1 ms coalescing, no acceleration; a speed slider |
-| Never reconnects after an address change, sleep or the lock screen | Heartbeat every 250 ms, lost after 1.5 s, reconnects forever at most 2 s apart and at once after a network change, wake-up or unlock; the other PC is recognised by the pairing key, not its address |
+| Never reconnects after an address change, sleep or the lock screen | Heartbeat every 250 ms (100 ms while a PC has control), lost after 1.5 s without any packet, a drop under 10 s resumes the same session, reconnects forever at most 2 s apart and at once after a network change, wake-up or unlock; the other PC is recognised by the pairing key, not its address |
 | Stuck modifier keys | Every key carries all modifiers and the receiving PC corrects its own; on leave, loss or lock every held key and button is released on both PCs |
 | AltGr arrives as Ctrl+Alt | AltGr's fake left Ctrl is dropped; keys go as scan codes |
 | One refused input kills the connection | Refused input is counted and shown, never fatal; an admin window in front is detected and shown |
-| Wrong network adapter (VPN, Hyper-V, VirtualBox) | Sends on the adapter whose subnet holds the other PC; virtual adapters only when nothing else does |
+| Wrong network adapter (VPN, Hyper-V, VirtualBox) | Sends on the adapter whose subnet holds the other PC; virtual adapters only when nothing else does; with Ethernet and Wi-Fi both, on both |
+| Jumps and lost keys on Wi-Fi or a hotspot | Each mouse packet carries the 3 positions before it; keys and buttons go twice and are resent after an RTT-based timeout until acknowledged; input marked as control traffic (qWAVE); the window shows round trip, jitter, loss and a Good/Fair/Poor badge, and a tip when Wi-Fi power saving is on |
 | Small scroll steps dropped | Wheel and horizontal wheel deltas forwarded unchanged, plus the side buttons |
 | Games spin | No crossing while a game holds the pointer; optional game mode sends raw movement |
 | The clipboard hangs the connection | Clipboard on its own TCP channel, pulled when the mouse arrives, capped at 32 MB, never on the input path |
 | A version mismatch shows as a wrong key | The handshake carries the version and says which PC to update |
-| The controlled PC falls asleep | Both PCs are kept awake only while the other PC has control |
+| The controlled PC falls asleep | The keyboard PC stays awake only while its input went to the other PC in the last 5 minutes; the controlled PC follows its own timers, its injected input counts as use |
 | Busy CPU while idle | Idle wake-ups every 20 ms; 1 ms timing only while the other PC has control |
 
-Also: a local panic key, Win+L on both PCs, the entry point following the pointer's position along the edge, and live latency and loss. Tested over loopback so far: from input to injection 0.4 ms (median) for pointer moves and keys, under 3.5 ms at the 99th percentile, with every key delivered once and in order at 30% packet loss each way.
+Also: a local panic key, Win+L on both PCs, the entry point following the pointer's position along the edge, and live latency and loss. Tested over loopback so far: from input to injection 0.4 ms (median) for pointer moves and keys, under 3.5 ms at the 99th percentile, with every key delivered once and in order at 30% packet loss each way; with 10% loss, 0 to 50 ms jitter and a 300 ms outage, no cursor jumps, every key in order, control kept, keys through about 0.2 s after the outage.
 
 ## Requirements
 
@@ -243,7 +244,7 @@ Click **Open log** at the bottom of the window to see what DeskGlide saw and did
 
 ## For maintainers
 
-- `powershell -ExecutionPolicy Bypass -File .\DeskGlide.ps1 -Test` runs the self-check: log parsing, pairing, encryption and tamper checks, audio packets, a real encrypted file and clipboard transfer over loopback, monitor plans, hotkeys, settings sync, DPAPI migration, install, update download and swap, and DeskGlide Link: packets and tampering, coalescing, modifiers, AltGr, release-all, edges, entry points, DPI, the reliable stream, heartbeat, loss and backoff, adapter choice, the hook watchdog and made-up Raw Input and hook events, then two engines over loopback UDP (crossing, keys, panic key, game mode, 30% packet loss, losing and regaining the link, a restart, a version mismatch) with latency figures. No input is injected and no hook is installed.
+- `powershell -ExecutionPolicy Bypass -File .\DeskGlide.ps1 -Test` runs the self-check: log parsing, pairing, encryption and tamper checks, audio packets, a real encrypted file and clipboard transfer over loopback, monitor plans, hotkeys, settings sync, DPAPI migration, install, update download and swap, and DeskGlide Link: packets and tampering, coalescing, modifiers, AltGr, release-all, edges, entry points, DPI, the reliable stream, absolute coordinates on 100/125/150% layouts, heartbeat, loss and backoff, round trip and resend timeout, adapter choice and a second path, the hook watch, keeping awake, connection quality, Wi-Fi power saving and made-up Raw Input and hook events, then two engines over loopback UDP (crossing, keys, panic key, game mode, 30% packet loss, a hotspot with loss, jitter and an outage, losing and regaining the link, a restart, a version mismatch) with latency figures. No input is injected and no hook is installed.
 - `Make-Release.ps1` builds `release\DeskGlide-<version>.zip` and `release\SHA256SUMS.txt` from the files at the top of the repository (no `.git`, no `docs`). Upload both to a release tagged `v<version>`.
 - Auto-update is off until `$UpdateRepo` in `DeskGlide.ps1` names the GitHub repository (`owner/repo`).
 - Screenshots: `DeskGlide.ps1 -Shot out.png -Theme light|dark -ShowWindow` renders the window off screen.
