@@ -1073,7 +1073,7 @@ public class Link {
   byte[] myNonce = Dg.Random(8), peerNonce, sessKey, helloKey, helloKeyFor; long lastHelloT; volatile string peerName = "the other PC";
   Conn conn = new Conn(); Reliable rel = new Reliable(); readonly LossMeter loss = new LossMeter(); readonly Watchdog wd = new Watchdog();
   uint hbSeq, mSeq, rxMSeq, peerT, peerTAt, flushedUs;
-  volatile Mon[] local = new Mon[0], remote; bool fixedMons; long monsAt = -100000, uipiAt, errAt = -100000, lockedAt = -100000;
+  volatile Mon[] local = new Mon[0], remote; bool fixedMons; long monsAt = -100000, uipiAt, deskAt, errAt = -100000, lockedAt = -100000;
   double mx, my, cx, cy; bool dirty, relMode, rawOn, timer1; Coalescer co = new Coalescer(); int sumX, sumY, mods, localDpi = 96;   // sender
   readonly bool[] phys = new bool[256]; volatile bool remoteGame; volatile int remoteX, remoteY;
   readonly Held held = new Held(); int lastX = int.MinValue, lastY, rxSumX, rxSumY; bool rxRel; uint exec; IPAddress ifFor;   // receiver
@@ -1147,6 +1147,10 @@ public class Link {
       bool wantRel = Game && remoteGame;
       if (wantRel != relMode) { Flush(); relMode = wantRel; co = new Coalescer(); if (!wantRel) { mx = remoteX + 0.5; my = remoteY + 0.5; } Note(wantRel ? "game mode: sending raw movement" : "game mode off"); }
       if (!NoInject) { int w = wd.Tick(now); if (w == 1) Probe(); else if (w == 2) { Note("the input hook stopped answering; installed it again"); Hooks(true); } }
+      if (!NoInject && now - deskAt >= 250) {   // Ctrl+Alt+Del, UAC or the lock screen here: the hooks miss key-ups, so release everything
+        deskAt = now; IntPtr d = OpenInputDesktop(0, false, 1);
+        if (d == IntPtr.Zero) { Note("this PC switched to its secure desktop: keyboard and mouse back here"); Return(-1, true); } else CloseDesktop(d);
+      }
     }
     Exec(false);
     if (Active != timer1) { if (Active) timeBeginPeriod(1); else timeEndPeriod(1); timer1 = Active; }   // 1 ms waits only while in use
@@ -1560,6 +1564,8 @@ public class Link {
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
+  [DllImport("user32.dll")] static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+  [DllImport("user32.dll")] static extern bool CloseDesktop(IntPtr d);
   [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string n);
   [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint f);
   [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
