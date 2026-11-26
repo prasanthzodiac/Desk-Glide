@@ -10,18 +10,28 @@ param(
   [string]$PairCode,                      # pair at startup without the window
   [int]$Port = 6991, [int]$PeerPort = 0,  # control/discovery UDP port to listen on / to send to
   [int]$AudioPort = 6990,
+  [int]$KmPort = 24810,                   # Deskflow's port (Synergy uses 24800)
   [string]$ConfigDir = "$env:APPDATA\DeskGlide",
+  [string]$DataDir = "$env:LOCALAPPDATA\DeskGlide",   # the installed app and downloaded Deskflow
   [string]$Name = $env:COMPUTERNAME,
   [switch]$NoBroadcast,                   # find the peer by address only
+  [switch]$MultiCore,                     # let a second deskflow-core run on this PC (two copies on one PC)
   [string]$Theme,                         # 'light' or 'dark' instead of the Windows setting
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '3.0'
+$Version = '4.0'
+$Proto = 4   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it
 if (-not $PeerPort) { $PeerPort = $Port }
-Add-Type -Path "$PSScriptRoot\DeskGlide.cs" -ReferencedAssemblies System.Drawing
+Add-Type -Path "$PSScriptRoot\DeskGlide.cs" -ReferencedAssemblies System.Drawing, System.Core, System.IO.Compression, System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, PresentationFramework, PresentationCore, WindowsBase, WindowsFormsIntegration
 $cfgPath   = Join-Path $ConfigDir 'config.json'
+$dfRoot    = Join-Path $DataDir 'deskflow'                      # downloaded Deskflow releases, one folder per version
+$dfDir     = Join-Path $ConfigDir 'deskflow'                    # its INI, server conf, TLS files and log
+$dfIni     = Join-Path $dfDir 'deskflow.ini'
+$dfLog     = Join-Path $dfDir 'deskflow.log'
+$dfPem     = Join-Path $dfDir 'tls\deskflow.pem'
+$dfSource  = 'https://github.com/deskflow/deskflow'
 $mutedPath = Join-Path $ConfigDir 'muted.txt'   # apps we muted, so a crash or kill doesn't leave them muted
 $logPath   = Join-Path $ConfigDir 'deskglide.log'
 $icoPath   = Join-Path $PSScriptRoot 'DeskGlide.ico'
@@ -32,7 +42,8 @@ $opp       = @{ left = 'right'; right = 'left'; up = 'down'; down = 'up' }
 function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 function Load-Config {
   $c = @{ peer = ''; key = ''; peerAddress = ''; input = 0; inputOverride = 0; monitor = $true; audio = 'follow'; hp = ''; vol = 100
-          paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null }
+          paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
+          km = $false; kmHost = ''; deskflowExe = '' }
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
     if ($c.headphones -and -not $c.hp) { $c.hp = $Name; $c.syncAt = Now-Ms }   # newest, so the other PC takes it instead of clearing it
@@ -118,18 +129,45 @@ function My-Addresses {
 function Merge-Settings($cfg, $m) {
   $took = $false
   if ($m.ly -and -not $cfg.layout) { $cfg.layout = $m.ly; $took = $true }   # the first layout either PC sets
+  if ($m.kh -and -not $cfg.kmHost) { $cfg.kmHost = [string]$m.kh; $took = $true }   # same for the keyboard PC (the Synergy server's guess)
   if ([long]$m.st -le [long]$cfg.syncAt) { return $took }
   $cfg.monitor = [bool]$m.m; $cfg.audio = [string]$m.am; $cfg.paused = [bool]$m.p; $cfg.syncAt = [long]$m.st
   if ($null -ne $m.hp) { $cfg.hp = [string]$m.hp }   # a DeskGlide 2 peer doesn't send it: keep ours, never clear it
   if ($null -ne $m.v) { $cfg.vol = [int]$m.v }
   if ($m.ly) { $cfg.layout = $m.ly }
+  if ($null -ne $m.k) { $cfg.km = [bool]$m.k }        # DeskGlide 4 settings: a DeskGlide 3 peer doesn't send them, keep ours
+  if ($m.kh) { $cfg.kmHost = [string]$m.kh }
   $true
 }
 # h is for DeskGlide 2 peers (it had a per-PC headphones flag); ly is DeskGlide's layout; l is Synergy's, from the server
+# DeskGlide 4 adds ver, sn (screen name), k/kh (keyboard sharing, keyboard PC) and fp (this PC's Deskflow certificate)
 function State-Json($cfg) {
   @{ n = $Name; t = $S.t; s = $S.server; sa = ($S.active -eq 'me'); i = (My-Input); h = ($cfg.hp -eq $Name)
      m = $cfg.monitor; am = $cfg.audio; p = $cfg.paused; st = $cfg.syncAt; hp = $cfg.hp; v = $cfg.vol; ly = $cfg.layout
-     l = @($(if ($S.server) { $S.links | % { "$($_.from) $($_.dir) $($_.to)" } })) } | ConvertTo-Json -Compress
+     l = @($(if ($S.server) { $S.links | % { "$($_.from) $($_.dir) $($_.to)" } }))
+     ver = $Proto; sn = $S.screen; k = $cfg.km; kh = $cfg.kmHost; fp = $S.fp } | ConvertTo-Json -Compress
+}
+
+# ---------- Deskflow: keyboard and mouse sharing ----------
+# The release asset for this PC: deskflow-<ver>-win-<x64|arm64>-portable.zip
+function Pick-Asset($release, [string]$arch) { @($release.assets | ? { $_.name -like "deskflow-*-win-$arch-portable.zip" })[0] }
+# GitHub's asset digest 'sha256:<hex>' -> lowercase hex, or $null
+function Parse-Digest([string]$d) { if ($d -match '^sha256:([0-9a-fA-F]{64})$') { $matches[1].ToLower() } }
+# deskflow-core reads only -s <ini>. Paths use '/' because QSettings reads '\' as an escape.
+function Deskflow-Ini([string]$me, [string]$peer, [string]$role, [string]$peerAddr, [int]$port, [string]$dir) {
+  $d = $dir -replace '\\', '/'
+  $t = "[core]`nscreenName=$me`ncomputerName=$me`nport=$port`n"
+  if ($role -eq 'client') { $t += "`n[client]`nremoteHost=${peerAddr}:$port`n" }
+  $t += "`n[log]`nlevel=INFO`ntoFile=true`nfile=$d/deskflow.log`n"
+  $t += "`n[security]`ntlsEnabled=true`ncheckPeerFingerprints=true`ncertificate=$d/tls/deskflow.pem`n"
+  foreach ($n in $me, $peer) { $t += "`n[computer_$n]`nname=$n`n" }   # Deskflow 1.27 takes the computer list from here, not the conf's 'screens'
+  $t
+}
+# The server's deskflow-server.conf (Synergy text format): the client is on the $dir side of the server. $keys: hotkey lines.
+function Deskflow-Conf([string]$server, [string]$client, [string]$dir, [string[]]$keys) {
+  $t = "section: links`n`t${server}:`n`t`t$dir = $client`n`t${client}:`n`t`t$($opp[$dir]) = $server`nend`n"
+  if ($keys) { $t += "section: options`n$(($keys | % { "`t$_`n" }) -join '')end`n" }
+  $t
 }
 # Why sound is or isn't playing, in plain words.
 function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active) {
@@ -157,7 +195,9 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         fixedIp = $null; fixedSeen = [DateTime]::MinValue; verify = $null; monMsg = ''; monErr = $false
         links = @(); confPath = ''; confTime = $null; layDir = ''; drag = $null
         code = ''; myAddrs = ''; pairStart = Get-Date; pairErr = ''; addrErr = ''; unpairAt = $null; volAt = $null
-        wiz = 0; wizDone = $false; iconState = 3; dark = $null; shownAt = $null }
+        wiz = 0; wizDone = $false; iconState = 3; dark = $null; shownAt = $null
+        fp = ''; peerFp = ''; peerVer = 0; peerScreen = ''; df = $null; dfSig = ''; dfRole = ''; dfAt = [DateTime]::MinValue; dfRetryAt = [DateTime]::MinValue
+        dfPos = 0; dfConn = $false; dfErr = ''; kmWhy = ''; dl = $null; dlTried = $false; dlMsg = ''; dlErr = $false; synergy = $null; synAt = [DateTime]::MinValue }
 $tray = $null; $win = $null; $ui = @{}; $icons = @(); $logos = @()
 
 function My-Input { if ($C.inputOverride) { [int]$C.inputOverride } else { [int]$C.input } }
@@ -259,6 +299,33 @@ if ($Test) {
   $PB.layout = $null; $PB.syncAt = 99
   Check ((Merge-Settings $PB (Msg $PA 'PC-A')) -and $PB.layout) 'first layout not taken from an older message'
 
+  # Deskflow: release asset and digest, INI and server conf, certificate, synced settings
+  $rel = '{"tag_name":"v1.27.0","assets":[{"name":"deskflow-1.27.0-win-x64.msi"},{"name":"deskflow-1.27.0-win-arm64-portable.zip","digest":"sha256:86D9A02F9F2F747023DE7F9808065BF4D7F922FFDE67C7308061A5865D367AC2"},{"name":"deskflow-1.27.0-win-x64-portable.zip","digest":"sha256:8d19004cc3625623489d96580c1b58fd13ee78185689907fd4478595f93fab9a"},{"name":"deskflow-1.27.0-macos-arm64.dmg"}]}' | ConvertFrom-Json
+  Check ((Pick-Asset $rel 'x64').name -eq 'deskflow-1.27.0-win-x64-portable.zip' -and (Pick-Asset $rel 'arm64').name -like '*arm64-portable.zip') 'asset: x64 and arm64 portable zip'
+  Check ($null -eq (Pick-Asset ('{"assets":[{"name":"deskflow-1.27.0-win-x64.msi"}]}' | ConvertFrom-Json) 'x64')) 'asset: msi is not the portable zip'
+  Check ((Parse-Digest (Pick-Asset $rel 'arm64').digest) -eq '86d9a02f9f2f747023de7f9808065bf4d7f922ffde67c7308061a5865d367ac2') 'digest: lowercased'
+  Check ($null -eq (Parse-Digest '') -and $null -eq (Parse-Digest 'sha512:abcd') -and $null -eq (Parse-Digest 'sha256:xyz') -and $null -eq (Parse-Digest "sha256:$('a' * 63)")) 'digest: rejects'
+  $ini = Deskflow-Ini 'DESK-PC' 'LAPTOP' 'client' '192.168.1.20' 24810 'C:\Users\x\AppData\Roaming\DeskGlide\deskflow'
+  Check ($ini -match '(?m)^screenName=DESK-PC$' -and $ini -match '(?m)^computerName=DESK-PC$' -and $ini -match '(?m)^port=24810$' -and $ini -match '(?m)^remoteHost=192\.168\.1\.20:24810$') 'ini: client core'
+  Check ($ini -match '(?m)^tlsEnabled=true$' -and $ini -match '(?m)^checkPeerFingerprints=true$' -and $ini -match '(?m)^file=C:/Users/x/AppData/Roaming/DeskGlide/deskflow/deskflow\.log$' -and $ini -match 'certificate=C:/Users/x/.+/tls/deskflow\.pem') 'ini: TLS and log, forward slashes'
+  Check ($ini -match '\[computer_LAPTOP\]\nname=LAPTOP' -and $ini -notmatch 'tlsEnabled=false') 'ini: computers, never plain text'
+  Check ((Deskflow-Ini 'A' 'B' 'server' '' 24810 'C:\d') -notmatch 'remoteHost') 'ini: server has no remoteHost'
+  $conf = Deskflow-Conf 'DESK-PC' 'LAPTOP' 'left' @('keystroke(control+alt+Right) = switchToScreen(LAPTOP)')
+  Check ($conf -match "DESK-PC:\n\t\tleft = LAPTOP\n" -and $conf -match "LAPTOP:\n\t\tright = DESK-PC\n" -and $conf -match "section: options\n\tkeystroke\(control\+alt\+Right\)") 'conf: links both ways and hotkeys'
+  $back = @(Parse-Links $conf); Check ($back.Count -eq 2 -and (Layout-Of $back 'DESK-PC').dir -eq 'left') 'conf: reads back as the same layout'
+  Check ((Deskflow-Conf 'A' 'B' 'up' @()) -notmatch 'options') 'conf: no options without hotkeys'
+  $pem = Join-Path $env:TEMP "dg-test-$PID.pem"; $fp = [Dg]::MakeCert($pem)
+  Check ($fp -match '^[0-9a-f]{64}$' -and $fp -eq [Dg]::PemFingerprint($pem) -and (Get-Content $pem -Raw) -match '(?s)BEGIN RSA PRIVATE KEY.+BEGIN CERTIFICATE') 'certificate and fingerprint'
+  Remove-Item $pem
+  $PA = @{ peer = 'PC-B'; hp = ''; monitor = $true; audio = 'follow'; paused = $false; vol = 100; syncAt = 5; input = 15; inputOverride = 0; layout = $null; km = $false; kmHost = '' }
+  $PB = $PA.Clone(); $PB.peer = 'PC-A'; $PA.kmHost = 'PC-A'
+  Check ((Merge-Settings $PB (Msg $PA 'PC-A')) -and $PB.kmHost -eq 'PC-A' -and $PB.syncAt -eq 5) 'keyboard PC: first one set is taken'
+  $PB.km = $true; $PB.kmHost = 'PC-B'; $PB.syncAt = 50
+  Check ((Merge-Settings $PA (Msg $PB 'PC-B')) -and $PA.km -and $PA.kmHost -eq 'PC-B') 'keyboard sharing synced'
+  $v3 = Msg $PA 'PC-A'; 'ver', 'k', 'kh', 'fp', 'sn' | % { $v3.psobject.Properties.Remove($_) }; $v3.st = 99
+  Check ((Merge-Settings $PB $v3) -and $PB.km -and $PB.kmHost -eq 'PC-B') 'DeskGlide 3 message turned keyboard sharing off'
+  Check ((Msg $PA 'PC-A').ver -eq 4) 'state message has ver 4'
+
   $bmp = [Dg]::DrawIcon(16, 1); Check ($bmp.GetPixel(4, 7).R -lt 60 -and $bmp.GetPixel(11, 7).R -gt 100) 'icon: this PC half highlighted'
   $bmp = [Dg]::DrawIcon(16, 2); Check ($bmp.GetPixel(4, 7).R -gt 100 -and $bmp.GetPixel(11, 7).R -lt 60) 'icon: other PC half highlighted'
 
@@ -354,6 +421,7 @@ function Receive-Control {
     $S.lastT = [long]$m.t; $S.okCtl++
     if (-not $S.peerAddr -or -not $S.peerAddr.Equals($ep.Address)) { Say "Found $($m.n) at $($ep.Address)." }
     $S.peerAddr = $ep.Address; $S.peerSeen = Get-Date; $S.peerInput = [int]$m.i
+    $S.peerVer = [int]$m.ver; $S.peerFp = [string]$m.fp; $S.peerScreen = if ($m.sn) { [string]$m.sn } else { [string]$m.n }
     # remember the address for the next start; only replace it once it went quiet, so a peer on two adapters doesn't flip-flop
     if ($S.fixedIp -and $S.fixedIp.Equals($ep.Address)) { $S.fixedSeen = Get-Date }
     elseif (((Get-Date) - $S.fixedSeen).TotalSeconds -gt 10) { $C.peerAddress = "$($ep.Address)"; $S.fixedIp = $ep.Address; $S.fixedSeen = Get-Date; Save-Config }
@@ -414,14 +482,139 @@ function Test-Monitor {   # read-only: says what would happen
 }
 
 function Detect-Role {   # the PC whose Synergy/Deskflow log has "switch from" lines is the server
+  if ($S.df) { return }   # DeskGlide runs Deskflow: the keyboard PC is the server (Sync-Deskflow)
   $log = if ($C.synergyLog) { $C.synergyLog } else { "$env:LOCALAPPDATA\synergy-dragon\logs\synergy-dragon-agent.log" }
   if (-not (Test-Path -LiteralPath $log)) { return }
   $text, $pos = Read-Lines $log 0
   if (-not $text.Contains('switch from "')) { return }
   $S.server = $true; $S.log = $log; $S.pos = $pos
   Say "This PC is the Synergy server (log: $log)."
+  if (-not $C.kmHost) { $C.kmHost = $Name; Save-Config }   # the default for "keyboard and mouse are plugged into"
   $t = Get-Target $text
   if (-not $t -or $t -eq $S.screen) { Set-Active 'me' $S.screen } else { Set-Active 'peer' $t }
+}
+
+# ---------- Deskflow ----------
+function Deskflow-Exe { if ($C.deskflowExe -and (Test-Path -LiteralPath $C.deskflowExe)) { $C.deskflowExe } }
+function Stop-Deskflow {
+  if ($S.df) { try { if (-not $S.df.HasExited) { $S.df.Kill(); [void]$S.df.WaitForExit(3000) } } catch {}; $S.df = $null; Say 'Deskflow stopped.' }
+  $S.dfSig = ''; $S.dfConn = $false
+  if ($S.dfRole -eq 'server') { $S.server = $false; $S.active = $null; Detect-Role }   # back to Synergy's log, if any
+  $S.dfRole = ''
+}
+function Kill-OrphanDeskflow {   # a deskflow-core a killed DeskGlide left running with this config
+  Get-CimInstance Win32_Process -Filter "Name = 'deskflow-core.exe'" -ErrorAction SilentlyContinue |
+    ? { $_.CommandLine -and $_.CommandLine.Contains($dfIni) } | % { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+# Runs, restarts or stops deskflow-core to match the settings. Sets $S.kmWhy to what the card shows.
+function Sync-Deskflow {
+  $now = Get-Date; $peer = Peer-Label
+  if ($S.df -and $S.df.HasExited) {   # crashed or killed: restart, slower if it keeps dying
+    Say "Deskflow stopped by itself (exit code $($S.df.ExitCode)). Restarting it." error
+    $S.df = $null; $S.dfSig = ''; $S.dfRetryAt = $now.AddSeconds($(if (($now - $S.dfAt).TotalSeconds -lt 30) { 10 } else { 2 }))
+  }
+  $exe = Deskflow-Exe
+  if ($C.km -and -not $exe -and -not $S.dl -and -not $S.dlTried) { $S.dlTried = $true; Start-DeskflowDownload }   # also when turned on from the other PC
+  if ($C.km -and $exe -and -not $S.fp) {   # this PC's certificate; its fingerprint goes to the peer in every state message
+    if (-not (Test-Path -LiteralPath $dfPem)) { [void](New-Item -ItemType Directory -Force (Split-Path $dfPem)); [void][Dg]::MakeCert($dfPem); Say 'Made this PC''s Deskflow certificate.' }
+    $S.fp = [Dg]::PemFingerprint($dfPem)
+  }
+  $why = if (-not $C.km) { 'Off. Turn this on, on both PCs, to use one keyboard and mouse for both.' }
+    elseif (-not $exe) { 'Download Deskflow (below) to share the keyboard and mouse.' }
+    elseif (-not $C.peer) { 'Pair with your other PC first.' }
+    elseif ($C.kmHost -ne $Name -and $C.kmHost -ne $C.peer) { 'Choose the PC the keyboard and mouse are plugged into.' }
+    elseif ((Peer-Online) -and $S.peerVer -lt $Proto) { "Update DeskGlide on $peer to share the keyboard and mouse." }
+    elseif (-not $S.peerFp) { "Waiting for $peer. Turn this on there too (it downloads Deskflow once)." }
+    elseif ($C.kmHost -ne $Name -and -not $S.peerAddr) { "Looking for $peer..." }
+  if ($why) { if ($S.df) { Stop-Deskflow }; $S.kmWhy = $why; return }
+
+  $role = if ($C.kmHost -eq $Name) { 'server' } else { 'client' }
+  $ini = Deskflow-Ini $S.screen $S.peerScreen $role "$($S.peerAddr)" $KmPort $dfDir
+  $L = Current-Layout; $side = if ($L.show) { $L.show.dir } else { 'right' }
+  if ($role -eq 'client') { $side = $opp[$side] }   # the conf is written from the server's side
+  $conf = Deskflow-Conf $(if ($role -eq 'server') { $S.screen } else { $S.peerScreen }) $(if ($role -eq 'server') { $S.peerScreen } else { $S.screen }) $side @()
+  $trust = "v2:sha256:$($S.peerFp)`n"   # the peer's certificate, sent over the signed channel: no prompt, no unencrypted fallback
+  $sig = "$exe|$role|$ini|$conf|$trust"
+  if ($S.df -and $sig -eq $S.dfSig) { Read-DeskflowStatus; $S.kmWhy = Deskflow-Status $role $peer; return }
+  if ($now -lt $S.dfRetryAt) { $S.kmWhy = 'Restarting Deskflow...'; return }
+
+  if ($S.df) { try { $S.df.Kill(); [void]$S.df.WaitForExit(3000) } catch {}; $S.df = $null }
+  [IO.File]::WriteAllText($dfIni, $ini); [IO.File]::WriteAllText((Join-Path $dfDir 'deskflow-server.conf'), $conf)
+  foreach ($f in 'trusted-servers', 'trusted-clients') { [IO.File]::WriteAllText((Join-Path $dfDir "tls\$f"), $trust) }
+  Remove-Item -LiteralPath $dfLog -ErrorAction SilentlyContinue
+  $psi = New-Object Diagnostics.ProcessStartInfo $exe, "$role$(if ($MultiCore) { ' --new-instance' }) -s `"$dfIni`""
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.WorkingDirectory = Split-Path $exe
+  $S.df = [Diagnostics.Process]::Start($psi); $S.dfSig = $sig; $S.dfAt = $now; $S.dfPos = 0; $S.dfConn = $false; $S.dfErr = ''
+  Say "Deskflow started as $role on port $KmPort$(if ($role -eq 'client') { ", connecting to $($S.peerAddr)" })."
+  if ($role -eq 'server') { $S.server = $true; $S.log = $dfLog; $S.pos = 0; $S.want = $null; Set-Active 'me' $S.screen }   # it starts with the mouse here
+  elseif ($S.dfRole -eq 'server') { $S.server = $false }
+  $S.dfRole = $role; $S.kmWhy = 'Starting Deskflow...'
+}
+function Read-DeskflowStatus {   # connection state from Deskflow's INFO lines
+  if (-not (Test-Path -LiteralPath $dfLog)) { return }
+  $text, $S.dfPos = Read-Lines $dfLog $S.dfPos
+  foreach ($l in $text -split "`n") {
+    if ($l -match 'connected to secure socket|accepted secure socket') { $S.dfConn = $true; $S.dfErr = '' }
+    elseif ($l -match 'server is dead|disconnecting client|failed to connect') { $S.dfConn = $false }
+    if ($l -match 'fingerprint does not match|failed to verify') { $S.dfErr = 'The other PC''s Deskflow certificate isn''t the one it sent DeskGlide. Turn sharing off and on again on both PCs.' }
+    elseif ($l -match '(ERROR|FATAL): (.+)$' -and $l -notmatch 'failed to connect|eof violates') { $S.dfErr = "Deskflow: $($matches[2])" }
+  }
+}
+function Deskflow-Status([string]$role, [string]$peer) {
+  if ($S.dfErr) { return $S.dfErr }
+  $up = $S.dfConn -and (Peer-Online)
+  if ($role -eq 'server') { if ($up) { "Sharing this PC's keyboard and mouse with $peer." } else { "Running. Waiting for $peer to connect (allow deskflow-core through Windows Firewall there if asked)." } }
+  elseif ($up) { "Using the keyboard and mouse of $peer." } else { "Connecting to $peer at $($S.peerAddr)... If Windows Firewall asks on $peer, allow deskflow-core on private networks." }
+}
+
+# The Deskflow download: release info, then the zip, SHA256-checked against the release's digest before it is extracted.
+function Start-DeskflowDownload {
+  if ($S.dl) { return }
+  $S.dlErr = $false; $S.dlMsg = 'Asking GitHub for the latest Deskflow release...'
+  $S.dl = @{ stage = 'api'; job = [Job]::Start('https://api.github.com/repos/deskflow/deskflow/releases/latest', $null, $null, $null) }
+}
+function Poll-DeskflowDownload {
+  $d = $S.dl; if (-not $d) { return }
+  $j = $d.job
+  if (-not $j.Status) { if ($d.stage -eq 'zip' -and $j.Total -gt 0) { $S.dlMsg = "Downloading Deskflow $($d.ver): $([int]($j.Done / 1MB)) of $([int]($j.Total / 1MB)) MB" }; return }
+  if ($j.Status -ne 'ok') { $S.dl = $null; $S.dlErr = $true; $S.dlMsg = "Download failed: $($j.Status -replace '^error: ')"; Say $S.dlMsg; return }
+  if ($d.stage -eq 'api') {
+    $rel = $j.Text | ConvertFrom-Json
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+    $a = Pick-Asset $rel $arch; $sha = if ($a) { Parse-Digest $a.digest }
+    if (-not $a -or -not $sha) { $S.dl = $null; $S.dlErr = $true; $S.dlMsg = "The latest Deskflow release has no checked Windows $arch download. Try again later."; return }
+    $ver = ($rel.tag_name -replace '[^\w.-]', ''); [void](New-Item -ItemType Directory -Force $dfRoot)
+    $zip = Join-Path $dfRoot ($a.name -replace '[^\w.-]', '')
+    $S.dl = @{ stage = 'zip'; ver = $ver; zip = $zip; dir = (Join-Path $dfRoot $ver); job = [Job]::Start($a.browser_download_url, $zip, $sha, (Join-Path $dfRoot $ver)) }
+    $S.dlMsg = "Downloading Deskflow $ver..."; Say "Downloading $($a.name), SHA256 $sha"
+    return
+  }
+  $exe = Get-ChildItem -LiteralPath $d.dir -Recurse -Filter 'deskflow-core.exe' | select -First 1 | % FullName
+  Remove-Item -LiteralPath $d.zip -ErrorAction SilentlyContinue
+  $S.dl = $null
+  if (-not $exe) { $S.dlErr = $true; $S.dlMsg = 'The Deskflow download has no deskflow-core.exe.'; return }
+  $C.deskflowExe = $exe; Save-Config
+  $S.dlMsg = "Deskflow $($d.ver) is downloaded and its SHA256 matches the release."; Say "Deskflow ready: $exe"
+}
+
+# Synergy, for the "Stop Synergy" helper: its running processes and services (nothing else is touched)
+function Find-Synergy {
+  @(Get-Process -ErrorAction SilentlyContinue | ? { $_.ProcessName -match '^synergy' } | % { "process $($_.ProcessName)" }) +
+  @(Get-Service -ErrorAction SilentlyContinue | ? { $_.Status -eq 'Running' -and ($_.Name -match 'synergy' -or $_.DisplayName -match 'synergy') } | % { "service $($_.Name)" })
+}
+function Stop-Synergy {
+  $found = @(Find-Synergy)
+  if (-not $found.Count) { $S.synergy = @(); return }
+  $list = ($found | % { "  - $_" }) -join "`n"
+  $q = "Stop these Synergy programs now?`n`n$list`n`nNothing is uninstalled or changed. Synergy may start again at your next sign-in: turn off its start-at-login option, or uninstall it in Windows Settings if you no longer need it.$(if ($found -match '^service') { "`n`nStopping a service needs administrator rights, so Windows will ask." })"
+  if ([Windows.MessageBox]::Show($win, $q, 'Stop Synergy', 'YesNo', 'Warning') -ne 'Yes') { return }
+  $svc = @($found | ? { $_ -like 'service *' } | % { $_.Substring(8) }); $proc = @($found | ? { $_ -like 'process *' } | % { $_.Substring(8) })
+  if ($svc.Count) {   # the service restarts its processes, so it goes first, in one elevated PowerShell
+    $cmd = "Stop-Service -Force -Name $(($svc | % { "'$_'" }) -join ','); Stop-Process -Force -ErrorAction SilentlyContinue -Name $(($proc + 'x-none' | % { "'$_'" }) -join ',')"
+    try { Start-Process "$PSHOME\powershell.exe" "-NoProfile -WindowStyle Hidden -Command $cmd" -Verb RunAs -Wait -WindowStyle Hidden } catch { Say "Synergy wasn't stopped: $($_.Exception.Message)" error; return }
+  } else { $proc | % { Stop-Process -Name $_ -Force -ErrorAction SilentlyContinue } }
+  Start-Sleep -Milliseconds 500; $S.synergy = @(Find-Synergy)
+  Say $(if ($S.synergy.Count) { "Some Synergy programs are still running: $($S.synergy -join ', ')." } else { 'Synergy stopped.' })
 }
 function Read-Layout {   # Synergy 3's layout (read-only): the default until DeskGlide has its own; re-read when the file changes
   $f = Get-ChildItem "$env:APPDATA\synergy-dragon\agent\*\synergy-server.conf" -ErrorAction SilentlyContinue | sort LastWriteTime | select -Last 1 | % FullName
@@ -472,6 +665,9 @@ function Tick {
     if ($C.peerAddress -and -not $S.fixedIp) { Resolve-Peer }
   }
   if ($S.n % 30 -eq 1) { Read-Layout }   # every 3 s
+  Poll-DeskflowDownload
+  Sync-Deskflow
+  if ($win -and $win.IsVisible -and ($now - $S.synAt).TotalSeconds -ge 5) { $S.synAt = $now; $S.synergy = @(Get-Process -ErrorAction SilentlyContinue | ? { $_.ProcessName -match '^synergy' }).Count }
   Check-Switch
   if ($S.volAt -and ($now - $S.volAt).TotalMilliseconds -ge 400) { $S.volAt = $null; Changed }   # slider: sync when it stops moving
 
@@ -736,6 +932,35 @@ $xaml = @'
 
         <StackPanel Grid.Column="2">
           <Border Style="{StaticResource CardBox}"><StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE765;"/><TextBlock Style="{StaticResource H}" Text="Keyboard &amp; mouse"/></StackPanel>
+            <Border x:Name="KmHostMain"><StackPanel x:Name="KmPanel">
+              <CheckBox x:Name="KmToggle" Style="{StaticResource Switch}"><StackPanel>
+                <TextBlock Text="Share keyboard and mouse"/>
+                <TextBlock Style="{StaticResource Sub}" Text="DeskGlide runs Deskflow for you, so you don't need Synergy."/></StackPanel></CheckBox>
+              <TextBlock Style="{StaticResource Label}" Text="Keyboard and mouse are plugged into"/>
+              <Border Style="{StaticResource InsetBox}"><UniformGrid Rows="1">
+                <RadioButton x:Name="KmMe" GroupName="km" Style="{StaticResource Seg}"/>
+                <RadioButton x:Name="KmPeer" GroupName="km" Style="{StaticResource Seg}"/>
+              </UniformGrid></Border>
+              <Border Style="{StaticResource InsetBox}" Padding="12,9" Margin="0,14,0,0"><Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                <Ellipse x:Name="KmDot" Width="8" Height="8" Margin="0,6,10,0" VerticalAlignment="Top"/>
+                <TextBlock x:Name="KmWhy" Grid.Column="1" Style="{StaticResource Body}"/>
+              </Grid></Border>
+              <StackPanel x:Name="DfGet" Margin="0,12,0,0">
+                <Button x:Name="DfDownload" Style="{StaticResource Primary}" Content="Download Deskflow" HorizontalAlignment="Left" ToolTip="About 18 MB from github.com/deskflow, checked against the release's SHA256"/>
+                <ProgressBar x:Name="DfBar" Height="3" Margin="0,10,0,0" Maximum="1" Foreground="{DynamicResource Accent}" Background="{DynamicResource Inset}" BorderThickness="0"/>
+              </StackPanel>
+              <TextBlock x:Name="DfMsg" Style="{StaticResource Sub}" Margin="0,6,0,0"/>
+              <StackPanel x:Name="SynRow" Margin="0,12,0,0">
+                <TextBlock Style="{StaticResource Sub}" Foreground="{DynamicResource Warn}" Text="Synergy is still running. Two programs sharing one mouse fight over it."/>
+                <Button x:Name="StopSyn" Content="Stop Synergy..." HorizontalAlignment="Left" Margin="0,8,0,0"/>
+              </StackPanel>
+              <TextBlock Style="{StaticResource Sub}" Margin="0,12,0,0" Text="The lock screen and UAC prompts of the other PC can't be used from here: that needs Deskflow's background service, which DeskGlide doesn't install."/>
+              <TextBlock Style="{StaticResource Sub}" Margin="0,6,0,0">Deskflow is free software under the GPL-2.0 license. <Hyperlink x:Name="DfSrc" Foreground="{DynamicResource Accent}">Source code</Hyperlink></TextBlock>
+            </StackPanel></Border>
+          </StackPanel></Border>
+          <Border Style="{StaticResource CardBox}"><StackPanel>
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE7F6;"/><TextBlock Style="{StaticResource H}" Text="Sound"/></StackPanel>
             <Border Style="{StaticResource InsetBox}"><UniformGrid Rows="1">
               <RadioButton x:Name="AFollow" GroupName="audio" Style="{StaticResource Seg}" Content="Follow mouse"/>
@@ -821,7 +1046,7 @@ $xaml = @'
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
           <Rectangle x:Name="D1" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/><Rectangle x:Name="D2" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/>
           <Rectangle x:Name="D3" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/><Rectangle x:Name="D4" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/>
-          <Rectangle x:Name="D5" Width="28" Height="4" RadiusX="2" RadiusY="2"/>
+          <Rectangle x:Name="D5" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/><Rectangle x:Name="D6" Width="28" Height="4" RadiusX="2" RadiusY="2"/>
         </StackPanel>
       </StackPanel>
     </DockPanel>
@@ -830,7 +1055,7 @@ $xaml = @'
         <StackPanel x:Name="W1">
           <Image x:Name="BigLogo" Width="88" Height="88" HorizontalAlignment="Left"/>
           <TextBlock Style="{StaticResource Big}" Text="Welcome to DeskGlide" Margin="0,18,0,10"/>
-          <TextBlock Style="{StaticResource Body}" Text="Two PCs, one monitor, one keyboard and mouse. When Synergy moves your mouse to the other PC, DeskGlide makes everything else follow."/>
+          <TextBlock Style="{StaticResource Body}" Text="Two PCs, one monitor, one keyboard and mouse. Move the mouse off the edge of one PC's screen and everything else follows it to the other PC."/>
           <Grid Margin="0,22,0,0">
             <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
             <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
@@ -849,6 +1074,11 @@ $xaml = @'
           <Border x:Name="PairHostWiz" Margin="0,18,0,0"/>
         </StackPanel>
         <StackPanel x:Name="W3" Visibility="Collapsed">
+          <TextBlock Style="{StaticResource Big}" Text="Share the keyboard and mouse"/>
+          <TextBlock Style="{StaticResource Body}" Text="DeskGlide downloads Deskflow, the free keyboard and mouse sharing program, and runs it on both PCs. Already happy with Synergy? Leave this off and click Next."/>
+          <Border x:Name="KmHostWiz" Margin="0,18,0,0"/>
+        </StackPanel>
+        <StackPanel x:Name="W4" Visibility="Collapsed">
           <TextBlock Style="{StaticResource Big}" Text="Show each PC on the monitor once"/>
           <TextBlock Style="{StaticResource Body}" Text="Move your mouse to each PC once and wait a few seconds. If the screen doesn't follow, press the monitor's input button. DeskGlide asks the monitor which input each PC uses."/>
           <Border Style="{StaticResource InsetBox}" Padding="16,12" Margin="0,18,0,0"><Grid>
@@ -859,13 +1089,13 @@ $xaml = @'
           </Grid></Border>
           <TextBlock x:Name="W3Msg" Style="{StaticResource Sub}" Margin="0,12,0,0"/>
         </StackPanel>
-        <StackPanel x:Name="W4" Visibility="Collapsed">
+        <StackPanel x:Name="W5" Visibility="Collapsed">
           <TextBlock Style="{StaticResource Big}" Text="Where are your headphones plugged in?"/>
           <TextBlock Style="{StaticResource Body}" Text="The other PC sends its sound there over your network. Both PCs share this choice, and you can change it later."/>
           <Border x:Name="HpHostWiz" Margin="0,18,0,0"/>
           <TextBlock Style="{StaticResource Sub}" Margin="0,12,0,0" Text="No headphones? Click Next, and set Sound to Off later."/>
         </StackPanel>
-        <StackPanel x:Name="W5" Visibility="Collapsed">
+        <StackPanel x:Name="W6" Visibility="Collapsed">
           <TextBlock Style="{StaticResource Glyph}" Text="&#xE73E;" FontSize="40" HorizontalAlignment="Left" Margin="0,0,0,14"/>
           <TextBlock Style="{StaticResource Big}" Text="You're all set"/>
           <TextBlock x:Name="Summary" Style="{StaticResource Body}"/>
@@ -949,7 +1179,13 @@ function New-Window {
   On LayUp Checked { Set-Layout 'up' }
   On LayDown Checked { Set-Layout 'down' }
   On Help Click { $md = Join-Path $PSScriptRoot 'README.md'; if (Test-Path 'Registry::HKEY_CLASSES_ROOT\.md') { Start-Process $md } else { Start-Process notepad.exe "`"$md`"" } }
-  On WizNext Click { if ($S.wiz -ge 5) { Show-Wizard 0 } else { Show-Wizard ($S.wiz + 1) } }
+  On KmToggle Checked, Unchecked { if ($C.km -ne [bool]$ui.KmToggle.IsChecked) { $C.km = -not $C.km; if ($C.km -and -not (Deskflow-Exe)) { Start-DeskflowDownload }; Changed } }
+  On KmMe Checked { if ($C.kmHost -ne $Name) { $C.kmHost = $Name; Changed } }
+  On KmPeer Checked { if ($C.peer -and $C.kmHost -ne $C.peer) { $C.kmHost = $C.peer; Changed } }
+  On DfDownload Click { Start-DeskflowDownload }
+  On StopSyn Click { Stop-Synergy }
+  On DfSrc Click { Start-Process $dfSource }
+  On WizNext Click { if ($S.wiz -ge 6) { Show-Wizard 0 } else { Show-Wizard ($S.wiz + 1) } }
   On WizBack Click { Show-Wizard ($S.wiz - 1) }
   On WizSkip Click { Show-Wizard 0 }
   # drag the other PC's screen around this one, like Windows' display settings
@@ -987,17 +1223,17 @@ function Show-Window {
 
 function Show-Wizard([int]$step) {
   $S.wiz = $step; $in = $step -gt 0
-  foreach ($p in @(@($ui.PairPanel, $ui.PairHostWiz, $ui.PairHostMain), @($ui.HpPanel, $ui.HpHostWiz, $ui.HpHostMain))) {   # the wizard borrows these from the main view
+  foreach ($p in @(@($ui.PairPanel, $ui.PairHostWiz, $ui.PairHostMain), @($ui.HpPanel, $ui.HpHostWiz, $ui.HpHostMain), @($ui.KmPanel, $ui.KmHostWiz, $ui.KmHostMain))) {   # the wizard borrows these from the main view
     $to = if ($in) { $p[1] } else { $p[2] }
     if ($p[0].Parent -ne $to) { $p[0].Parent.Child = $null; $to.Child = $p[0] }
   }
   Show-If $ui.Wiz $in; Show-If $ui.Main (-not $in)
   if (-not $in) { $S.wizDone = $true; return }
-  for ($i = 1; $i -le 5; $i++) { Show-If $ui["W$i"] ($i -eq $step); $ui["D$i"].SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ($i -le $step) { 'Accent' } else { 'Line2' })) }
+  for ($i = 1; $i -le 6; $i++) { Show-If $ui["W$i"] ($i -eq $step); $ui["D$i"].SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ($i -le $step) { 'Accent' } else { 'Line2' })) }
   $ui.WizBack.Visibility = if ($step -gt 1) { 'Visible' } else { 'Hidden' }
-  $ui.WizSkip.Visibility = if ($step -lt 5) { 'Visible' } else { 'Hidden' }
-  $ui.WizNext.Content = switch ($step) { 1 { 'Get started' } 5 { 'Finish' } default { 'Next' } }
-  $ui.WizStep.Text = "Step $step of 5"
+  $ui.WizSkip.Visibility = if ($step -lt 6) { 'Visible' } else { 'Hidden' }
+  $ui.WizNext.Content = switch ($step) { 1 { 'Get started' } 6 { 'Finish' } default { 'Next' } }
+  $ui.WizStep.Text = "Step $step of 6"
 }
 
 function Update-Ui {
@@ -1043,6 +1279,18 @@ function Update-Ui {
   $ui.SwitchNow.IsEnabled = [bool]$S.peerInput
   $ui.SwitchNow.ToolTip = "Show $peer on the monitor now"
   $ui.MonMsg.Text = $S.monMsg; $ui.MonMsg.Foreground = Brush $(if ($S.monErr) { 'Bad' } else { 'Fg2' }); Show-If $ui.MonMsg $S.monMsg
+
+  # keyboard & mouse
+  $ui.KmToggle.IsChecked = $C.km
+  $ui.KmMe.Content = $Name; $ui.KmPeer.Content = $peer; $ui.KmPeer.IsEnabled = $paired
+  $ui.KmMe.IsChecked = $C.kmHost -eq $Name; $ui.KmPeer.IsChecked = $paired -and $C.kmHost -eq $C.peer
+  $ui.KmWhy.Text = $S.kmWhy
+  $ui.KmDot.Fill = Brush $(if ($S.df -and $S.dfErr) { 'Bad' } elseif ($S.df -and $S.dfConn) { 'Good' } elseif ($S.df) { 'Warn' } else { 'Fg2' })
+  $have = [bool](Deskflow-Exe)
+  Show-If $ui.DfGet (-not $have -or $S.dl); $ui.DfDownload.IsEnabled = -not $S.dl; Show-If $ui.DfBar $S.dl
+  if ($S.dl -and $S.dl.job.Total -gt 0) { $ui.DfBar.Value = $S.dl.job.Done / $S.dl.job.Total } else { $ui.DfBar.Value = 0 }
+  $ui.DfMsg.Text = $S.dlMsg; Show-If $ui.DfMsg $S.dlMsg; $ui.DfMsg.Foreground = Brush $(if ($S.dlErr) { 'Bad' } else { 'Fg2' })
+  Show-If $ui.SynRow ($C.km -and $S.synergy)
 
   # sound
   $ui.AFollow.IsChecked = $C.audio -eq 'follow'; $ui.ABoth.IsChecked = $C.audio -eq 'both'; $ui.AOff.IsChecked = $C.audio -eq 'off'
@@ -1142,6 +1390,7 @@ try {
   }
 
   Restore-Muted
+  Kill-OrphanDeskflow
   $udp = New-Object Net.Sockets.UdpClient
   $udp.Client.Bind((New-Object Net.IPEndPoint([Net.IPAddress]::Any, $Port)))
   $udp.EnableBroadcast = $true
@@ -1172,6 +1421,7 @@ try {
   if ($Console) { throw } else { [void][Windows.Forms.MessageBox]::Show($msg, 'DeskGlide', 'OK', 'Error') }
 } finally {
   [Dg]::SendOn = $false; [Dg]::RecvOn = $false
+  if ($S.df) { try { $S.df.Kill() } catch {} }   # Deskflow runs only while DeskGlide does
   if ([Dg]::Muted.Count) { [Dg]::MuteOthers($false, $PID) }
   Save-Muted
   if ($tray) { $tray.Visible = $false; $tray.Dispose() }

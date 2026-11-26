@@ -2,8 +2,87 @@
 using System; using System.Text; using System.Net; using System.Net.Sockets; using System.Threading; using System.IO;
 using System.Collections.Generic; using System.Runtime.InteropServices; using System.Security.Cryptography;
 using System.Drawing; using System.Drawing.Drawing2D; using System.Drawing.Imaging;
+using System.Security.Cryptography.X509Certificates; using System.IO.Compression;
+
+// One background download (or GET when path is null) with progress. DeskGlide.ps1 polls it from its timer.
+public class Job {
+  public volatile string Status = "";   // "" while running, then "ok" or "error: ..."
+  public long Done, Total;
+  public string Text;                    // the body, for a GET
+  public static Job Start(string url, string path, string sha256, string extractTo) {
+    var j = new Job();   // PowerShell passes $null as "": treat both as "not given"
+    var t = new Thread(() => j.Run(url, N(path), N(sha256), N(extractTo))); t.IsBackground = true; t.Start(); return j;
+  }
+  static string N(string s) { return string.IsNullOrEmpty(s) ? null : s;
+  }
+  void Run(string url, string path, string sha256, string extractTo) {
+    try {
+      ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+      var rq = (HttpWebRequest)WebRequest.Create(url); rq.UserAgent = "DeskGlide"; rq.Timeout = 30000;
+      using (var rs = rq.GetResponse()) using (var s = rs.GetResponseStream()) {
+        Total = rs.ContentLength;
+        Stream o = path == null ? (Stream)new MemoryStream() : File.Create(path);
+        using (var h = SHA256.Create()) {
+          try {
+            var b = new byte[65536]; int n;
+            while ((n = s.Read(b, 0, b.Length)) > 0) { o.Write(b, 0, n); h.TransformBlock(b, 0, n, null, 0); Done += n; }
+            h.TransformFinalBlock(b, 0, 0);
+            if (path == null) Text = Encoding.UTF8.GetString(((MemoryStream)o).ToArray());
+          } finally { o.Close(); }
+          if (sha256 != null && Dg.Hex(h.Hash) != sha256.ToLowerInvariant()) {
+            File.Delete(path); Status = "error: the download's SHA256 doesn't match the release, so it was deleted"; return;
+          }
+        }
+      }
+      if (extractTo != null) {   // into a temp folder first, so a half-extracted copy is never used
+        string tmp = extractTo + ".part";
+        if (Directory.Exists(tmp)) Directory.Delete(tmp, true);
+        ZipFile.ExtractToDirectory(path, tmp);   // refuses entries that point outside tmp
+        if (Directory.Exists(extractTo)) Directory.Delete(extractTo, true);
+        Directory.Move(tmp, extractTo);
+      }
+      Status = "ok";
+    } catch (Exception e) { Status = "error: " + e.Message; }
+  }
+}
 
 public static class Dg {
+  public static string Hex(byte[] b) { var s = new StringBuilder(); foreach (byte x in b) s.Append(x.ToString("x2")); return s.ToString(); }
+
+  // ---------- Deskflow TLS: its GUI makes the certificate, the headless core doesn't, so DeskGlide does ----------
+  // Writes an RSA key and a self-signed certificate as PEM (what the Deskflow GUI writes), returns its fingerprint.
+  public static string MakeCert(string pemPath) {
+    using (var rsa = new RSACryptoServiceProvider(2048)) {
+      var req = new CertificateRequest("CN=Deskflow", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+      byte[] der = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(10)).RawData;
+      var p = rsa.ExportParameters(true);
+      byte[] key = Tlv(0x30, Cat(DerInt(new byte[] { 0 }), DerInt(p.Modulus), DerInt(p.Exponent), DerInt(p.D), DerInt(p.P),
+                                 DerInt(p.Q), DerInt(p.DP), DerInt(p.DQ), DerInt(p.InverseQ)));   // PKCS#1 RSAPrivateKey
+      File.WriteAllText(pemPath, Pem("RSA PRIVATE KEY", key) + Pem("CERTIFICATE", der));
+      return Hex(SHA256.Create().ComputeHash(der));
+    }
+  }
+  // SHA256 of the certificate in a PEM file, lowercase hex, the way Deskflow's trusted-servers file stores it.
+  public static string PemFingerprint(string pemPath) {
+    string t = File.ReadAllText(pemPath); const string a = "-----BEGIN CERTIFICATE-----", z = "-----END CERTIFICATE-----";
+    int i = t.IndexOf(a), j = t.IndexOf(z); if (i < 0 || j < i) return null;
+    return Hex(SHA256.Create().ComputeHash(Convert.FromBase64String(t.Substring(i + a.Length, j - i - a.Length))));
+  }
+  static string Pem(string label, byte[] der) {
+    return "-----BEGIN " + label + "-----\n" + Convert.ToBase64String(der, Base64FormattingOptions.InsertLineBreaks).Replace("\r", "") + "\n-----END " + label + "-----\n";
+  }
+  static byte[] DerInt(byte[] v) {   // unsigned big-endian -> DER INTEGER
+    int i = 0; while (i < v.Length - 1 && v[i] == 0) i++;
+    int pad = (v[i] & 0x80) != 0 ? 1 : 0; var b = new byte[v.Length - i + pad];
+    Buffer.BlockCopy(v, i, b, pad, v.Length - i); return Tlv(2, b);
+  }
+  static byte[] Tlv(byte tag, byte[] body) {
+    var m = new MemoryStream(); m.WriteByte(tag); int n = body.Length;
+    if (n < 128) m.WriteByte((byte)n); else if (n < 256) { m.WriteByte(0x81); m.WriteByte((byte)n); } else { m.WriteByte(0x82); m.WriteByte((byte)(n >> 8)); m.WriteByte((byte)n); }
+    m.Write(body, 0, n); return m.ToArray();
+  }
+  static byte[] Cat(params byte[][] parts) { var m = new MemoryStream(); foreach (var p in parts) m.Write(p, 0, p.Length); return m.ToArray(); }
+
   // ---------- app icon: a monitor whose left half is this PC and right half the other PC ----------
   // state: 0 = app icon (two-tone), 1 = this PC has the mouse, 2 = the other PC has it, 3 = grey (paused / not paired)
   public static Bitmap DrawIcon(int size, int state) {
