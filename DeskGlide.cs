@@ -18,7 +18,7 @@ public class Job {
   void Run(string url, string path, string sha256, string extractTo) {
     try {
       ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-      var rq = (HttpWebRequest)WebRequest.Create(url); rq.UserAgent = "DeskGlide"; rq.Timeout = 30000;
+      var rq = WebRequest.Create(url); var http = rq as HttpWebRequest; if (http != null) http.UserAgent = "DeskGlide"; rq.Timeout = 30000;   // GitHub wants a User-Agent
       using (var rs = rq.GetResponse()) using (var s = rs.GetResponseStream()) {
         Total = rs.ContentLength;
         Stream o = path == null ? (Stream)new MemoryStream() : File.Create(path);

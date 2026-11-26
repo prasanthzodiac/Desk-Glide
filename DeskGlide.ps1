@@ -21,6 +21,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Version = '4.0'
 $Proto = 4   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it
+$UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
 Add-Type -Path "$PSScriptRoot\DeskGlide.cs" -ReferencedAssemblies System.Drawing, System.Core, System.IO.Compression, System.IO.Compression.FileSystem, System.Windows.Forms
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, PresentationFramework, PresentationCore, WindowsBase, WindowsFormsIntegration, System.Security
@@ -48,7 +49,7 @@ function Load-Config {
   $c = @{ peer = ''; key = ''; peerAddress = ''; input = 0; inputOverride = 0; monitor = $true; audio = 'follow'; hp = ''; vol = 100
           paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
           kmHost = ''; inputs = @{}; monOff = @(); detach = $false
-          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048; mic = 'off' }
+          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048; mic = 'off'; updateAt = 0 }
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
   $c.inputs = To-Hash $c.inputs; $c.monOff = @($c.monOff | ? { $_ })
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
@@ -226,6 +227,31 @@ function Pick-Asset($release, [string]$pattern) { @($release.assets | ? { $_.nam
 # GitHub's asset digest 'sha256:<hex>' -> lowercase hex, or $null
 function Parse-Digest([string]$d) { if ($d -match '^sha256:([0-9a-fA-F]{64})$') { $matches[1].ToLower() } }
 
+# A release tag ('v4.1') if it is newer than $current, else $null
+function Newer-Version([string]$tag, [string]$current) {
+  $t = $tag -replace '^[vV]', ''; $v = $null; $c = $null
+  if ([version]::TryParse($t, [ref]$v) -and [version]::TryParse($current, [ref]$c) -and $v -gt $c) { $t }
+}
+# The updater DeskGlide leaves behind when it exits for an update: waits for it, swaps the files (rolls back if a copy
+# fails), unblocks them and starts DeskGlide again. -Files is comma-separated (powershell -File can't pass arrays).
+$updaterText = @'
+param([int]$Wait, [string]$From, [string]$To, [string]$Files, [switch]$NoStart)
+try { Wait-Process -Id $Wait -Timeout 30 -ErrorAction Stop } catch {}
+$bak = Join-Path $To '.previous'; [void](New-Item -ItemType Directory -Force $bak)
+$names = $Files -split ','
+try {
+  foreach ($f in $names) {
+    $src = Get-ChildItem -LiteralPath $From -Recurse -File -Filter $f | select -First 1
+    if (-not $src) { continue }
+    if (Test-Path -LiteralPath (Join-Path $To $f)) { Copy-Item -LiteralPath (Join-Path $To $f) (Join-Path $bak $f) -Force }
+    Copy-Item -LiteralPath $src.FullName (Join-Path $To $f) -Force; Unblock-File -LiteralPath (Join-Path $To $f)
+  }
+} catch {
+  foreach ($f in $names) { if (Test-Path -LiteralPath (Join-Path $bak $f)) { Copy-Item -LiteralPath (Join-Path $bak $f) (Join-Path $To $f) -Force } }
+}
+if (-not $NoStart) { Start-Process "$PSHOME\powershell.exe" "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $To 'DeskGlide.ps1')`" -ShowWindow" -WindowStyle Hidden }
+'@
+
 # ---------- edges, for DeskGlide Link (keyboard and mouse sharing, next version) ----------
 # The edges between the keyboard PC ($server) and the other one, from DeskGlide's layout, in Synergy's 'links' format:
 # the other PC is on the $dir side of the keyboard PC. Parse-Links reads it back.
@@ -292,7 +318,7 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         links = @(); confPath = ''; confTime = $null; layDir = ''; drag = $null
         code = ''; myAddrs = ''; pairStart = Get-Date; pairErr = ''; addrErr = ''; unpairAt = $null; volAt = $null
         wiz = 0; wizDone = $false; iconState = 3; dark = $null; shownAt = $null
-        peerVer = 0; peerScreen = ''
+        peerVer = 0; peerScreen = ''; upd = $null; newer = $null; updMsg = ''; startedAt = Get-Date
         cable = -1; cableAt = [DateTime]::MinValue; peerCable = $false
         offer = $null; peerOffer = $null; fetchedId = ''; pasted = ''; fileMsg = ''; fileErr = $false; fileSaved = @()
         hk = [long]0; hkTo = ''; hkSeen = [long]0; lastSa = $null; hkSig = ''; hkErr = ''; msgWin = $null
@@ -411,6 +437,20 @@ if ($Test) {
   Check ((Pick-Asset $rel 'DeskGlide-*.zip').name -eq 'DeskGlide-4.1.zip' -and $null -eq (Pick-Asset $rel 'Other-*.zip')) 'asset by name'
   Check ((Parse-Digest (Pick-Asset $rel 'SHA256SUMS.txt').digest) -eq '86d9a02f9f2f747023de7f9808065bf4d7f922ffde67c7308061a5865d367ac2') 'digest: lowercased'
   Check ($null -eq (Parse-Digest '') -and $null -eq (Parse-Digest 'sha512:abcd') -and $null -eq (Parse-Digest 'sha256:xyz') -and $null -eq (Parse-Digest "sha256:$('a' * 63)")) 'digest: rejects'
+  Check ((Newer-Version 'v4.1' '4.0') -eq '4.1' -and (Newer-Version '4.0.1' '4.0') -eq '4.0.1' -and $null -eq (Newer-Version 'v4.0' '4.0') -and $null -eq (Newer-Version 'v3.9' '4.0') -and $null -eq (Newer-Version 'nightly' '4.0')) 'newer version'
+
+  # update: download, SHA256 check and extract (file:// so it runs offline), then the updater swaps the files
+  $ut = Join-Path $env:TEMP "dg-update-$PID"; [void](New-Item -ItemType Directory -Force "$ut\pkg\DeskGlide-4.1", "$ut\app")
+  Set-Content "$ut\pkg\DeskGlide-4.1\DeskGlide.ps1" 'new ps1'; Set-Content "$ut\pkg\DeskGlide-4.1\DeskGlide.cs" 'new cs'
+  Set-Content "$ut\app\DeskGlide.ps1" 'old ps1'; Set-Content "$ut\app\DeskGlide.cs" 'old cs'; Set-Content "$ut\app\README.md" 'old readme'
+  [IO.Compression.ZipFile]::CreateFromDirectory("$ut\pkg", "$ut\rel.zip"); $sha = (Get-FileHash "$ut\rel.zip" -Algorithm SHA256).Hash.ToLower()
+  function Fetch($sha256) { $j = [Job]::Start(([Uri]"$ut\rel.zip").AbsoluteUri, "$ut\dl.zip", $sha256, "$ut\staged"); $t0 = Get-Date; while (-not $j.Status -and ((Get-Date) - $t0).TotalSeconds -lt 10) { Start-Sleep -Milliseconds 50 }; $j.Status }
+  Check ((Fetch ('0' * 64)) -match 'SHA256 doesn.t match' -and -not (Test-Path "$ut\dl.zip") -and -not (Test-Path "$ut\staged")) 'download with the wrong SHA256 kept'
+  Check ((Fetch $sha) -eq 'ok' -and (Test-Path "$ut\staged\DeskGlide-4.1\DeskGlide.ps1") -and -not (Test-Path "$ut\staged.part")) 'download, check, extract'
+  [IO.File]::WriteAllText("$ut\update.ps1", $updaterText)
+  & "$ut\update.ps1" -Wait 2147483646 -From "$ut\staged" -To "$ut\app" -Files ($appFiles -join ',') -NoStart
+  Check ((Get-Content "$ut\app\DeskGlide.ps1") -eq 'new ps1' -and (Get-Content "$ut\app\DeskGlide.cs") -eq 'new cs' -and (Get-Content "$ut\app\README.md") -eq 'old readme' -and (Get-Content "$ut\app\.previous\DeskGlide.ps1") -eq 'old ps1') 'updater: new files in, old kept in .previous'
+  Remove-Item -Recurse -Force $ut
 
   # edges from DeskGlide's layout (for DeskGlide Link), and the keyboard PC choice, synced
   $edges = Edge-Links 'DESK-PC' 'LAPTOP' 'left'
@@ -679,6 +719,37 @@ function Set-HotkeyText([string]$which, [string]$text) {   # from the Settings c
   if ($C[$which] -eq $k.text) { $S.hkErr = ''; return }
   $C[$which] = $k.text; Save-Config; Apply-Hotkeys
 }
+# ---------- auto-update: once a day ask GitHub for the latest release; the user clicks to install it ----------
+function Poll-Update {
+  if (-not $UpdateRepo) { return }
+  $u = $S.upd
+  if (-not $u) {   # a minute after start, then daily
+    if (((Get-Date) - $S.startedAt).TotalSeconds -lt 60 -or (Now-Ms) - [long]$C.updateAt -lt 86400000) { return }
+    $C.updateAt = Now-Ms; Save-Config
+    $S.upd = @{ stage = 'check'; job = [Job]::Start("https://api.github.com/repos/$UpdateRepo/releases/latest", $null, $null, $null) }; return
+  }
+  $j = $u.job; if (-not $j -or -not $j.Status) { return }
+  if ($u.stage -eq 'check') {
+    $S.upd = $null
+    if ($j.Status -ne 'ok') { Say "Update check failed: $($j.Status -replace '^error: ')"; return }
+    $rel = $j.Text | ConvertFrom-Json; $ver = Newer-Version $rel.tag_name $Version; $a = Pick-Asset $rel 'DeskGlide-*.zip'
+    if ($ver -and $a -and (Parse-Digest $a.digest)) { $S.newer = @{ ver = $ver; url = $a.browser_download_url; sha = (Parse-Digest $a.digest); page = $rel.html_url }; Say "DeskGlide $ver is available." }
+    return
+  }
+  if ($j.Status -ne 'ok') { $S.upd = $null; $S.updMsg = "The update didn't download: $($j.Status -replace '^error: ')"; Say $S.updMsg error; return }
+  # downloaded, SHA256 checked and extracted: hand over to the updater and quit
+  $updater = Join-Path $DataDir 'update\update.ps1'; [IO.File]::WriteAllText($updater, $updaterText)
+  Start-Process "$PSHOME\powershell.exe" "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$updater`" -Wait $PID -From `"$($u.dir)`" -To `"$PSScriptRoot`" -Files $($appFiles -join ',')" -WindowStyle Hidden
+  Say "Installing DeskGlide $($S.newer.ver); it restarts in a moment."
+  [Windows.Forms.Application]::Exit()
+}
+function Start-Update {   # the footer link
+  $n = $S.newer; if (-not $n -or $S.upd) { return }
+  if ($PSScriptRoot -ne $appDir) { Start-Process $n.page; return }   # not the installed copy: show the release page, Install.cmd does the rest
+  $dir = Join-Path $DataDir "update\$($n.ver -replace '[^\w.-]', '')"; [void](New-Item -ItemType Directory -Force (Split-Path $dir))
+  $S.updMsg = ''; $S.upd = @{ stage = 'get'; dir = $dir; job = [Job]::Start($n.url, "$dir.zip", $n.sha, $dir) }
+}
+
 # ---------- files: copy on one PC, paste on the other ----------
 function Check-Clipboard {   # the clipboard changed: offer copied files to the other PC
   [MsgWin]::ClipChanged = $false
@@ -843,6 +914,7 @@ function Tick {
   }
   if ($S.n % 30 -eq 1) { Read-Layout }   # every 3 s
   Poll-Fetch; [Files]::Key = $S.key
+  Poll-Update
   Check-Switch
   if ($S.volAt -and ($now - $S.volAt).TotalMilliseconds -ge 400) { $S.volAt = $null; Changed }   # slider: sync when it stops moving
 
@@ -1227,7 +1299,7 @@ $xaml = @'
     </ScrollViewer>
     <DockPanel Grid.Row="2" Margin="2,6,2,0">
       <TextBlock DockPanel.Dock="Right" FontSize="12.5"><Hyperlink x:Name="OpenLog" Foreground="{DynamicResource Accent}">Open log</Hyperlink><Run Text="     "/><Hyperlink x:Name="Help" Foreground="{DynamicResource Accent}">Help and README</Hyperlink></TextBlock>
-      <TextBlock x:Name="Ver" Foreground="{DynamicResource Fg2}" FontSize="12.5"/>
+      <TextBlock FontSize="12.5"><Run x:Name="Ver" Foreground="{DynamicResource Fg2}"/><Run Text="     "/><Hyperlink x:Name="UpdateLink" Foreground="{DynamicResource Accent}"><Run x:Name="UpdateText"/></Hyperlink></TextBlock>
     </DockPanel>
   </Grid>
 
@@ -1376,6 +1448,7 @@ function New-Window {
   On HkPeer KeyDown { if ($args[1].Key -eq 'Return') { Set-HotkeyText 'hotkeyPeer' $ui.HkPeer.Text } }
   On HkMe KeyDown { if ($args[1].Key -eq 'Return') { Set-HotkeyText 'hotkeyMe' $ui.HkMe.Text } }
   On OpenLog Click { Start-Process notepad.exe "`"$logPath`"" }
+  On UpdateLink Click { Start-Update }
   On LayLeft Checked { Set-Layout 'left' }
   On LayRight Checked { Set-Layout 'right' }
   On LayUp Checked { Set-Layout 'up' }
@@ -1524,6 +1597,10 @@ function Update-Ui {
   $ui.VolPct.Text = "$($C.vol)%"
   $ui.AudioWhy.Text = Audio-Status $C $paired $online $S.active $S.peerVer
   $ui.AudioDot.Fill = Brush $(if ([Dg]::SendMode -eq [Dg]::Sound -or [Dg]::RecvMode -eq [Dg]::Sound) { 'Good' } else { 'Fg2' })
+
+  # update (footer)
+  $ui.UpdateText.Text = if ($S.updMsg) { $S.updMsg } elseif ($S.upd -and $S.upd.stage -eq 'get') { "Downloading DeskGlide $($S.newer.ver)... $(if ($S.upd.job.Total -gt 0) { [int](100 * $S.upd.job.Done / $S.upd.job.Total) })%" } elseif ($S.newer) { "Update available: DeskGlide $($S.newer.ver)" } else { '' }
+  $ui.UpdateLink.IsEnabled = [bool]$S.newer -and -not $S.upd
 
   # files
   $ui.FilesToggle.IsChecked = $C.files
