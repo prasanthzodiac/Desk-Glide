@@ -821,7 +821,8 @@ if ($Install -or $Uninstall) {
     "DeskGlide removed. Your settings are kept in $ConfigDir"; return
   }
   $files = @(if ($PSScriptRoot -ne $appDir) { Copy-App $PSScriptRoot $appDir } else { $appFiles | % { Join-Path $appDir $_ } | ? { Test-Path $_ } })
-  $files | Unblock-File   # downloaded from the internet: without this Windows asks before every start
+  # downloaded from the internet: without this Windows asks before every start
+  $files | ? { $_ -is [string] -and (Test-Path -LiteralPath $_) } | % { Unblock-File -LiteralPath $_ }
   $app = Join-Path $appDir 'DeskGlide.ps1'
   Set-Startup $true $app
   Start-Process "$PSHOME\powershell.exe" "$(Arg-Line $app) -ShowWindow" -WindowStyle Hidden
