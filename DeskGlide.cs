@@ -1222,7 +1222,8 @@ public class Link {
     if (Controlled && !NoInject && Out == null && now - uipiAt >= 500) { uipiAt = now; Uipi = ElevatedFront(); }   // the service's helper runs as SYSTEM: no UIPI
     byte[] key = Key; IPAddress peer = Peer;
     if (key == null) return;
-    if (key != helloKeyFor) { lock (gate) { helloKey = Dg.SessionKey(key, "link hello", LinkProto.Empty); helloKeyFor = key; } NewSession("a new pairing"); }
+    // by content, not reference: PowerShell hands over a fresh copy of the same key on every poll
+    if (!Same(key, helloKeyFor)) { lock (gate) { helloKey = Dg.SessionKey(key, "link hello", LinkProto.Empty); helloKeyFor = key; } NewSession("a new pairing"); }
     if (peer != null && !peer.Equals(ifFor)) { ifFor = peer; SetIf(peer); }
     if (now - addrsAt >= 5000) { addrsAt = now; Paths(); }
     int f; lock (gate) { conn.Slack = est.Rto; conn.Fast = Active || Controlled; f = conn.Tick(now); Up = conn.Up; }

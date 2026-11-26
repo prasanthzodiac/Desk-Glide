@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.2'
+$Version = '5.2.1'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -797,6 +797,9 @@ if ($Test) {
   function Until([scriptblock]$cond, [int]$wait = 3000) { $t0 = Get-Date; while (-not (& $cond) -and ((Get-Date) - $t0).TotalMilliseconds -lt $wait) { Start-Sleep -Milliseconds 5 }; [bool](& $cond) }
   function Took { $o = @(); $s = $null; while ($B.Injected.TryDequeue([ref]$s)) { $o += ($s -split '\|')[1] }; $o }
   Check (Until { $A.Up -and $B.Up -and $A.HasRemote -and $B.HasRemote }) 'link: connected over loopback'
+  $m = $null; while ($A.Log.TryDequeue([ref]$m)) {}; 1..5 | % { $A.Key = [byte[]]$pk.Clone(); Start-Sleep -Milliseconds 30 }   # the app re-sets the key every poll (5.2 flapped)
+  $flap = $false; while ($A.Log.TryDequeue([ref]$m)) { if ($m -match 'new pairing') { $flap = $true } }
+  Check ($A.Up -and -not $flap) 'link: the same key handed over again keeps the session'
   $A.FeedMouse(10, 0, 0, 0); Check (-not (Until { $A.Active } 300)) 'link: 10 px short of the edge stays here'
   $A.FeedMouse(20, 0, 0, 0); Check ((Until { $A.Active -and $B.Controlled }) -and (Took) -contains 'move 0,720') 'link: crossing the right edge; enters halfway down'
   $A.FeedMouse(10, 4, 0, 0); Check ((Until { $B.Injected.Count }) -and (Took) -contains 'move 15,726') 'link: moves scaled by the DPI ratio (96 -> 144)'
@@ -1331,7 +1334,8 @@ function Poll-Link {
     $S.link = $l; Say "Keyboard and mouse sharing on UDP port $($Port + 2)$(if ($NoInject) { ', no injection' })."
   }
   $l = $S.link
-  $l.Key = if ($C.peerAdmin -and $S.adminKey -and $C.kmHost -eq $Name) { $S.adminKey } else { $S.key }   # the other PC's admin service has its own key
+  # the other PC's admin service has its own key. Plain assignments: `$x = if (...) { $bytes }` unrolls the array into a new one
+  $k = $S.key; if ($C.peerAdmin -and $S.adminKey -and $C.kmHost -eq $Name) { $k = $S.adminKey }; $l.Key = $k
   if ($S.peerAddr) { $l.Peer = $S.peerAddr } elseif ($S.fixedIp -and -not $l.Peer) { $l.Peer = $S.fixedIp }
   $l.Sender = $C.kmHost -eq $Name
   $lay = (Current-Layout).show; $l.Dir = [char]$(if ($lay) { $lay.dir[0] } else { 'r' })
