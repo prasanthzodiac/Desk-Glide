@@ -36,8 +36,16 @@ $mutedPath = Join-Path $ConfigDir 'muted.txt'   # apps we muted, so a crash or k
 $logPath   = Join-Path $ConfigDir 'deskglide.log'
 $icoPath   = Join-Path $PSScriptRoot 'DeskGlide.ico'
 $lnk       = Join-Path ([Environment]::GetFolderPath('Startup')) 'DeskGlide.lnk'
-$argLine   = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
 $opp       = @{ left = 'right'; right = 'left'; up = 'down'; down = 'up' }
+
+# DeskGlide runs from its own copy in $appDir, so the downloaded folder can be moved or deleted and updates have one place to go
+$appDir   = Join-Path $DataDir 'app'
+$appFiles = 'DeskGlide.ps1', 'DeskGlide.cs', 'DeskGlide.ico', 'README.md', 'LICENSE', 'Install.cmd', 'Uninstall.cmd'
+function Arg-Line([string]$ps1) { "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ps1`"" }
+function Copy-App([string]$from, [string]$to) {   # DeskGlide's own files only (no .git, docs or settings); returns the copies
+  [void](New-Item -ItemType Directory -Force $to)
+  foreach ($f in $appFiles) { $s = Join-Path $from $f; if (Test-Path -LiteralPath $s) { Copy-Item -LiteralPath $s (Join-Path $to $f) -Force; Join-Path $to $f } }
+}
 
 function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 function Load-Config {
@@ -326,6 +334,14 @@ if ($Test) {
   Check ((Merge-Settings $PB $v3) -and $PB.km -and $PB.kmHost -eq 'PC-B') 'DeskGlide 3 message turned keyboard sharing off'
   Check ((Msg $PA 'PC-A').ver -eq 4) 'state message has ver 4'
 
+  # install: only DeskGlide's own files go into the app folder, and the shortcut runs that copy
+  $to = Join-Path $env:TEMP "dg-app-$PID"; $copied = @(Copy-App $PSScriptRoot $to)
+  $names = @(Get-ChildItem $to | % Name | sort)
+  Check ($copied.Count -ge 6 -and ($names -join ',') -eq (($appFiles | ? { Test-Path (Join-Path $PSScriptRoot $_) } | sort) -join ',') -and (Test-Path "$to\DeskGlide.ps1") -and -not (Test-Path "$to\docs") -and -not (Test-Path "$to\.git")) "install copies the app files only: $($names -join ',')"
+  Check ((Arg-Line "$to\DeskGlide.ps1") -eq "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$to\DeskGlide.ps1`"") 'startup arguments'
+  Check ($appDir -eq (Join-Path $DataDir 'app') -and $dfRoot -eq (Join-Path $DataDir 'deskflow')) 'app and Deskflow folders'
+  Remove-Item -Recurse $to
+
   $bmp = [Dg]::DrawIcon(16, 1); Check ($bmp.GetPixel(4, 7).R -lt 60 -and $bmp.GetPixel(11, 7).R -gt 100) 'icon: this PC half highlighted'
   $bmp = [Dg]::DrawIcon(16, 2); Check ($bmp.GetPixel(4, 7).R -gt 100 -and $bmp.GetPixel(11, 7).R -lt 60) 'icon: other PC half highlighted'
 
@@ -349,11 +365,15 @@ function Restore-Muted {   # unmute the apps a previous run muted (crash, kill, 
   [Dg]::MuteOthers($false, $PID); Remove-Item $mutedPath
 }
 function Ensure-Icon { if (-not (Test-Path $icoPath)) { [Dg]::SaveIco($icoPath, 0, [int[]](16, 24, 32, 48, 256)) } }
-function Set-Startup([bool]$on) {
+function Set-Startup([bool]$on, [string]$ps1 = $PSCommandPath) {
   if (-not $on) { Remove-Item $lnk -ErrorAction SilentlyContinue; return }
   Ensure-Icon
   $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-  $sc.TargetPath = "$PSHOME\powershell.exe"; $sc.Arguments = $argLine; $sc.WorkingDirectory = $PSScriptRoot; $sc.IconLocation = $icoPath; $sc.Save()
+  $sc.TargetPath = "$PSHOME\powershell.exe"; $sc.Arguments = Arg-Line $ps1; $sc.WorkingDirectory = Split-Path $ps1; $sc.IconLocation = Join-Path (Split-Path $ps1) 'DeskGlide.ico'; $sc.Save()
+}
+function Kill-OrphanDeskflow {   # a deskflow-core a killed DeskGlide left running with this config
+  Get-CimInstance Win32_Process -Filter "Name = 'deskflow-core.exe'" -ErrorAction SilentlyContinue |
+    ? { $_.CommandLine -and $_.CommandLine.Contains($dfIni) } | % { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 if ($Install -or $Uninstall) {
@@ -361,12 +381,20 @@ if ($Install -or $Uninstall) {
   Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
     ? { $_.ProcessId -ne $PID -and $_.CommandLine -like '*deskglide*.ps1*' } |
     % { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Kill-OrphanDeskflow
   Start-Sleep -Milliseconds 500
   Restore-Muted
-  if ($Uninstall) { Set-Startup $false; "DeskGlide removed. Your settings are kept in $ConfigDir"; return }
-  Set-Startup $true
-  Start-Process "$PSHOME\powershell.exe" "$argLine -ShowWindow" -WindowStyle Hidden
-  'DeskGlide is installed and running. Its window is open, and its icon is in the taskbar tray.'; return
+  if ($Uninstall) {
+    Set-Startup $false
+    foreach ($d in $appDir, $dfRoot) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+    "DeskGlide removed. Your settings are kept in $ConfigDir"; return
+  }
+  $files = @(if ($PSScriptRoot -ne $appDir) { Copy-App $PSScriptRoot $appDir } else { $appFiles | % { Join-Path $appDir $_ } | ? { Test-Path $_ } })
+  $files | Unblock-File   # downloaded from the internet: without this Windows asks before every start
+  $app = Join-Path $appDir 'DeskGlide.ps1'
+  Set-Startup $true $app
+  Start-Process "$PSHOME\powershell.exe" "$(Arg-Line $app) -ShowWindow" -WindowStyle Hidden
+  "DeskGlide is installed in $appDir and running. Its window is open, and its icon is in the taskbar tray."; return
 }
 
 # ---------------------------------------------------------------- the app
@@ -501,10 +529,6 @@ function Stop-Deskflow {
   $S.dfSig = ''; $S.dfConn = $false
   if ($S.dfRole -eq 'server') { $S.server = $false; $S.active = $null; Detect-Role }   # back to Synergy's log, if any
   $S.dfRole = ''
-}
-function Kill-OrphanDeskflow {   # a deskflow-core a killed DeskGlide left running with this config
-  Get-CimInstance Win32_Process -Filter "Name = 'deskflow-core.exe'" -ErrorAction SilentlyContinue |
-    ? { $_.CommandLine -and $_.CommandLine.Contains($dfIni) } | % { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 # Runs, restarts or stops deskflow-core to match the settings. Sets $S.kmWhy to what the card shows.
 function Sync-Deskflow {
