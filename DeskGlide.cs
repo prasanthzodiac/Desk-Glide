@@ -165,20 +165,103 @@ public static class Dg {
   [DllImport("dxva2.dll")] static extern bool SetVCPFeature(IntPtr h, byte code, uint value);
   [DllImport("dxva2.dll")] static extern bool GetVCPFeatureAndVCPFeatureReply(IntPtr h, byte code, IntPtr t, out uint cur, out uint max);
 
-  static void Each(Action<PM> f) {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  struct MONITORINFOEX { public int cb; public RECT mon, work; public uint flags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dev; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  struct DISPLAY_DEVICE { public int cb; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string name; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string text;
+    public uint state; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string id; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string key; }
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr hm, ref MONITORINFOEX mi);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool EnumDisplayDevices(string dev, uint i, ref DISPLAY_DEVICE dd, uint flags);
+
+  // Every physical monitor with its id and device path (\\?\DISPLAY#MSI4CE8#...#{guid}).
+  // ponytail: physical monitor i of a display output is matched to its i-th active monitor device; true for everything but clone setups
+  static void Each(Action<PM, string, string> f) {
+    var seen = new Dictionary<string, int>();
     EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (hm, dc, r, p) => {
       uint n; if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hm, out n) || n == 0) return true;
       var a = new PM[n]; if (!GetPhysicalMonitorsFromHMONITOR(hm, n, a)) return true;
-      foreach (var m in a) f(m);
+      var paths = new List<string>(); var mi = new MONITORINFOEX(); mi.cb = Marshal.SizeOf(mi);
+      if (GetMonitorInfo(hm, ref mi)) {
+        var dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(dd);
+        for (uint i = 0; EnumDisplayDevices(mi.dev, i, ref dd, 1); i++) { if ((dd.state & 1) != 0) paths.Add(dd.id); dd.cb = Marshal.SizeOf(dd); }   // 1 = active, EDD_GET_DEVICE_INTERFACE_NAME
+      }
+      for (int i = 0; i < a.Length; i++) {
+        string path = i < paths.Count ? paths[i] : "", k = MonitorKey(path); int c; seen.TryGetValue(k, out c); seen[k] = ++c;
+        f(a[i], c > 1 ? k + "-" + c : k, path);
+      }
       DestroyPhysicalMonitors(n, a); return true;
     }, IntPtr.Zero);
   }
-  // ponytail: talks to every DDC monitor; fine for one shared monitor, filter by name if you have more
-  public static bool SetInput(uint v) { bool ok = false; Each(m => ok |= SetVCPFeature(m.h, 0x60, v)); return ok; }
-  public static int GetInput() {   // -1 = no DDC/CI reply
+  // The monitor's EDID maker + product code ("MSI4CE8"): the same on both PCs, whichever input shows it.
+  // ponytail: two identical monitors are told apart by order ("MSI4CE8-2"), which can differ between the PCs
+  public static string MonitorKey(string path) { var p = (path ?? "").Split('#'); return p.Length > 2 && p[1] != "" ? p[1].ToUpperInvariant() : "MONITOR"; }
+  // "id \t device path \t name" per monitor; no DDC traffic
+  public static string[] ListMonitors() {
+    var names = FriendlyNames(); var o = new List<string>();
+    Each((m, id, path) => { string nm; if (!names.TryGetValue(path.ToLowerInvariant(), out nm) || nm == "") nm = m.d; o.Add(id + "\t" + path + "\t" + nm); });
+    return o.ToArray();
+  }
+  public static bool SetInputOn(string id, uint v) { bool ok = false; Each((m, i, p) => { if (i == id) ok |= SetVCPFeature(m.h, 0x60, v); }); return ok; }
+  public static int GetInputOf(string id) {   // -1 = no DDC/CI reply (or no such monitor)
     int v = -1;
-    Each(m => { uint cur, max; if (v < 0 && GetVCPFeatureAndVCPFeatureReply(m.h, 0x60, IntPtr.Zero, out cur, out max)) v = (int)(cur & 0xFF); });
+    Each((m, i, p) => { uint cur, max; if (i == id && v < 0 && GetVCPFeatureAndVCPFeatureReply(m.h, 0x60, IntPtr.Zero, out cur, out max)) v = (int)(cur & 0xFF); });
     return v;
+  }
+
+  // ---------- display configuration: take a switched-away monitor off this PC's desktop, and put it back ----------
+  [StructLayout(LayoutKind.Sequential)] struct LUID { public uint lo; public int hi; }
+  [StructLayout(LayoutKind.Sequential)] struct PathSource { public LUID adapter; public uint id, mode, status; }
+  [StructLayout(LayoutKind.Sequential)] struct PathTarget { public LUID adapter; public uint id, mode, tech, rotation, scaling, rateN, rateD, scan; public int available; public uint status; }
+  [StructLayout(LayoutKind.Sequential)] struct PathInfo { public PathSource src; public PathTarget tgt; public uint flags; }
+  [StructLayout(LayoutKind.Sequential, Size=64)] struct ModeInfo { public uint type, id; public LUID adapter; }   // opaque: passed back unchanged
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  struct TargetName { public uint type, size; public LUID adapter; public uint id, flags, tech; public ushort maker, product; public uint conn;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=64)] public string name; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string path; }
+  [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint np, out uint nm);
+  [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint np, [Out] PathInfo[] p, ref uint nm, [Out] ModeInfo[] m, IntPtr topo);
+  [DllImport("user32.dll")] static extern int SetDisplayConfig(uint np, [In] PathInfo[] p, uint nm, [In] ModeInfo[] m, uint flags);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int DisplayConfigGetDeviceInfo(ref TargetName t);
+  const uint SdcApply = 0x80, SdcValidate = 0x40, SdcSupplied = 0x20, SdcAllowChanges = 0x400, SdcExtend = 0x4;
+
+  static bool Query(out PathInfo[] p, out ModeInfo[] m) {   // active paths only
+    uint np, nm; p = null; m = null;
+    if (GetDisplayConfigBufferSizes(2, out np, out nm) != 0) return false;
+    p = new PathInfo[np]; m = new ModeInfo[nm];
+    if (QueryDisplayConfig(2, ref np, p, ref nm, m, IntPtr.Zero) != 0) return false;
+    Array.Resize(ref p, (int)np); Array.Resize(ref m, (int)nm); return true;
+  }
+  static TargetName TargetOf(PathInfo x) {
+    var t = new TargetName(); t.type = 2; t.size = (uint)Marshal.SizeOf(t); t.adapter = x.tgt.adapter; t.id = x.tgt.id;   // 2 = GET_TARGET_NAME
+    DisplayConfigGetDeviceInfo(ref t); return t;
+  }
+  static Dictionary<string, string> FriendlyNames() {   // device path -> "MAG 275QF X30"
+    var o = new Dictionary<string, string>(); PathInfo[] p; ModeInfo[] m;
+    if (Query(out p, out m)) foreach (var x in p) { var t = TargetOf(x); if (t.path != null) o[t.path.ToLowerInvariant()] = t.name ?? ""; }
+    return o;
+  }
+  static PathInfo[] savedPaths; static ModeInfo[] savedModes;
+  public static bool Detached { get { return savedPaths != null; } }
+  // Takes the monitor with this device path off the desktop. validate: only ask Windows whether it would accept it.
+  // Returns "" when done (or acceptable), else why not.
+  public static string Detach(string devicePath, bool validate) {
+    PathInfo[] p; ModeInfo[] m; if (!Query(out p, out m)) return "can't read the display setup";
+    int hit = -1;
+    for (int i = 0; i < p.Length; i++) if (string.Equals(TargetOf(p[i]).path, devicePath, StringComparison.OrdinalIgnoreCase)) hit = i;
+    if (hit < 0) return "it isn't on this PC's desktop";
+    if (p.Length < 2) return "it's this PC's only screen";
+    var q = (PathInfo[])p.Clone();
+    q[hit].flags &= ~1u; q[hit].src.mode = 0xFFFFFFFF; q[hit].tgt.mode = 0xFFFFFFFF;   // inactive, no modes
+    int r = SetDisplayConfig((uint)q.Length, q, (uint)m.Length, m, SdcSupplied | SdcAllowChanges | (validate ? SdcValidate : SdcApply));
+    if (r != 0) return "Windows refused (error " + r + ")";
+    if (!validate && savedPaths == null) { savedPaths = p; savedModes = m; }   // the setup before the first monitor was taken off
+    return "";
+  }
+  public static string Reattach() {
+    if (savedPaths == null) return "";
+    int r = SetDisplayConfig((uint)savedPaths.Length, savedPaths, (uint)savedModes.Length, savedModes, SdcSupplied | SdcAllowChanges | SdcApply);
+    if (r != 0) r = SetDisplayConfig(0, null, 0, null, SdcApply | SdcExtend);   // fall back to Windows' own extended layout
+    savedPaths = null; savedModes = null;
+    return r == 0 ? "" : "Windows refused (error " + r + ")";
   }
 
   // ---------- discovery: 255.255.255.255 leaves through one adapter only, so also send each subnet's broadcast ----------

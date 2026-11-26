@@ -44,15 +44,19 @@ $appFiles = 'DeskGlide.ps1', 'DeskGlide.cs', 'DeskGlide.ico', 'README.md', 'LICE
 function Arg-Line([string]$ps1) { "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ps1`"" }
 function Copy-App([string]$from, [string]$to) {   # DeskGlide's own files only (no .git, docs or settings); returns the copies
   [void](New-Item -ItemType Directory -Force $to)
-  foreach ($f in $appFiles) { $s = Join-Path $from $f; if (Test-Path -LiteralPath $s) { Copy-Item -LiteralPath $s (Join-Path $to $f) -Force; Join-Path $to $f } }
+  foreach ($f in $appFiles) { $src = Join-Path $from $f; if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src (Join-Path $to $f) -Force; Join-Path $to $f } }
 }
 
 function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+function To-Hash($o) {   # a JSON object { "MSI4CE8": 15 } -> @{ MSI4CE8 = 15 }
+  $h = @{}; if ($o -is [hashtable]) { foreach ($k in $o.Keys) { $h[$k] = [int]$o[$k] } } elseif ($o) { $o.psobject.Properties | % { $h[$_.Name] = [int]$_.Value } }; $h
+}
 function Load-Config {
   $c = @{ peer = ''; key = ''; peerAddress = ''; input = 0; inputOverride = 0; monitor = $true; audio = 'follow'; hp = ''; vol = 100
           paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
-          km = $false; kmHost = ''; deskflowExe = '' }
+          km = $false; kmHost = ''; deskflowExe = ''; inputs = @{}; monOff = @(); detach = $false }
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
+  $c.inputs = To-Hash $c.inputs; $c.monOff = @($c.monOff | ? { $_ })
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
     if ($c.headphones -and -not $c.hp) { $c.hp = $Name; $c.syncAt = Now-Ms }   # newest, so the other PC takes it instead of clearing it
     $c.Remove('headphones')
@@ -145,15 +149,29 @@ function Merge-Settings($cfg, $m) {
   if ($m.ly) { $cfg.layout = $m.ly }
   if ($null -ne $m.k) { $cfg.km = [bool]$m.k }        # DeskGlide 4 settings: a DeskGlide 3 peer doesn't send them, keep ours
   if ($m.kh) { $cfg.kmHost = [string]$m.kh }
+  if ($null -ne $m.mo) { $cfg.monOff = @($m.mo | ? { $_ }) }
   $true
 }
 # h is for DeskGlide 2 peers (it had a per-PC headphones flag); ly is DeskGlide's layout; l is Synergy's, from the server
-# DeskGlide 4 adds ver, sn (screen name), k/kh (keyboard sharing, keyboard PC) and fp (this PC's Deskflow certificate)
+# DeskGlide 4 adds ver, sn (screen name), k/kh (keyboard sharing, keyboard PC), fp (this PC's Deskflow certificate),
+# mi (this PC's input on each monitor) and mo (monitors that don't follow the mouse)
 function State-Json($cfg) {
   @{ n = $Name; t = $S.t; s = $S.server; sa = ($S.active -eq 'me'); i = (My-Input); h = ($cfg.hp -eq $Name)
      m = $cfg.monitor; am = $cfg.audio; p = $cfg.paused; st = $cfg.syncAt; hp = $cfg.hp; v = $cfg.vol; ly = $cfg.layout
      l = @($(if ($S.server) { $S.links | % { "$($_.from) $($_.dir) $($_.to)" } }))
-     ver = $Proto; sn = $S.screen; k = $cfg.km; kh = $cfg.kmHost; fp = $S.fp } | ConvertTo-Json -Compress
+     ver = $Proto; sn = $S.screen; k = $cfg.km; kh = $cfg.kmHost; fp = $S.fp; mi = $cfg.inputs; mo = @($cfg.monOff) } | ConvertTo-Json -Compress
+}
+
+# ---------- monitors ----------
+# The other PC's input on monitor $id: what it learned for that monitor, else its one input (DeskGlide 3, or a monitor it doesn't see)
+function Peer-Input-Of($peerInputs, [int]$peerInput, [string]$id) { if ($peerInputs -and $peerInputs[$id]) { [int]$peerInputs[$id] } else { $peerInput } }
+# The monitors to switch to the other PC, each with the input to switch to; skips unchecked monitors and unknown inputs
+function Switch-Plan($mons, $off, $peerInputs, [int]$peerInput) {
+  foreach ($m in $mons) {
+    if (@($off) -contains $m.id) { continue }
+    $to = Peer-Input-Of $peerInputs $peerInput $m.id
+    if ($to) { @{ id = $m.id; to = $to; path = $m.path; name = $m.name } }
+  }
 }
 
 # ---------- Deskflow: keyboard and mouse sharing ----------
@@ -205,6 +223,7 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         code = ''; myAddrs = ''; pairStart = Get-Date; pairErr = ''; addrErr = ''; unpairAt = $null; volAt = $null
         wiz = 0; wizDone = $false; iconState = 3; dark = $null; shownAt = $null
         fp = ''; peerFp = ''; peerVer = 0; peerScreen = ''; df = $null; dfSig = ''; dfRole = ''; dfAt = [DateTime]::MinValue; dfRetryAt = [DateTime]::MinValue
+        mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{}
         dfPos = 0; dfConn = $false; dfErr = ''; kmWhy = ''; dl = $null; dlTried = $false; dlMsg = ''; dlErr = $false; synergy = $null; synAt = [DateTime]::MinValue }
 $tray = $null; $win = $null; $ui = @{}; $icons = @(); $logos = @()
 
@@ -330,9 +349,23 @@ if ($Test) {
   Check ((Merge-Settings $PB (Msg $PA 'PC-A')) -and $PB.kmHost -eq 'PC-A' -and $PB.syncAt -eq 5) 'keyboard PC: first one set is taken'
   $PB.km = $true; $PB.kmHost = 'PC-B'; $PB.syncAt = 50
   Check ((Merge-Settings $PA (Msg $PB 'PC-B')) -and $PA.km -and $PA.kmHost -eq 'PC-B') 'keyboard sharing synced'
-  $v3 = Msg $PA 'PC-A'; 'ver', 'k', 'kh', 'fp', 'sn' | % { $v3.psobject.Properties.Remove($_) }; $v3.st = 99
+  $v3 = Msg $PA 'PC-A'; 'ver', 'k', 'kh', 'fp', 'sn', 'mi', 'mo' | % { $v3.psobject.Properties.Remove($_) }; $v3.st = 99
   Check ((Merge-Settings $PB $v3) -and $PB.km -and $PB.kmHost -eq 'PC-B') 'DeskGlide 3 message turned keyboard sharing off'
   Check ((Msg $PA 'PC-A').ver -eq 4) 'state message has ver 4'
+
+  # monitors: each PC's input per monitor, unchecked monitors stay put, DeskGlide 3 peers have one input for all
+  $mons = @(@{ id = 'MSI4CE8'; path = 'p1'; name = 'MAG 275QF' }, @{ id = 'DEL4321'; path = 'p2'; name = 'DELL U2720Q' }, @{ id = 'DEL4321-2'; path = 'p3'; name = 'DELL U2720Q' })
+  $pi = To-Hash ('{"MSI4CE8":17,"DEL4321":16}' | ConvertFrom-Json)
+  Check ((Peer-Input-Of $pi 15 'MSI4CE8') -eq 17 -and (Peer-Input-Of $pi 15 'DEL4321-2') -eq 15 -and (Peer-Input-Of @{} 0 'X') -eq 0) 'peer input per monitor, else its one input'
+  $plan = @(Switch-Plan $mons @('DEL4321') $pi 0)
+  Check ($plan.Count -eq 1 -and $plan[0].id -eq 'MSI4CE8' -and $plan[0].to -eq 17 -and $plan[0].path -eq 'p1') 'plan: unchecked monitor and unknown input skipped'
+  $plan = @(Switch-Plan $mons @() @{} 17)
+  Check ($plan.Count -eq 3 -and -not ($plan | ? { $_.to -ne 17 })) 'plan: DeskGlide 3 peer switches every monitor to its input'
+  Check (@(Switch-Plan $mons @() @{} 0).Count -eq 0) 'plan: nothing known, nothing switched'
+  Check ((To-Hash $null).Count -eq 0 -and (To-Hash @{ a = '5' }).a -eq 5) 'to-hash'
+  $PA.monOff = @(); $PB.monOff = @('DEL4321'); $PB.syncAt = 200
+  Check ((Merge-Settings $PA (Msg $PB 'PC-B')) -and @($PA.monOff) -contains 'DEL4321') 'unchecked monitors synced'
+  $v3.st = 300; Check ((Merge-Settings $PA $v3) -and @($PA.monOff) -contains 'DEL4321') 'DeskGlide 3 message cleared the unchecked monitors'
 
   # install: only DeskGlide's own files go into the app folder, and the shortcut runs that copy
   $to = Join-Path $env:TEMP "dg-app-$PID"; $copied = @(Copy-App $PSScriptRoot $to)
@@ -352,9 +385,9 @@ if ($Test) {
   Check ($C.hp -eq 'PC-A' -and $C.syncAt -gt 5 -and -not $C.Contains('headphones') -and $C.key -eq 'a2V5' -and $C.peer -eq 'PC-B' -and $C.audio -eq 'both' -and $C.vol -eq 100) 'upgrade from DeskGlide 2 (headphones here)'
   Set-Content $cfgPath '{"peer":"PC-B","key":"a2V5","headphones":false,"syncAt":5}'
   $C = Load-Config; Check ($C.hp -eq '' -and $C.syncAt -eq 5 -and $C.key -eq 'a2V5') 'upgrade from DeskGlide 2 (headphones elsewhere)'
-  $C = Load-Config; $C.peer = 'PC-B'; $C.input = 17; $C.audio = 'both'; $C.hp = 'PC-B'; $C.syncAt = 1764000000000; Save-Config
+  $C = Load-Config; $C.peer = 'PC-B'; $C.input = 17; $C.audio = 'both'; $C.hp = 'PC-B'; $C.syncAt = 1764000000000; $C.inputs = @{ MSI4CE8 = 17 }; $C.monOff = @('X'); Save-Config
   $C = Load-Config
-  Check ($C.peer -eq 'PC-B' -and $C.input -eq 17 -and $C.audio -eq 'both' -and $C.hp -eq 'PC-B' -and $C.syncAt -eq 1764000000000 -and $C.monitor -eq $true) 'config round trip'
+  Check ($C.peer -eq 'PC-B' -and $C.input -eq 17 -and $C.audio -eq 'both' -and $C.hp -eq 'PC-B' -and $C.syncAt -eq 1764000000000 -and $C.monitor -eq $true -and $C.inputs.MSI4CE8 -eq 17 -and $C.inputs -is [hashtable] -and @($C.monOff).Count -eq 1) 'config round trip'
   Remove-Item -Recurse $ConfigDir
   'self-check ok'; return
 }
@@ -450,6 +483,7 @@ function Receive-Control {
     if (-not $S.peerAddr -or -not $S.peerAddr.Equals($ep.Address)) { Say "Found $($m.n) at $($ep.Address)." }
     $S.peerAddr = $ep.Address; $S.peerSeen = Get-Date; $S.peerInput = [int]$m.i
     $S.peerVer = [int]$m.ver; $S.peerFp = [string]$m.fp; $S.peerScreen = if ($m.sn) { [string]$m.sn } else { [string]$m.n }
+    $S.peerInputs = To-Hash $m.mi
     # remember the address for the next start; only replace it once it went quiet, so a peer on two adapters doesn't flip-flop
     if ($S.fixedIp -and $S.fixedIp.Equals($ep.Address)) { $S.fixedSeen = Get-Date }
     elseif (((Get-Date) - $S.fixedSeen).TotalSeconds -gt 10) { $C.peerAddress = "$($ep.Address)"; $S.fixedIp = $ep.Address; $S.fixedSeen = Get-Date; Save-Config }
@@ -465,6 +499,7 @@ function Set-Active($new, [string]$screen) {
   Say "Mouse is on $(if ($new -eq 'me') { 'this PC' } elseif ($C.peer) { $C.peer } else { $screen })."
   if ($S.server) { Send-State }   # tell the peer right away; it wakes its screen when the mouse arrives there
   if ($new -eq 'me' -and $old) { [Dg]::WakeDisplay() }   # so the monitor doesn't switch to a sleeping screen
+  if ($new -eq 'me') { Reattach-Monitors }
   # The PC on screen sends the switch: many monitors ignore DDC from an input they aren't showing.
   if ($old -eq 'me' -and $new -eq 'peer' -and $C.monitor -and -not $C.paused) { Switch-Monitor }
   if ($C.onSwitch) {
@@ -473,40 +508,66 @@ function Set-Active($new, [string]$screen) {
   }
 }
 
-function Switch-Monitor {
-  $to = $S.peerInput
-  if (-not $to) { $S.monMsg = "Can't switch yet: $(Peer-Label)'s input isn't known. Show it on the monitor once."; $S.monErr = $true; Say $S.monMsg; return }
-  $S.monErr = $false
-  if ($DryRun) { Say "dry run: would switch the monitor to input $to"; $S.monMsg = "Dry run: would switch the monitor to $(Input-Name $to)."; return }
-  if ([Dg]::SetInput([uint32]$to)) {
-    Say "Monitor -> input $to"; $S.monMsg = "Switched to $(Input-Name $to)."
-    $S.verify = @{ at = (Get-Date).AddSeconds(2); to = $to; from = (My-Input); tries = 1; active = $S.active }
-  } else { $S.monErr = $true; $S.monMsg = "The monitor did not accept the switch to $(Input-Name $to)."; Say $S.monMsg error }
+function Refresh-Monitors {   # not while one is off the desktop: Windows doesn't list it then
+  if ([Dg]::Detached) { return }
+  $S.mons = @([Dg]::ListMonitors() | % { $a = $_ -split "`t"; @{ id = $a[0]; path = $a[1]; name = $(if ($a[2]) { $a[2] } else { 'Monitor' }) } })
 }
-function Check-Switch {   # 2 s after a switch: did the monitor really change? retry once, then tell the user
+function Switch-Monitor {
+  $plan = @(Switch-Plan $S.mons $C.monOff $S.peerInputs $S.peerInput)
+  if (-not $plan.Count) { $S.monMsg = "Can't switch yet: $(Peer-Label)'s input isn't known, or no monitor is set to switch. Show $(Peer-Label) on the monitor once."; $S.monErr = $true; Say $S.monMsg; return }
+  $S.monErr = $false
+  if ($DryRun) {
+    foreach ($p in $plan) {
+      Say "dry run: would switch $($p.name) to input $($p.to)"
+      if ($C.detach) { $r = [Dg]::Detach($p.path, $true); Say "dry run: taking $($p.name) off this PC's desktop $(if ($r) { "would not work: $r" } else { 'would work' })" }
+    }
+    $S.monMsg = "Dry run: would switch $(($plan | % { "$($_.name) to $(Input-Name $_.to)" }) -join ', ')."; return
+  }
+  $done = @($plan | ? { [Dg]::SetInputOn($_.id, [uint32]$_.to) })
+  $bad = @($plan | ? { $done -notcontains $_ })
+  if ($done.Count) {
+    Say "Monitor -> $(($done | % { "$($_.id) input $($_.to)" }) -join ', ')"; $S.monMsg = "Switched $(($done | % { "$($_.name) to $(Input-Name $_.to)" }) -join ', ')."
+    foreach ($p in $done) { $p.from = [int]$C.inputs[$p.id] }
+    $S.verify = @{ at = (Get-Date).AddSeconds(2); items = $done; tries = 1; active = $S.active }
+  }
+  if ($bad.Count) { $S.monErr = $true; $S.monMsg = "$(($bad | % name) -join ', ') did not accept the switch to $(Peer-Label)."; Say $S.monMsg error }
+}
+function Check-Switch {   # 2 s after a switch: did the monitors really change? retry once, then tell the user
   $v = $S.verify
   if (-not $v -or (Get-Date) -lt $v.at) { return }
   $S.verify = $null
   if ($S.active -ne $v.active) { return }   # the mouse moved again meanwhile
-  $cur = [Dg]::GetInput()
-  if ($cur -ne $v.from -or -not $v.from) { return }   # switched (or the monitor won't answer from an input it doesn't show)
+  # still on this PC's input; no answer counts as switched (many monitors don't answer an input they don't show)
+  $stuck = @($v.items | ? { $_.from -and [Dg]::GetInputOf($_.id) -eq $_.from })
+  if ($C.detach) { foreach ($p in @($v.items | ? { $stuck -notcontains $_ })) { $r = [Dg]::Detach($p.path, $false); Say "$(if ($r) { "Couldn't take $($p.name) off this PC's desktop: $r" } else { "Took $($p.name) off this PC's desktop." })" } }
+  if (-not $stuck.Count) { return }
   if ($v.tries -lt 2) {
-    Say "The monitor still shows input $cur, trying again."
-    [void][Dg]::SetInput([uint32]$v.to); $v.at = (Get-Date).AddSeconds(2); $v.tries++; $S.verify = $v
+    Say "$(($stuck | % name) -join ', ') still shows this PC, trying again."
+    foreach ($p in $stuck) { [void][Dg]::SetInputOn($p.id, [uint32]$p.to) }
+    $v.items = $stuck; $v.at = (Get-Date).AddSeconds(2); $v.tries++; $S.verify = $v
   } else {
-    $S.monErr = $true
-    $S.monMsg = "Your monitor didn't accept the switch to $(Input-Name $v.to). Check that DDC/CI is on in the monitor's menu. Some monitors only accept it with the input set to manual, not auto."
-    Say "Your monitor didn't accept the switch to $(Input-Name $v.to)." error
+    $S.monErr = $true; $names = ($stuck | % name) -join ', '
+    $S.monMsg = "$names didn't accept the switch to $(Peer-Label). Check that DDC/CI is on in the monitor's menu. Some monitors only accept it with the input set to manual, not auto."
+    Say "$names didn't accept the switch to $(Peer-Label)." error
   }
 }
+function Reattach-Monitors {
+  if (-not [Dg]::Detached) { return }
+  $r = [Dg]::Reattach(); Say $(if ($r) { "Couldn't put the monitors back on this PC's desktop: $r. Press Win+P and choose Extend." } else { 'Put the monitors back on this PC''s desktop.' }) $(if ($r) { 'error' })
+}
 function Test-Monitor {   # read-only: says what would happen
-  $v = [Dg]::GetInput(); $peer = Peer-Label
-  if ($v -lt 0) { $S.monErr = $true; $S.monMsg = "The monitor didn't answer. Turn on DDC/CI in the monitor's on-screen menu, then try again."; return }
-  $S.monErr = $false
-  $msg = "The monitor answers and shows $(Input-Name $v)$(if ($v -eq (My-Input)) { ' (this PC)' } elseif ($v -eq $S.peerInput) { " ($peer)" })."
-  $msg += if ($S.peerInput) { " When the mouse moves to $peer, DeskGlide switches it to $(Input-Name $S.peerInput)." } else { " Show $peer on the monitor once so DeskGlide learns its input." }
-  if (-not $C.monitor) { $msg += ' Monitor follows mouse is off, so it won''t switch by itself.' }
-  $S.monMsg = $msg
+  $peer = Peer-Label; Refresh-Monitors
+  if (-not $S.mons.Count) { $S.monErr = $true; $S.monMsg = "Windows lists no monitor that DeskGlide can talk to."; return }
+  $lines = foreach ($m in $S.mons) {
+    $v = [Dg]::GetInputOf($m.id); $to = Peer-Input-Of $S.peerInputs $S.peerInput $m.id
+    if ($v -lt 0) { "$($m.name) didn't answer: turn on DDC/CI in its on-screen menu."; continue }
+    $line = "$($m.name) answers and shows $(Input-Name $v)$(if ($v -eq $C.inputs[$m.id]) { ' (this PC)' } elseif ($v -eq $to) { " ($peer)" })."
+    if (@($C.monOff) -contains $m.id) { $line += ' It stays put when the mouse moves.' }
+    elseif ($to) { $line += " When the mouse moves to $peer, it switches to $(Input-Name $to)." } else { $line += " Show $peer on it once so DeskGlide learns its input." }
+    $line
+  }
+  $S.monErr = [bool]($lines -match "didn't answer")
+  $S.monMsg = ($lines -join "`n") + $(if (-not $C.monitor) { "`nMonitor follows mouse is off, so nothing switches by itself." })
 }
 
 function Detect-Role {   # the PC whose Synergy/Deskflow log has "switch from" lines is the server
@@ -696,13 +757,20 @@ function Tick {
   if ($S.volAt -and ($now - $S.volAt).TotalMilliseconds -ge 400) { $S.volAt = $null; Changed }   # slider: sync when it stops moving
 
   # learn this PC's monitor input while it is on screen (retry if the monitor still shows the other PC)
+  if (($now - $S.monAt).TotalSeconds -ge 30) { $S.monAt = $now; Refresh-Monitors }
   if ($S.active -eq 'me' -and -not $S.inputOk -and ($now - $S.activeSince).TotalSeconds -ge 3 -and ($now - $S.readAt).TotalSeconds -ge 10) {
-    $S.readAt = $now; $v = [Dg]::GetInput()
-    if ($v -lt 0) { Once ddc 'The monitor does not answer DDC/CI. Turn on DDC/CI in the monitor''s menu.' error }
-    elseif ($v -ne $S.peerInput) {
-      $S.inputOk = $true; Say "This PC is on monitor input $v."
-      if ($v -ne $C.input) { $C.input = $v; Save-Config; Send-State }
+    $S.readAt = $now; $answered = $false; $changed = $false
+    foreach ($m in $S.mons) {   # one input per monitor; a monitor still showing the other PC is asked again later
+      $v = [Dg]::GetInputOf($m.id); if ($v -lt 0) { continue }
+      $answered = $true
+      if ($v -eq (Peer-Input-Of $S.peerInputs $S.peerInput $m.id)) { continue }
+      $S.inputOk = $true
+      if ($C.inputs[$m.id] -ne $v) { $C.inputs[$m.id] = $v; $changed = $true; Say "This PC is on input $v of $($m.name)." }
     }
+    if (-not $answered) { Once ddc 'The monitor does not answer DDC/CI. Turn on DDC/CI in the monitor''s menu.' error }
+    $first = if ($S.mons.Count) { [int]$C.inputs[$S.mons[0].id] }   # 'i' for DeskGlide 3 peers and the setup guide
+    if ($first -and $first -ne $C.input) { $C.input = $first; $changed = $true }
+    if ($changed) { Save-Config; Send-State }
   }
   if ($online -and (-not (My-Input) -or -not $S.peerInput)) {
     Once inputs 'Almost done: show each PC on the monitor once. Move the mouse to it and, if the screen does not follow, press the monitor''s input button.'
@@ -940,12 +1008,7 @@ $xaml = @'
             <CheckBox x:Name="MonToggle" Style="{StaticResource Switch}"><StackPanel>
               <TextBlock Text="Monitor follows mouse"/>
               <TextBlock Style="{StaticResource Sub}" Text="Switch the monitor's input to the PC that has the mouse."/></StackPanel></CheckBox>
-            <Border Style="{StaticResource InsetBox}" Padding="12,8" Margin="0,12,0,12"><Grid>
-              <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-              <Grid.RowDefinitions><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
-              <TextBlock x:Name="MeName" TextTrimming="CharacterEllipsis"/><TextBlock x:Name="MeInput" Grid.Column="1" FontWeight="SemiBold" Margin="12,0,0,0"/>
-              <TextBlock x:Name="PeerName" Grid.Row="1" Margin="0,6,0,0" TextTrimming="CharacterEllipsis"/><TextBlock x:Name="PeerInput" Grid.Row="1" Grid.Column="1" FontWeight="SemiBold" Margin="12,6,0,0"/>
-            </Grid></Border>
+            <StackPanel x:Name="MonList" Margin="0,12,0,12"/>
             <StackPanel Orientation="Horizontal">
               <Button x:Name="SwitchNow" Style="{StaticResource Primary}" Content="Switch monitor now"/>
               <Button x:Name="TestMon" Content="Test" Margin="8,0,0,0" ToolTip="Ask the monitor which input it shows. Nothing is switched."/>
@@ -1041,6 +1104,9 @@ $xaml = @'
             <CheckBox x:Name="StartupToggle" Style="{StaticResource Switch}" Content="Start with Windows"/>
             <CheckBox x:Name="PauseToggle" Style="{StaticResource Switch}" Margin="0,12,0,0"><StackPanel>
               <TextBlock Text="Pause DeskGlide"/><TextBlock Style="{StaticResource Sub}" Text="No switching and no sound until you turn this off."/></StackPanel></CheckBox>
+            <CheckBox x:Name="DetachToggle" Style="{StaticResource Switch}" Margin="0,12,0,0"><StackPanel>
+              <TextBlock Text="Take switched monitors off this PC's desktop" TextWrapping="Wrap"/>
+              <TextBlock Style="{StaticResource Sub}" Text="So windows and the pointer can't get lost on a monitor that shows the other PC. Off by default: Windows rearranges windows each time, and it needs another screen to stay on."/></StackPanel></CheckBox>
             <TextBlock Style="{StaticResource Label}" Text="Synergy or Deskflow log"/>
             <DockPanel><Button x:Name="BrowseLog" DockPanel.Dock="Right" Content="Browse..." Margin="8,0,0,0"/><TextBox x:Name="LogPath"/></DockPanel>
             <TextBlock x:Name="RoleText" Style="{StaticResource Sub}" Margin="0,4,0,0"/>
@@ -1177,6 +1243,7 @@ function New-Window {
 
   On MonToggle Checked, Unchecked { if ($C.monitor -ne [bool]$ui.MonToggle.IsChecked) { $C.monitor = -not $C.monitor; Changed } }
   On PauseToggle Checked, Unchecked { if ($C.paused -ne [bool]$ui.PauseToggle.IsChecked) { $C.paused = -not $C.paused; Changed } }
+  On DetachToggle Checked, Unchecked { if ($C.detach -ne [bool]$ui.DetachToggle.IsChecked) { $C.detach = -not $C.detach; Save-Config; if (-not $C.detach) { Reattach-Monitors } } }
   On StartupToggle Checked, Unchecked { $want = [bool]$ui.StartupToggle.IsChecked; if ((Test-Path $lnk) -ne $want) { Set-Startup $want } }
   On AFollow Checked { Set-Audio 'follow' }
   On ABoth Checked { Set-Audio 'both' }
@@ -1219,6 +1286,34 @@ function New-Window {
   $ui.BoxPeer.Add_MouseLeftButtonUp({ try { Drop-Peer } catch { Say "$($_.Exception.Message)" error }; Update-Ui })
   $win.Add_Closing({ if ($tray) { $args[1].Cancel = $true; $win.Hide() } else { [Windows.Forms.Application]::Exit() } })   # the tray's Quit ends DeskGlide
   Apply-Theme
+}
+
+function Build-MonRows {   # one row per monitor in the Monitor card, rebuilt when the monitors change
+  $sig = ($S.mons | % { "$($_.id)=$($_.name)" }) -join ','
+  if ($sig -eq $S.monSig) { return }
+  $S.monSig = $sig; $ui.MonList.Children.Clear(); $S.monRows = @{}
+  function El($type, $style) { $e = New-Object "Windows.Controls.$type"; if ($style) { $e.SetResourceReference([Windows.FrameworkElement]::StyleProperty, $style) }; $e }
+  foreach ($m in $S.mons) {
+    $box = El Border 'InsetBox'; $box.Padding = '12,10'; $box.Margin = '0,0,0,8'
+    $sp = El StackPanel; $box.Child = $sp
+    $cb = El CheckBox 'Switch'; $cb.Tag = $m.id; $cb.ToolTip = 'Switch this monitor with the mouse'
+    $head = El StackPanel; $t = El TextBlock; $t.Text = $m.name; $t.FontWeight = 'SemiBold'; $t.TextTrimming = 'CharacterEllipsis'
+    $sub = El TextBlock 'Sub'; $sub.Text = 'Switch with the mouse'; [void]$head.Children.Add($t); [void]$head.Children.Add($sub); $cb.Content = $head
+    $cb.Add_Click({ try { $id = $this.Tag; $C.monOff = @(@($C.monOff | ? { $_ -ne $id }) + $(if (-not $this.IsChecked) { $id })) | ? { $_ }; Changed } catch { Say "$($_.Exception.Message)" error }; Update-Ui })
+    [void]$sp.Children.Add($cb)
+    $g = El Grid; $g.Margin = '0,8,0,0'
+    foreach ($w in '*', 'Auto') { $col = El ColumnDefinition; $col.Width = $w; [void]$g.ColumnDefinitions.Add($col) }
+    $row = @{ cb = $cb }
+    for ($i = 0; $i -lt 2; $i++) {
+      [void]$g.RowDefinitions.Add((El RowDefinition))
+      $a = El TextBlock; $a.TextTrimming = 'CharacterEllipsis'; $b = El TextBlock; $b.FontWeight = 'SemiBold'; $b.Margin = '12,0,0,0'
+      if ($i) { $a.Margin = '0,4,0,0'; $b.Margin = '12,4,0,0' }
+      [Windows.Controls.Grid]::SetRow($a, $i); [Windows.Controls.Grid]::SetRow($b, $i); [Windows.Controls.Grid]::SetColumn($b, 1)
+      [void]$g.Children.Add($a); [void]$g.Children.Add($b)
+      if ($i) { $row.peer = $a; $row.peerIn = $b } else { $row.me = $a; $row.meIn = $b }
+    }
+    [void]$sp.Children.Add($g); [void]$ui.MonList.Children.Add($box); $S.monRows[$m.id] = $row
+  }
 }
 
 function Drop-Peer {   # the side of this PC's box where the other box was let go
@@ -1298,9 +1393,13 @@ function Update-Ui {
 
   # monitor
   $ui.MonToggle.IsChecked = $C.monitor
-  $ui.MeName.Text = "$Name (this PC)"; $ui.MeInput.Text = Input-Name (My-Input)
-  $ui.PeerName.Text = $peer; $ui.PeerInput.Text = if ($paired) { Input-Name $S.peerInput } else { 'not paired' }
-  $ui.SwitchNow.IsEnabled = [bool]$S.peerInput
+  Build-MonRows
+  foreach ($m in $S.mons) {
+    $r = $S.monRows[$m.id]; $r.cb.IsChecked = @($C.monOff) -notcontains $m.id
+    $r.me.Text = "$Name (this PC)"; $r.meIn.Text = Input-Name ([int]$(if ($C.inputOverride) { $C.inputOverride } else { $C.inputs[$m.id] }))
+    $r.peer.Text = $peer; $r.peerIn.Text = if ($paired) { Input-Name (Peer-Input-Of $S.peerInputs $S.peerInput $m.id) } else { 'not paired' }
+  }
+  $ui.SwitchNow.IsEnabled = @(Switch-Plan $S.mons $C.monOff $S.peerInputs $S.peerInput).Count -gt 0
   $ui.SwitchNow.ToolTip = "Show $peer on the monitor now"
   $ui.MonMsg.Text = $S.monMsg; $ui.MonMsg.Foreground = Brush $(if ($S.monErr) { 'Bad' } else { 'Fg2' }); Show-If $ui.MonMsg $S.monMsg
 
@@ -1346,7 +1445,7 @@ function Update-Ui {
   if ($S.addrErr) { $ui.PairMsg.Text = $S.addrErr; $ui.PairMsg.Foreground = Brush 'Bad' }
 
   # settings (text boxes are refreshed only while the user isn't typing in them)
-  $ui.StartupToggle.IsChecked = Test-Path $lnk; $ui.PauseToggle.IsChecked = $C.paused
+  $ui.StartupToggle.IsChecked = Test-Path $lnk; $ui.PauseToggle.IsChecked = $C.paused; $ui.DetachToggle.IsChecked = $C.detach
   foreach ($p in @(@('LogPath', 'synergyLog'), @('AddrSet', 'peerAddress'), @('Script', 'onSwitch'))) {
     if (-not $ui[$p[0]].IsKeyboardFocused) { $ui[$p[0]].Text = $C[$p[1]] }
   }
@@ -1425,6 +1524,8 @@ try {
   if ($PairCode) { Set-Key $PairCode }
   Resolve-Peer
   Say "DeskGlide on $Name, control port $Port -> $PeerPort, audio port $AudioPort$(if ($DryRun) { ', dry run' })$(if ($NoBroadcast) { ', no broadcast' })."
+  Refresh-Monitors; $S.monAt = Get-Date
+  Say "Monitors: $(($S.mons | % { "$($_.name) ($($_.id))" }) -join ', ')"
   Detect-Role
   if (-not $S.server) { Say 'This PC is a Synergy client (no "switch from" lines in its log).' }
   Read-Layout
@@ -1446,6 +1547,7 @@ try {
 } finally {
   [Dg]::SendOn = $false; [Dg]::RecvOn = $false
   if ($S.df) { try { $S.df.Kill() } catch {} }   # Deskflow runs only while DeskGlide does
+  if ([Dg]::Detached) { [void][Dg]::Reattach() }   # never leave a monitor off the desktop
   if ([Dg]::Muted.Count) { [Dg]::MuteOthers($false, $PID) }
   Save-Muted
   if ($tray) { $tray.Visible = $false; $tray.Dispose() }
