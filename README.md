@@ -1,21 +1,10 @@
 # DeskGlide
 
-**Two Windows PCs at one desk, one set of everything: one keyboard and mouse for both (DeskGlide's own sharing, no Synergy), and the monitor, your headphones, your microphone and your clipboard follow the mouse.**
+**Two Windows PCs at one desk, one set of everything: one keyboard and mouse for both (DeskGlide's own sharing), and the monitor, your headphones, your microphone and your clipboard follow the mouse.**
 
 ![DeskGlide window, light theme](docs/window-light.png)
 
 <sub>Also in [dark](docs/window-dark.png). The window follows Windows' light or dark app theme.</sub>
-
-<!-- Demo GIF: replace this comment with ![DeskGlide demo](docs/demo.gif)
-
-How to record it with Snipping Tool (built into Windows 11):
-1. Press Win+Shift+R, drag a box around the monitor (or a phone camera pointed at the desk for the input switch), and click Start.
-2. Move the mouse from one PC to the other and back, copy a file on one PC and paste it on the other, press Ctrl+Alt+Right.
-3. Stop, then Save as docs\demo.mp4.
-4. GitHub plays MP4 when you drag the file into the README editor on github.com; for a GIF, convert it
-   (for example with ffmpeg: ffmpeg -i docs\demo.mp4 -vf "fps=12,scale=900:-1" docs\demo.gif) and keep it under 10 MB. -->
-
-> **Demo GIF coming soon.** It will show the monitor following the mouse, sound switching, and a file copied on one PC pasted on the other.
 
 ```
  keyboard + mouse ─▶ Raw Input / low-level hooks
@@ -38,7 +27,6 @@ How to record it with Snipping Tool (built into Windows 11):
 ## How it works
 
 - **Keyboard and mouse (DeskGlide Link):** the PC they are plugged into reads the mouse with Raw Input. When the pointer leaves the screen edge toward the other PC, low-level hooks hold local input back and DeskGlide sends it over UDP; the other PC injects it with `SendInput`. DeskGlide knows the other PC's monitors, so it sends exact pointer positions (a lost packet never shifts the pointer); keys, buttons and the wheel go on an acknowledged stream. This also tells DeskGlide which PC has the mouse.
-- **Where the mouse is, without Link:** Synergy writes `switch from "A" to "B"` to its log and DeskGlide reads it (turn off keyboard and mouse sharing to keep Synergy).
 - **Monitor:** DeskGlide tells the monitor to change its input over DDC/CI (VCP code 0x60) with `dxva2.dll`, which ships with Windows.
 - **Sound:** WASAPI loopback captures the other PC's sound; DeskGlide sends it as 16-bit PCM over UDP and plays it with `winmm`.
 - **Microphone:** WASAPI captures the headset microphone; the other PC plays it into VB-Audio Virtual Cable, which apps there use as a microphone.
@@ -65,7 +53,7 @@ How to record it with Snipping Tool (built into Windows 11):
 
 ### DeskGlide Link vs others
 
-What DeskGlide Link does about problems reported in the issue trackers of Deskflow, Barrier and Mouse Without Borders:
+What DeskGlide Link does about the problems people most often report with keyboard and mouse sharing tools:
 
 | Reported elsewhere | What DeskGlide Link does |
 |---|---|
@@ -139,7 +127,7 @@ The card then says **Admin control: on (service)**. To remove it, turn the switc
 | **Microphone** | Follow mouse / Always / Off, and what's missing if it doesn't work (VB-Cable, the other PC). |
 | **Pairing** | Show or type a code; Unpair. |
 | **Copy files** | On or off, what was copied where, progress, and **Open received files** (`Downloads\DeskGlide`). |
-| **Settings** | Start with Windows, Pause, taking switched monitors off the desktop, the Synergy log (only without keyboard and mouse sharing), the other PC's address, a script to run on every switch, the hotkeys, and the largest file copy. |
+| **Settings** | Start with Windows, Pause, taking switched monitors off the desktop, the other PC's address, a script to run on every switch, the hotkeys, and the largest file copy. |
 
 Settings that both PCs share (sound mode, headphones, microphone mode, monitors to switch, layout, keyboard PC, keyboard and mouse sharing, locking together) sync automatically; the newest change wins.
 
@@ -167,7 +155,7 @@ VB-Cable's installer may make **CABLE Input** that PC's default speaker. Then it
 
 ### Copy and paste files
 
-Copy files or folders in Explorer, move the mouse to the other PC, press **Ctrl+V**. DeskGlide pulls them when the mouse arrives, saves them in `Downloads\DeskGlide` (an existing name gets ` (2)`), and puts them on that PC's clipboard. A notification says when they're ready. Text and pictures work the same way with keyboard and mouse sharing on (Synergy copies them when it is off). Only one of the two PCs needs to accept connections: if a firewall you can't change blocks them on one PC (a company laptop, say), that PC connects out to the other instead.
+Copy files or folders in Explorer, move the mouse to the other PC, press **Ctrl+V**. DeskGlide pulls them when the mouse arrives, saves them in `Downloads\DeskGlide` (an existing name gets ` (2)`), and puts them on that PC's clipboard. A notification says when they're ready. Text and pictures work the same way. Only one of the two PCs needs to accept connections: if a firewall you can't change blocks them on one PC (a company laptop, say), that PC connects out to the other instead.
 
 ### Hotkeys
 
@@ -238,22 +226,12 @@ Admin control needs a Windows service running as SYSTEM, the most powerful accou
 | Setting | Default | What it does |
 |---|---|---|
 | `inputOverride` | `0` | This PC's monitor input, if automatic detection gets it wrong: `15` = DisplayPort 1, `16` = DisplayPort 2, `17` = HDMI 1, `18` = HDMI 2 |
-| `screenName` | computer name | This PC's screen name in Synergy, if it isn't the Windows computer name |
 
 Network ports: UDP `6991` (finding each other, control), UDP `6990` (sound and microphone), TCP `6992` (files, text and pictures), UDP `6993` (keyboard and mouse; with admin control, the service holds it on the controlled PC).
 
-## Upgrading from DeskGlide 4 (from Synergy to DeskGlide Link)
+## Updating
 
-1. On **both** PCs, keep Synergy running: quit DeskGlide from the tray, extract the new version and double-click **Install.cmd**. Your pairing and settings are kept, and keyboard and mouse sharing stays **off** after an upgrade, so Synergy keeps working.
-2. On the PC the keyboard and mouse are plugged into (the Synergy server): **quit Synergy** (its tray icon > Quit, so that it isn't running at all).
-3. In DeskGlide's window on that PC, **Keyboard & mouse** card: check that "Keyboard and mouse are plugged into" shows this PC, and turn on **Share them with the other PC**. It turns on on both PCs. The card says **Connected** with its latency.
-4. Move the pointer across the edge to the other PC and quit Synergy there too.
-
-If something goes wrong, press **Ctrl+Alt+Pause**, turn sharing off and start Synergy again; DeskGlide follows Synergy's log again.
-
-## Upgrading from DeskGlide 3
-
-Do it on **both** PCs: DeskGlide 4 encrypts sound, so a DeskGlide 3 PC can't play it (the Sound card says so until both are updated). Quit DeskGlide from the tray, extract the new version and double-click **Install.cmd**. Your pairing is kept and its key is re-saved with DPAPI. Keep Synergy running.
+DeskGlide offers new releases itself. To update by hand, quit DeskGlide from the tray on **both** PCs, extract the new version and double-click **Install.cmd**; your pairing and settings are kept. With admin control on, turn it off and on once afterwards so the service is rebuilt.
 
 ## Uninstall
 
@@ -266,10 +244,8 @@ Click **Open log** at the bottom of the window to see what DeskGlide saw and did
 - **"Looking for ...":** the PCs can't reach each other. Allow PowerShell through Windows Firewall on Private networks on both, use the same network (not a guest Wi-Fi), or set the other PC's address.
 - **The monitor doesn't switch:** click **Test**. It says whether each monitor answers and which inputs DeskGlide knows. "Not learned yet": show that PC on the monitor once. Wrong input: set `inputOverride`.
 - **"Didn't accept the switch":** turn on DDC/CI in the monitor's menu. Some monitors only accept input changes with the input set to manual rather than auto.
-- **The pointer doesn't cross:** the Keyboard & mouse card says why (waiting for the other PC, Synergy still running, the other PC needs an update). Check the Layout card's side, and that a game isn't holding the pointer. "Waiting for": allow PowerShell through Windows Firewall on Private networks (UDP 6993) on both PCs.
+- **The pointer doesn't cross:** the Keyboard & mouse card says why (waiting for the other PC, another sharing app still running, the other PC needs an update). Check the Layout card's side, and that a game isn't holding the pointer. "Waiting for": allow PowerShell through Windows Firewall on Private networks (UDP 6993) on both PCs.
 - **A key seems stuck:** press the panic key (Ctrl+Alt+Pause); it releases every key on this PC and, when connected, on the other one.
-- **Without keyboard and mouse sharing, nothing happens when the mouse crosses:** the Synergy log path is wrong or the log isn't written. Synergy's log is `%LOCALAPPDATA%\synergy-dragon\logs\synergy-dragon-agent.log`.
-- **It always switches to the other input:** your Synergy screen name isn't the Windows computer name; set `screenName`.
 - **No sound or microphone:** the line in the Sound or Microphone card says why.
 - **Files don't arrive:** the Copy files card shows the error. Files and copied text travel over TCP 6992. Since 5.3 it's enough for *one* of the two PCs to accept connections there: if the PC you copied on blocks them (a company laptop's firewall, say), it connects out to the other PC instead. If both block it, allow PowerShell through the firewall on one of them. Also check the size limit in Settings.
 - **Windows rearranges after a switch:** some monitors drop the DisplayPort link when they change input. Try another cable or port, or turn off the monitor's "DP auto-switch" or deep-sleep option.
@@ -284,14 +260,13 @@ Click **Open log** at the bottom of the window to see what DeskGlide saw and did
 
 ## Tested on
 
-- Two real PCs, a Windows 11 desktop and a company-managed Windows laptop, sharing one MSI monitor (DisplayPort + HDMI) over a phone hotspot: the monitor following the mouse, keyboard and mouse sharing, admin control (admin windows, UAC prompts, the taskbar, signing in on the lock screen), copying text and files both ways, and the laptop's sound in the desktop's headphones with the headset microphone used by apps on the laptop (VB-Cable), with the laptop's firewall blocking connections in
+- Two real PCs, a Windows 11 desktop and a Windows laptop, sharing one monitor (DisplayPort + HDMI) over Wi-Fi: the monitor following the mouse, keyboard and mouse sharing, admin control (admin windows, UAC prompts, the taskbar, signing in on the lock screen), copying text and files both ways, and the laptop's sound in the desktop's headphones with the headset microphone used by apps on the laptop (VB-Cable), with the laptop's firewall blocking connections in
 - The self-check (`-Test`) on Windows 11: two engines over loopback for latency, loss and outages, and the admin service in its test mode with its security checks
 - Not yet on real PCs: Ctrl+Alt+End through admin control, game mode, the second network path (two networks between the PCs at once, such as Wi-Fi and a cable)
 
 ## Credits
 
 - [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) by VB-Audio Software (donationware, not included) makes the shared microphone possible.
-- Synergy by Symless: DeskGlide follows its log when keyboard and mouse sharing is off. DeskGlide Link is DeskGlide's own code.
 
 ## License
 
