@@ -46,6 +46,24 @@ public class Job {
   }
 }
 
+// A message-only window for global hotkeys and clipboard changes. DeskGlide.ps1 polls the flags from its timer.
+public class MsgWin : System.Windows.Forms.NativeWindow {
+  [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
+  [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+  [DllImport("user32.dll")] static extern bool AddClipboardFormatListener(IntPtr h);
+  public static volatile int Pressed;          // id of the last hotkey pressed, 0 = none; DeskGlide.ps1 clears it
+  public static volatile bool ClipChanged;
+  public MsgWin() { var p = new System.Windows.Forms.CreateParams(); p.Parent = new IntPtr(-3); CreateHandle(p); }   // HWND_MESSAGE
+  // vk 0 = just unregister. false = another program has this key.
+  public bool SetHotkey(int id, uint mods, uint vk) { UnregisterHotKey(Handle, id); return vk == 0 || RegisterHotKey(Handle, id, mods | 0x4000, vk); }   // MOD_NOREPEAT
+  public bool ListenClipboard() { return AddClipboardFormatListener(Handle); }
+  protected override void WndProc(ref System.Windows.Forms.Message m) {
+    if (m.Msg == 0x312) Pressed = m.WParam.ToInt32();          // WM_HOTKEY
+    else if (m.Msg == 0x31D) ClipChanged = true;               // WM_CLIPBOARDUPDATE
+    base.WndProc(ref m);
+  }
+}
+
 public static class Dg {
   public static string Hex(byte[] b) { var s = new StringBuilder(); foreach (byte x in b) s.Append(x.ToString("x2")); return s.ToString(); }
 

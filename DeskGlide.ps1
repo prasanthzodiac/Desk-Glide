@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 $Version = '4.0'
 $Proto = 4   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it
 if (-not $PeerPort) { $PeerPort = $Port }
-Add-Type -Path "$PSScriptRoot\DeskGlide.cs" -ReferencedAssemblies System.Drawing, System.Core, System.IO.Compression, System.IO.Compression.FileSystem
+Add-Type -Path "$PSScriptRoot\DeskGlide.cs" -ReferencedAssemblies System.Drawing, System.Core, System.IO.Compression, System.IO.Compression.FileSystem, System.Windows.Forms
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, PresentationFramework, PresentationCore, WindowsBase, WindowsFormsIntegration
 $cfgPath   = Join-Path $ConfigDir 'config.json'
 $dfRoot    = Join-Path $DataDir 'deskflow'                      # downloaded Deskflow releases, one folder per version
@@ -54,7 +54,8 @@ function To-Hash($o) {   # a JSON object { "MSI4CE8": 15 } -> @{ MSI4CE8 = 15 }
 function Load-Config {
   $c = @{ peer = ''; key = ''; peerAddress = ''; input = 0; inputOverride = 0; monitor = $true; audio = 'follow'; hp = ''; vol = 100
           paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
-          km = $false; kmHost = ''; deskflowExe = ''; inputs = @{}; monOff = @(); detach = $false }
+          km = $false; kmHost = ''; deskflowExe = ''; inputs = @{}; monOff = @(); detach = $false
+          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left' }
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
   $c.inputs = To-Hash $c.inputs; $c.monOff = @($c.monOff | ? { $_ })
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
@@ -154,12 +155,36 @@ function Merge-Settings($cfg, $m) {
 }
 # h is for DeskGlide 2 peers (it had a per-PC headphones flag); ly is DeskGlide's layout; l is Synergy's, from the server
 # DeskGlide 4 adds ver, sn (screen name), k/kh (keyboard sharing, keyboard PC), fp (this PC's Deskflow certificate),
-# mi (this PC's input on each monitor) and mo (monitors that don't follow the mouse)
+# mi (this PC's input on each monitor), mo (monitors that don't follow the mouse) and hk/ha (a hotkey press, for 10 s:
+# its time and the PC it showed)
 function State-Json($cfg) {
   @{ n = $Name; t = $S.t; s = $S.server; sa = ($S.active -eq 'me'); i = (My-Input); h = ($cfg.hp -eq $Name)
      m = $cfg.monitor; am = $cfg.audio; p = $cfg.paused; st = $cfg.syncAt; hp = $cfg.hp; v = $cfg.vol; ly = $cfg.layout
      l = @($(if ($S.server) { $S.links | % { "$($_.from) $($_.dir) $($_.to)" } }))
-     ver = $Proto; sn = $S.screen; k = $cfg.km; kh = $cfg.kmHost; fp = $S.fp; mi = $cfg.inputs; mo = @($cfg.monOff) } | ConvertTo-Json -Compress
+     ver = $Proto; sn = $S.screen; k = $cfg.km; kh = $cfg.kmHost; fp = $S.fp; mi = $cfg.inputs; mo = @($cfg.monOff)
+     hk = $(if ((Now-Ms) - [long]$S.hk -lt 10000) { $S.hk } else { 0 }); ha = $S.hkTo } | ConvertTo-Json -Compress
+}
+
+# ---------- hotkeys ----------
+# 'Ctrl+Alt+Right' -> @{ text = 'Ctrl+Alt+Right'; mods; vk; df = 'Control+Alt+Right' } (RegisterHotKey and Deskflow's keystroke()), or $null.
+# At least one modifier; keys: arrows, A-Z, 0-9, F1-F24.
+function Parse-Hotkey([string]$text) {
+  $parts = @(($text -replace '\s', '') -split '\+' | ? { $_ })
+  if ($parts.Count -lt 2) { return }
+  $mods = 0; $names = @(); $df = @()
+  foreach ($p in $parts[0..($parts.Count - 2)]) {
+    $m = switch -regex ($p) { '^(ctrl|control)$' { 2, 'Ctrl', 'Control' } '^alt$' { 1, 'Alt', 'Alt' } '^shift$' { 4, 'Shift', 'Shift' } '^win$' { 8, 'Win', 'Super' } }
+    if (-not $m -or ($mods -band $m[0])) { return }
+    $mods = $mods -bor $m[0]; $names += $m[1]; $df += $m[2]
+  }
+  $k = $parts[-1]
+  $key = switch -regex ($k) {
+    '^(left|right|up|down)$' { $n = $k.Substring(0, 1).ToUpper() + $k.Substring(1).ToLower(); @{ vk = @{ Left = 0x25; Up = 0x26; Right = 0x27; Down = 0x28 }[$n]; n = $n; d = $n } }
+    '^[a-z0-9]$' { @{ vk = [int][char]$k.ToUpper(); n = $k.ToUpper(); d = $k.ToLower() } }
+    '^f([1-9]|1\d|2[0-4])$' { @{ vk = 0x6F + [int]$matches[1]; n = $k.ToUpper(); d = $k.ToUpper() } }
+  }
+  if (-not $key) { return }
+  @{ text = (($names + $key.n) -join '+'); mods = $mods; vk = $key.vk; df = (($df + $key.d) -join '+') }
 }
 
 # ---------- monitors ----------
@@ -223,6 +248,7 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         code = ''; myAddrs = ''; pairStart = Get-Date; pairErr = ''; addrErr = ''; unpairAt = $null; volAt = $null
         wiz = 0; wizDone = $false; iconState = 3; dark = $null; shownAt = $null
         fp = ''; peerFp = ''; peerVer = 0; peerScreen = ''; df = $null; dfSig = ''; dfRole = ''; dfAt = [DateTime]::MinValue; dfRetryAt = [DateTime]::MinValue
+        hk = [long]0; hkTo = ''; hkSeen = [long]0; lastSa = $null; hkSig = ''; hkErr = ''; msgWin = $null
         mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{}
         dfPos = 0; dfConn = $false; dfErr = ''; kmWhy = ''; dl = $null; dlTried = $false; dlMsg = ''; dlErr = $false; synergy = $null; synAt = [DateTime]::MinValue }
 $tray = $null; $win = $null; $ui = @{}; $icons = @(); $logos = @()
@@ -352,6 +378,18 @@ if ($Test) {
   $v3 = Msg $PA 'PC-A'; 'ver', 'k', 'kh', 'fp', 'sn', 'mi', 'mo' | % { $v3.psobject.Properties.Remove($_) }; $v3.st = 99
   Check ((Merge-Settings $PB $v3) -and $PB.km -and $PB.kmHost -eq 'PC-B') 'DeskGlide 3 message turned keyboard sharing off'
   Check ((Msg $PA 'PC-A').ver -eq 4) 'state message has ver 4'
+
+  # hotkeys: RegisterHotKey values and Deskflow's keystroke() names
+  $k = Parse-Hotkey 'Ctrl+Alt+Right'; Check ($k.mods -eq 3 -and $k.vk -eq 0x27 -and $k.df -eq 'Control+Alt+Right' -and $k.text -eq 'Ctrl+Alt+Right') 'hotkey: default'
+  $k = Parse-Hotkey ' control + shift + left '; Check ($k.mods -eq 6 -and $k.vk -eq 0x25 -and $k.text -eq 'Ctrl+Shift+Left' -and $k.df -eq 'Control+Shift+Left') 'hotkey: spaces and case'
+  $k = Parse-Hotkey 'Win+Alt+k'; Check ($k.mods -eq 9 -and $k.vk -eq 0x4B -and $k.df -eq 'Super+Alt+k' -and $k.text -eq 'Win+Alt+K') 'hotkey: letter'
+  $k = Parse-Hotkey 'Ctrl+F12'; Check ($k.vk -eq 0x7B -and $k.df -eq 'Control+F12') 'hotkey: F12'
+  Check ((Parse-Hotkey 'Alt+F24').vk -eq 0x87 -and (Parse-Hotkey 'Ctrl+7').vk -eq 0x37) 'hotkey: F24 and digits'
+  Check ($null -eq (Parse-Hotkey 'Right') -and $null -eq (Parse-Hotkey 'Ctrl+Ctrl+Right') -and $null -eq (Parse-Hotkey 'Ctrl+Alt+PgUp') -and $null -eq (Parse-Hotkey 'Hyper+Right') -and $null -eq (Parse-Hotkey 'Ctrl+F25') -and $null -eq (Parse-Hotkey '')) 'hotkey: rejects'
+  $PA.hkTo = ''; $S.hk = Now-Ms; $S.hkTo = 'PC-B'; $hm = Msg $PA 'PC-A'
+  Check ($hm.hk -eq $S.hk -and $hm.ha -eq 'PC-B') 'hotkey press in the state message'
+  $S.hk = (Now-Ms) - 20000; Check ((Msg $PA 'PC-A').hk -eq 0) 'old hotkey press not resent'
+  $S.hk = 0; $S.hkTo = ''
 
   # monitors: each PC's input per monitor, unchecked monitors stay put, DeskGlide 3 peers have one input for all
   $mons = @(@{ id = 'MSI4CE8'; path = 'p1'; name = 'MAG 275QF' }, @{ id = 'DEL4321'; path = 'p2'; name = 'DELL U2720Q' }, @{ id = 'DEL4321-2'; path = 'p3'; name = 'DELL U2720Q' })
@@ -489,7 +527,12 @@ function Receive-Control {
     elseif (((Get-Date) - $S.fixedSeen).TotalSeconds -gt 10) { $C.peerAddress = "$($ep.Address)"; $S.fixedIp = $ep.Address; $S.fixedSeen = Get-Date; Save-Config }
     if ($m.s) { $S.peerLinks = @($m.l | % { $w = "$_" -split ' '; if ($w.Count -eq 3 -and $opp[$w[1]]) { [pscustomobject]@{ from = $w[0]; dir = $w[1]; to = $w[2] } } }) }
     if (Merge-Settings $C $m) { Save-Config; Update-Menu }
-    if ($m.s -and -not $S.server) { if ($m.sa) { Set-Active 'peer' $m.n } else { Set-Active 'me' $Name } }
+    # follow the server when where the mouse is changes there (not every message, so a hotkey here isn't undone by a stale one)
+    if ($m.s -and -not $S.server -and [bool]$m.sa -ne $S.lastSa) { $S.lastSa = [bool]$m.sa; if ($m.sa) { Set-Active 'peer' $m.n } else { Set-Active 'me' $Name } }
+    if ([long]$m.hk -gt $S.hkSeen) {   # a hotkey on the other PC
+      $S.hkSeen = [long]$m.hk; $S.want = $null
+      if ($m.ha -eq $Name) { Set-Active 'me' $S.screen } elseif ($m.ha) { Set-Active 'peer' $S.peerScreen }
+    }
   }
 }
 
@@ -508,6 +551,33 @@ function Set-Active($new, [string]$screen) {
   }
 }
 
+function Show-Pc([string]$who) {   # hotkey: the monitor and sound go to $who ('me' or 'peer'); the mouse stays put
+  if (-not $C.peer -or $C.paused) { return }
+  $S.want = $null   # a pending edge crossing must not undo this
+  $S.hk = Now-Ms; $S.hkTo = if ($who -eq 'me') { $Name } else { $C.peer }
+  Say "Hotkey: show $($S.hkTo)."
+  Set-Active $who $(if ($who -eq 'me') { $S.screen } else { $S.peerScreen })
+  Send-State   # the other PC follows; if it is the one on screen, it switches the monitor to this PC
+}
+# Registers the two hotkeys, or releases them while this PC runs the Deskflow server: then Deskflow owns them
+# (keystroke() lines in its conf) and moves the mouse too, and DeskGlide follows its log as for any crossing.
+function Apply-Hotkeys([bool]$deskflowOwns) {
+  if (-not $S.msgWin) { return }
+  $S.hkSig = "$($C.hotkeyPeer)|$($C.hotkeyMe)|$deskflowOwns"; $bad = @()
+  foreach ($h in @(@(1, $C.hotkeyPeer), @(2, $C.hotkeyMe))) {
+    $k = Parse-Hotkey $h[1]
+    if ($deskflowOwns -or -not $k) { [void]$S.msgWin.SetHotkey($h[0], 0, 0) }
+    elseif (-not $S.msgWin.SetHotkey($h[0], [uint32]$k.mods, [uint32]$k.vk)) { $bad += $k.text }
+  }
+  $S.hkErr = if ($bad.Count) { "$($bad -join ' and ') $(if ($bad.Count -gt 1) { 'are' } else { 'is' }) in use by another program. Choose another key." } else { '' }
+  if ($bad.Count) { Say $S.hkErr }
+}
+function Set-HotkeyText([string]$which, [string]$text) {   # from the Settings card
+  $k = Parse-Hotkey $text
+  if (-not $k) { $S.hkErr = "`"$text`" isn't a hotkey DeskGlide understands. Use Ctrl, Alt, Shift or Win with an arrow, a letter, a digit or F1-F24, like Ctrl+Alt+Right."; return }
+  if ($C[$which] -eq $k.text) { $S.hkErr = ''; return }
+  $C[$which] = $k.text; Save-Config; Apply-Hotkeys ($S.dfRole -eq 'server')
+}
 function Refresh-Monitors {   # not while one is off the desktop: Windows doesn't list it then
   if ([Dg]::Detached) { return }
   $S.mons = @([Dg]::ListMonitors() | % { $a = $_ -split "`t"; @{ id = $a[0]; path = $a[1]; name = $(if ($a[2]) { $a[2] } else { 'Monitor' }) } })
@@ -589,7 +659,7 @@ function Stop-Deskflow {
   if ($S.df) { try { if (-not $S.df.HasExited) { $S.df.Kill(); [void]$S.df.WaitForExit(3000) } } catch {}; $S.df = $null; Say 'Deskflow stopped.' }
   $S.dfSig = ''; $S.dfConn = $false
   if ($S.dfRole -eq 'server') { $S.server = $false; $S.active = $null; Detect-Role }   # back to Synergy's log, if any
-  $S.dfRole = ''
+  $S.dfRole = ''; Apply-Hotkeys $false
 }
 # Runs, restarts or stops deskflow-core to match the settings. Sets $S.kmWhy to what the card shows.
 function Sync-Deskflow {
@@ -617,7 +687,10 @@ function Sync-Deskflow {
   $ini = Deskflow-Ini $S.screen $S.peerScreen $role "$($S.peerAddr)" $KmPort $dfDir
   $L = Current-Layout; $side = if ($L.show) { $L.show.dir } else { 'right' }
   if ($role -eq 'client') { $side = $opp[$side] }   # the conf is written from the server's side
-  $conf = Deskflow-Conf $(if ($role -eq 'server') { $S.screen } else { $S.peerScreen }) $(if ($role -eq 'server') { $S.peerScreen } else { $S.screen }) $side @()
+  $srv = if ($role -eq 'server') { $S.screen } else { $S.peerScreen }; $cli = if ($role -eq 'server') { $S.peerScreen } else { $S.screen }
+  # the hotkeys are pressed on the keyboard PC, the server: "the other PC" is the client there
+  $keys = @(foreach ($h in @(@($C.hotkeyPeer, $cli), @($C.hotkeyMe, $srv))) { $k = Parse-Hotkey $h[0]; if ($k) { "keystroke($($k.df)) = switchToScreen($($h[1]))" } })
+  $conf = Deskflow-Conf $srv $cli $side $keys
   $trust = "v2:sha256:$($S.peerFp)`n"   # the peer's certificate, sent over the signed channel: no prompt, no unencrypted fallback
   $sig = "$exe|$role|$ini|$conf|$trust"
   if ($S.df -and $sig -eq $S.dfSig) { Read-DeskflowStatus; $S.kmWhy = Deskflow-Status $role $peer; return }
@@ -627,6 +700,7 @@ function Sync-Deskflow {
   [IO.File]::WriteAllText($dfIni, $ini); [IO.File]::WriteAllText((Join-Path $dfDir 'deskflow-server.conf'), $conf)
   foreach ($f in 'trusted-servers', 'trusted-clients') { [IO.File]::WriteAllText((Join-Path $dfDir "tls\$f"), $trust) }
   Remove-Item -LiteralPath $dfLog -ErrorAction SilentlyContinue
+  Apply-Hotkeys ($role -eq 'server')   # release them before Deskflow registers them
   $psi = New-Object Diagnostics.ProcessStartInfo $exe, "$role$(if ($MultiCore) { ' --new-instance' }) -s `"$dfIni`""
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.WorkingDirectory = Split-Path $exe
   $S.df = [Diagnostics.Process]::Start($psi); $S.dfSig = $sig; $S.dfAt = $now; $S.dfPos = 0; $S.dfConn = $false; $S.dfErr = ''
@@ -740,6 +814,8 @@ function Tick {
     if ($S.want -and $S.want -ne $S.active -and ($now - $S.since).TotalMilliseconds -ge 400) { Set-Active $S.want $S.wantName }
   }
   if ($showEvt.WaitOne(0)) { Show-Window }   # DeskGlide was started again: show this copy instead
+  $hk = [MsgWin]::Pressed
+  if ($hk) { [MsgWin]::Pressed = 0; Show-Pc $(if ($hk -eq 1) { 'peer' } else { 'me' }) }
   if ($S.n++ % 5) { return }   # the rest twice a second
 
   $online = Peer-Online
@@ -1116,6 +1192,13 @@ $xaml = @'
             <TextBlock Style="{StaticResource Label}" Text="Run my script when the screen switches"/>
             <TextBox x:Name="Script"/>
             <TextBlock Style="{StaticResource Sub}" Margin="0,4,0,0" Text="Optional. Gets the name of the PC that now has the mouse, for example C:\Scripts\switched.cmd"/>
+            <TextBlock Style="{StaticResource Label}" Text="Hotkeys: monitor and sound, mouse stays"/>
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="8"/><ColumnDefinition/></Grid.ColumnDefinitions>
+              <StackPanel><TextBlock Style="{StaticResource Sub}" Text="Show the other PC"/><TextBox x:Name="HkPeer" Margin="0,4,0,0"/></StackPanel>
+              <StackPanel Grid.Column="2"><TextBlock Style="{StaticResource Sub}" Text="Show this PC"/><TextBox x:Name="HkMe" Margin="0,4,0,0"/></StackPanel>
+            </Grid>
+            <TextBlock x:Name="HkMsg" Style="{StaticResource Sub}" Margin="0,4,0,0"/>
           </StackPanel></Border>
         </StackPanel>
       </Grid>
@@ -1264,6 +1347,10 @@ function New-Window {
   On LogPath LostFocus { Set-Log $ui.LogPath.Text }
   On BrowseLog Click { $f = Browse 'Choose the Synergy or Deskflow log file' 'Log files|*.log;*.txt|All files|*.*' "$env:LOCALAPPDATA\synergy-dragon\logs"; if ($f) { Set-Log $f } }
   On Script LostFocus { $C.onSwitch = $ui.Script.Text.Trim(); Save-Config }
+  On HkPeer LostFocus { Set-HotkeyText 'hotkeyPeer' $ui.HkPeer.Text }
+  On HkMe LostFocus { Set-HotkeyText 'hotkeyMe' $ui.HkMe.Text }
+  On HkPeer KeyDown { if ($args[1].Key -eq 'Return') { Set-HotkeyText 'hotkeyPeer' $ui.HkPeer.Text } }
+  On HkMe KeyDown { if ($args[1].Key -eq 'Return') { Set-HotkeyText 'hotkeyMe' $ui.HkMe.Text } }
   On OpenLog Click { Start-Process notepad.exe "`"$logPath`"" }
   On LayLeft Checked { Set-Layout 'left' }
   On LayRight Checked { Set-Layout 'right' }
@@ -1446,7 +1533,9 @@ function Update-Ui {
 
   # settings (text boxes are refreshed only while the user isn't typing in them)
   $ui.StartupToggle.IsChecked = Test-Path $lnk; $ui.PauseToggle.IsChecked = $C.paused; $ui.DetachToggle.IsChecked = $C.detach
-  foreach ($p in @(@('LogPath', 'synergyLog'), @('AddrSet', 'peerAddress'), @('Script', 'onSwitch'))) {
+  $ui.HkMsg.Text = if ($S.hkErr) { $S.hkErr } elseif ($S.dfRole -eq 'server') { 'Deskflow handles these keys now, so the mouse moves too.' } else { 'With keyboard sharing on, the mouse moves too.' }
+  $ui.HkMsg.Foreground = Brush $(if ($S.hkErr) { 'Bad' } else { 'Fg2' })
+  foreach ($p in @(@('LogPath', 'synergyLog'), @('AddrSet', 'peerAddress'), @('Script', 'onSwitch'), @('HkPeer', 'hotkeyPeer'), @('HkMe', 'hotkeyMe'))) {
     if (-not $ui[$p[0]].IsKeyboardFocused) { $ui[$p[0]].Text = $C[$p[1]] }
   }
   $ui.RoleText.Text = if ($S.server) { "This PC is the Synergy server. Log: $($S.log)" } elseif ($C.synergyLog -and -not (Test-Path -LiteralPath $C.synergyLog)) { "This file doesn't exist." } else { "This PC is a Synergy client.$(if (-not $C.synergyLog) { " Empty means Synergy 3's log." })" }
@@ -1519,6 +1608,7 @@ try {
   $udp.EnableBroadcast = $true
   [void]$udp.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null)   # SIO_UDP_CONNRESET off: ignore ICMP "port unreachable"
   [Dg]::StartAudio($AudioPort)
+  $S.msgWin = New-Object MsgWin; Apply-Hotkeys $false
   $S.screen = if ($C.screenName) { $C.screenName } else { $Name }
   if ($C.key) { $S.key = [Convert]::FromBase64String($C.key) }
   if ($PairCode) { Set-Key $PairCode }
@@ -1532,7 +1622,7 @@ try {
   if (-not $S.key) { Say 'Not paired yet: open the DeskGlide window to pair.' }
 
   if ($Console -and -not $ShowWindow) {
-    while ($true) { try { Tick } catch { Say "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))" error }; Start-Sleep -Milliseconds 100 }
+    while ($true) { try { [Windows.Forms.Application]::DoEvents(); Tick } catch { Say "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))" error }; Start-Sleep -Milliseconds 100 }   # DoEvents: hotkey and clipboard messages
   } else {
     $timer = New-Object Windows.Forms.Timer; $timer.Interval = 100
     $timer.Add_Tick({ try { Tick } catch { Say "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))" error } })
