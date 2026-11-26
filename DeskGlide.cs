@@ -407,7 +407,6 @@ public static class Dg {
 
   // ---------- pairing and authentication ----------
   const string Alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // 32 symbols, no I/O/0/1
-  public const int AudioTagLen = 8;
 
   public static string NewCode() {   // 8 symbols = 40 bits, shown as ABCD-EFGH
     var b = new byte[8]; using (var r = new RNGCryptoServiceProvider()) r.GetBytes(b);
@@ -471,21 +470,30 @@ public static class Dg {
     return tag.Length == 32 && Same(Mac(key, b, b.Length), tag, 0, 32) ? json : null;
   }
 
-  // Audio packet: [rate:4][channels:2][seq:2][16-bit PCM][first 8 bytes of HMAC-SHA256].
+  // Audio packet (sound and microphone): [session nonce:16][Encrypt(session key, nonce, [rate:4][channels:2][seq:2][16-bit PCM])].
+  // The sender picks the nonce at random for each stream; the session key is the pairing key with that nonce. Each packet
+  // also gets its own random IV (Encrypt). About 1.2 KB per 6 ms of 48 kHz stereo.
+  static byte[] txNonce, txKey, txFor, rxNonce, rxKey, rxFor;
+  public static void NewAudioSession() { txNonce = null; }
   public static byte[] MakePacket(byte[] key, int rate, int ch, ushort seq, byte[] pcm, int len) {
-    byte[] p = new byte[8 + len + AudioTagLen];
-    BitConverter.GetBytes(rate).CopyTo(p, 0); BitConverter.GetBytes((ushort)ch).CopyTo(p, 4); BitConverter.GetBytes(seq).CopyTo(p, 6);
-    Buffer.BlockCopy(pcm, 0, p, 8, len);
-    Buffer.BlockCopy(Mac(key, p, 8 + len), 0, p, 8 + len, AudioTagLen);
-    return p;
+    if (txNonce == null || txFor != key) { txNonce = Random(16); txKey = SessionKey(key, "audio", txNonce); txFor = key; }
+    var plain = new byte[8 + len];
+    BitConverter.GetBytes(rate).CopyTo(plain, 0); BitConverter.GetBytes((ushort)ch).CopyTo(plain, 4); BitConverter.GetBytes(seq).CopyTo(plain, 6);
+    Buffer.BlockCopy(pcm, 0, plain, 8, len);
+    byte[] e = Encrypt(txKey, txNonce, plain, 0, plain.Length), p = new byte[16 + e.Length];
+    txNonce.CopyTo(p, 0); e.CopyTo(p, 16); return p;
   }
-  public static bool ValidPacket(byte[] key, byte[] p, out int rate, out int ch) {
+  // The decrypted [rate][channels][seq][PCM], or null if it isn't from the paired PC, was changed, or makes no sense.
+  public static byte[] OpenPacket(byte[] key, byte[] p, out int rate, out int ch) {
     rate = 0; ch = 0;
-    if (key == null || p == null || p.Length < 10 + AudioTagLen || p.Length > 8 + 8192 + AudioTagLen) return false;
-    int n = p.Length - AudioTagLen;
-    if (!Same(Mac(key, p, n), p, n, AudioTagLen)) return false;
-    rate = BitConverter.ToInt32(p, 0); ch = BitConverter.ToUInt16(p, 4);
-    return rate >= 8000 && rate <= 192000 && ch >= 1 && ch <= 2 && (n - 8) % (ch * 2) == 0;
+    if (key == null || p == null || p.Length < 16 + CryptoOverhead || p.Length > 16 + 8192 + CryptoOverhead) return null;
+    if (rxNonce == null || rxFor != key || !Same(rxNonce, p, 0, 16)) {   // a new stream: derive its key once
+      var n = new byte[16]; Buffer.BlockCopy(p, 0, n, 0, 16); rxKey = SessionKey(key, "audio", n); rxNonce = n; rxFor = key;
+    }
+    byte[] d = Decrypt(rxKey, rxNonce, p, 16, p.Length - 16);
+    if (d == null || d.Length < 10) return null;
+    rate = BitConverter.ToInt32(d, 0); ch = BitConverter.ToUInt16(d, 4);
+    return rate >= 8000 && rate <= 192000 && ch >= 1 && ch <= 2 && (d.Length - 8) % (ch * 2) == 0 ? d : null;
   }
 
   // ---------- audio threads: DeskGlide.ps1 sets these flags, the threads do the rest ----------
@@ -590,7 +598,7 @@ public static class Dg {
     iid = typeof(IAudioCaptureClient).GUID;
     Check(client.GetService(ref iid, out o)); capture = (IAudioCaptureClient)o;
     Check(client.Start());
-    outLen = 0; capMode = mode;
+    outLen = 0; capMode = mode; NewAudioSession();   // a new stream gets a new session key
   }
 
   static void StopCapture() {
@@ -674,12 +682,13 @@ public static class Dg {
     while (DateTime.UtcNow < end) {
       byte[] p; IPEndPoint ep = null;
       try { p = rx.Receive(ref ep); } catch (SocketException) { Feed(); continue; }
-      int rate, ch; if (!ValidPacket(Key, p, out rate, out ch)) { Bad++; continue; }
+      int rate, ch; p = OpenPacket(Key, p, out rate, out ch);
+      if (p == null) { Bad++; continue; }
       got++;
       if (RecvMode == Sound && !RemoteOn) continue;   // follow mode: the mouse is on this PC, drop the other PC's sound
       if (wave == IntPtr.Zero || rate != wRate || ch != wCh || RecvDevice != wDev) OpenOut(rate, ch);
-      if (RecvMode == Sound) Scale(p, 8, p.Length - AudioTagLen - 8, Volume);   // the volume slider is for the other PC's sound, not its microphone
-      for (int i = 8, n = p.Length - AudioTagLen; i < n; ) {
+      if (RecvMode == Sound) Scale(p, 8, p.Length - 8, Volume);   // the volume slider is for the other PC's sound, not its microphone
+      for (int i = 8, n = p.Length; i < n; ) {
         int k = Math.Min(blockBytes - fillLen, n - i);
         Buffer.BlockCopy(p, i, fill, fillLen, k); fillLen += k; i += k;
         if (fillLen == blockBytes) { pending.Enqueue(fill); fill = new byte[blockBytes]; fillLen = 0; }

@@ -23,7 +23,7 @@ $Version = '4.0'
 $Proto = 4   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it
 if (-not $PeerPort) { $PeerPort = $Port }
 Add-Type -Path "$PSScriptRoot\DeskGlide.cs" -ReferencedAssemblies System.Drawing, System.Core, System.IO.Compression, System.IO.Compression.FileSystem, System.Windows.Forms
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing, PresentationFramework, PresentationCore, WindowsBase, WindowsFormsIntegration
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing, PresentationFramework, PresentationCore, WindowsBase, WindowsFormsIntegration, System.Security
 $cfgPath   = Join-Path $ConfigDir 'config.json'
 $mutedPath = Join-Path $ConfigDir 'muted.txt'   # apps we muted, so a crash or kill doesn't leave them muted
 $logPath   = Join-Path $ConfigDir 'deskglide.log'
@@ -55,9 +55,25 @@ function Load-Config {
     if ($c.headphones -and -not $c.hp) { $c.hp = $Name; $c.syncAt = Now-Ms }   # newest, so the other PC takes it instead of clearing it
     $c.Remove('headphones')
   }
+  $c.key = Unprotect-Key $c.key   # DeskGlide 3 stored it in plain text: the next Save-Config protects it
+  if (-not $c.key) { $c.peer = '' }   # no readable key (copied from another user or PC): pair again
   $c
 }
-function Save-Config { [void](New-Item -ItemType Directory -Force $ConfigDir); $C | ConvertTo-Json | Set-Content $cfgPath -Encoding UTF8 }
+function Save-Config {   # the pairing key goes to disk only encrypted for this Windows user (DPAPI)
+  [void](New-Item -ItemType Directory -Force $ConfigDir)
+  $o = $C.Clone(); $o.key = Protect-Key $C.key
+  $o | ConvertTo-Json | Set-Content $cfgPath -Encoding UTF8
+}
+# The pairing key (base64) <-> 'dpapi:<base64 blob>' in config.json, readable only by this Windows user on this PC.
+$dpapiExtra = [Text.Encoding]::UTF8.GetBytes('DeskGlide pairing key')
+function Protect-Key([string]$b64) {
+  if (-not $b64) { return '' }
+  'dpapi:' + [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect([Text.Encoding]::UTF8.GetBytes($b64), $dpapiExtra, 'CurrentUser'))
+}
+function Unprotect-Key([string]$s) {   # '' if it can't be read (another user or PC): DeskGlide then asks to pair again
+  if ($s -notlike 'dpapi:*') { return $s }
+  try { [Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($s.Substring(6)), $dpapiExtra, 'CurrentUser')) } catch { '' }
+}
 
 # Screen name in the last Synergy 'switch from "A" to "B"' line, or $null.
 function Get-Target([string]$text) {
@@ -217,7 +233,7 @@ function Edge-Links([string]$server, [string]$client, [string]$dir) {
   "section: links`n`t${server}:`n`t`t$dir = $client`n`t${client}:`n`t`t$($opp[$dir]) = $server`nend`n"
 }
 # Why sound is or isn't playing, in plain words.
-function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active) {
+function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active, [int]$peerVer = 4) {
   $peer = $cfg.peer
   if (-not $paired) { return 'Off: pair with your other PC first.' }
   if ($cfg.paused) { return 'Off while DeskGlide is paused.' }
@@ -225,6 +241,7 @@ function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active) {
   $here = $cfg.hp -eq $Name; $there = $cfg.hp -and $cfg.hp -eq $peer
   if (-not $here -and -not $there) { return 'Off: choose which PC your headphones are plugged into.' }
   if (-not $online) { return "Off: waiting for $peer to connect." }
+  if ($peerVer -lt 4) { return "Off: update DeskGlide on $peer. Sound is encrypted now, and DeskGlide 3 can't decrypt it." }
   if ($here) {
     if ($cfg.audio -eq 'both') { return "You hear this PC and $peer together." }
     if ($active -eq 'peer') { return "You hear $peer. This PC's apps are muted until the mouse comes back." }
@@ -238,7 +255,7 @@ function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active) {
 # The headphones PC receives the other PC's sound and sends its microphone; the other PC sends sound and plays the mic into VB-Cable.
 function Audio-Modes($cfg, [bool]$online, [string]$active, [int]$peerVer, [bool]$peerCable, [int]$cable) {
   $here = $cfg.hp -eq $Name; $there = $cfg.hp -and $cfg.hp -eq $cfg.peer
-  $sound = $online -and $cfg.audio -ne 'off' -and -not $cfg.paused
+  $sound = $online -and $cfg.audio -ne 'off' -and -not $cfg.paused -and $peerVer -ge 4   # sound is encrypted since DeskGlide 4
   $mic = $online -and $cfg.mic -ne 'off' -and -not $cfg.paused -and $peerVer -ge 4
   $o = @{ send = 0; recv = 0; dev = -1 }
   if ($here) {
@@ -306,17 +323,24 @@ if ($Test) {
   Check ($null -eq [Dg]::Open($k, $p.Replace('"t":1', '"t":2'))) 'tampered control message accepted'
   Check ($null -eq [Dg]::Open($k, 'garbage')) 'garbage accepted'
 
+  # audio packets: encrypted (session key from a per-stream nonce, random IV each), anything else refused
   $r = 0; $ch = 0
-  function Pkt($key, [int]$rate, [int]$chans, [int]$bytes) { [Dg]::MakePacket($key, $rate, $chans, 7, (New-Object byte[] ([Math]::Max($bytes, 1))), $bytes) }
-  Check ([Dg]::ValidPacket($k, (Pkt $k 48000 2 1152), [ref]$r, [ref]$ch) -and $r -eq 48000 -and $ch -eq 2) 'valid stereo packet rejected'
-  Check ([Dg]::ValidPacket($k, (Pkt $k 44100 1 2), [ref]$r, [ref]$ch)) 'valid mono packet rejected'
-  $bad = Pkt $k 48000 2 1152; $bad[100] = 1
-  Check (-not [Dg]::ValidPacket($k, $bad, [ref]$r, [ref]$ch)) 'tampered audio accepted'
-  Check (-not [Dg]::ValidPacket($k2, (Pkt $k 48000 2 1152), [ref]$r, [ref]$ch)) 'audio with wrong key accepted'
-  Check (-not [Dg]::ValidPacket($k, (Pkt $k 48000 2 3), [ref]$r, [ref]$ch)) 'odd length accepted'
-  Check (-not [Dg]::ValidPacket($k, (Pkt $k 48000 6 12), [ref]$r, [ref]$ch)) '6 channels accepted'
-  Check (-not [Dg]::ValidPacket($k, (Pkt $k 1 2 4), [ref]$r, [ref]$ch)) 'bad sample rate accepted'
-  Check (-not [Dg]::ValidPacket($k, [byte[]](1, 2, 3), [ref]$r, [ref]$ch)) 'short packet accepted'
+  function Pkt($key, [int]$rate, [int]$chans, [int]$bytes) { $pcm = New-Object byte[] ([Math]::Max($bytes, 1)); for ($i = 0; $i -lt $pcm.Length; $i++) { $pcm[$i] = 0x41 }; [Dg]::MakePacket($key, $rate, $chans, 7, $pcm, $bytes) }
+  $good = Pkt $k 48000 2 1152; $d = [Dg]::OpenPacket($k, $good, [ref]$r, [ref]$ch)
+  Check ($d -and $r -eq 48000 -and $ch -eq 2 -and $d.Length -eq 8 + 1152 -and $d[8] -eq 0x41 -and [BitConverter]::ToUInt16($d, 6) -eq 7) 'stereo packet round trip'
+  Check (-not ([Text.Encoding]::ASCII.GetString($good)).Contains('AAAAAAAA') -and $good.Length -le 16 + 8 + 1152 + [Dg]::CryptoOverhead) 'audio is encrypted, small overhead'
+  Check ([Dg]::OpenPacket($k, (Pkt $k 44100 1 2), [ref]$r, [ref]$ch) -and $r -eq 44100 -and $ch -eq 1) 'mono packet round trip'
+  $g2 = Pkt $k 48000 2 1152; [Dg]::NewAudioSession(); $g3 = Pkt $k 48000 2 1152
+  Check ([Dg]::Hex($good[0..15]) -eq [Dg]::Hex($g2[0..15]) -and [Dg]::Hex($good[16..31]) -ne [Dg]::Hex($g2[16..31]) -and [Dg]::Hex($g3[0..15]) -ne [Dg]::Hex($good[0..15])) 'same stream nonce, new IV per packet, new nonce per stream'
+  Check ([Dg]::OpenPacket($k, $g3, [ref]$r, [ref]$ch) -and [Dg]::OpenPacket($k, $good, [ref]$r, [ref]$ch)) 'receiver follows a new stream'
+  foreach ($i in 3, 20, 100, ($good.Length - 1)) { $bad = [byte[]]$good.Clone(); $bad[$i] = $bad[$i] -bxor 1; Check ($null -eq [Dg]::OpenPacket($k, $bad, [ref]$r, [ref]$ch)) "tampered audio byte $i accepted" }
+  Check ($null -eq [Dg]::OpenPacket($k2, (Pkt $k 48000 2 1152), [ref]$r, [ref]$ch)) 'audio with wrong key accepted'
+  Check ($null -eq [Dg]::OpenPacket($k, (Pkt $k 48000 2 3), [ref]$r, [ref]$ch)) 'odd length accepted'
+  Check ($null -eq [Dg]::OpenPacket($k, (Pkt $k 48000 6 12), [ref]$r, [ref]$ch)) '6 channels accepted'
+  Check ($null -eq [Dg]::OpenPacket($k, (Pkt $k 1 2 4), [ref]$r, [ref]$ch)) 'bad sample rate accepted'
+  Check ($null -eq [Dg]::OpenPacket($k, [byte[]](1, 2, 3), [ref]$r, [ref]$ch)) 'short packet accepted'
+  $old = New-Object byte[] (8 + 1152 + 8); [BitConverter]::GetBytes(48000).CopyTo($old, 0); $old[4] = 2
+  Check ($null -eq [Dg]::OpenPacket($k, $old, [ref]$r, [ref]$ch)) 'DeskGlide 3 plain packet accepted'
   Check ([Dg]::ToPcm16(2.0) -eq 32767 -and [Dg]::ToPcm16(-2.0) -eq -32768 -and [Dg]::ToPcm16(0) -eq 0) 'clipping'
 
   # volume: the receiver scales samples, the 8-byte header is untouched
@@ -348,6 +372,7 @@ if ($Test) {
   Check ((Audio-Status $q $false $false 'me') -match 'pair') 'reason: not paired'
   Check ((Audio-Status $q $true $true 'me') -match 'headphones are plugged') 'reason: no headphones PC'
   $q.hp = 'PC-A'; Check ((Audio-Status $q $true $false 'me') -match 'waiting for PC-B') 'reason: offline'
+  Check ((Audio-Status $q $true $true 'me' 3) -match 'update DeskGlide on PC-B') 'reason: DeskGlide 3 peer'
   Check ((Audio-Status $q $true $true 'peer') -match '^You hear PC-B') 'status: playing the other PC'
   $q.hp = 'PC-B'; Check ((Audio-Status $q $true $true 'me') -match 'headphones on PC-B') 'status: sending'
   $q.audio = 'off'; Check ((Audio-Status $q $true $true 'me') -match '^Off\.') 'reason: audio off'
@@ -417,7 +442,7 @@ if ($Test) {
   $m = Audio-Modes $q $true 'me' 4 $true -1; Check ($m.recv -eq 1 -and $m.send -eq 0) 'headphones PC, mouse here: sound in, mic stays'
   $m = Audio-Modes $q $true 'peer' 4 $true -1; Check ($m.recv -eq 1 -and $m.send -eq 2) 'headphones PC, mouse there: mic goes'
   $m = Audio-Modes $q $true 'peer' 4 $false -1; Check ($m.send -eq 0) 'mic sent although the other PC has no VB-Cable'
-  $m = Audio-Modes $q $true 'peer' 3 $true -1; Check ($m.send -eq 0 -and $m.recv -eq 1) 'mic sent to DeskGlide 3'
+  $m = Audio-Modes $q $true 'peer' 3 $true -1; Check ($m.send -eq 0 -and $m.recv -eq 0) 'sound or mic with DeskGlide 3 (it can''t decrypt)'
   $q.mic = 'always'; $m = Audio-Modes $q $true 'me' 4 $true -1; Check ($m.send -eq 2) 'mic always'
   $q.hp = 'PC-B'; $m = Audio-Modes $q $true 'me' 4 $false 3; Check ($m.send -eq 1 -and $m.recv -eq 2 -and $m.dev -eq 3) 'other PC: sound out, mic into CABLE Input'
   $m = Audio-Modes $q $true 'me' 4 $false -1; Check ($m.send -eq 1 -and $m.recv -eq 0) 'mic played without VB-Cable'
@@ -502,6 +527,13 @@ if ($Test) {
   $C = Load-Config; $C.peer = 'PC-B'; $C.input = 17; $C.audio = 'both'; $C.hp = 'PC-B'; $C.syncAt = 1764000000000; $C.inputs = @{ MSI4CE8 = 17 }; $C.monOff = @('X'); Save-Config
   $C = Load-Config
   Check ($C.peer -eq 'PC-B' -and $C.input -eq 17 -and $C.audio -eq 'both' -and $C.hp -eq 'PC-B' -and $C.syncAt -eq 1764000000000 -and $C.monitor -eq $true -and $C.inputs.MSI4CE8 -eq 17 -and $C.inputs -is [hashtable] -and @($C.monOff).Count -eq 1) 'config round trip'
+  # pairing key at rest: DPAPI-protected for this Windows user; DeskGlide 3's plain key is migrated on the next save
+  $raw = Get-Content $cfgPath -Raw
+  Check ($raw -match '"key":\s*"dpapi:' -and $raw -notmatch 'a2V5' -and $C.key -eq 'a2V5') 'key protected on disk, plain in memory'
+  Set-Content $cfgPath '{"peer":"PC-B","key":"a2V5"}'; $C = Load-Config; Check ($C.key -eq 'a2V5') 'DeskGlide 3 plain key read'
+  Save-Config; Check ((Get-Content $cfgPath -Raw) -notmatch 'a2V5' -and (Load-Config).key -eq 'a2V5') 'plain key migrated'
+  Set-Content $cfgPath '{"peer":"PC-B","key":"dpapi:AAAA"}'; $u = Load-Config; Check ($u.key -eq '' -and $u.peer -eq '') 'unreadable key means unpaired, no crash'
+  $C = Load-Config; $C.key = ''; Save-Config; Check ((Get-Content $cfgPath -Raw) -match '"key":\s*""') 'no key stays empty'
   Remove-Item -Recurse $ConfigDir
   'self-check ok'; return
 }
@@ -835,7 +867,6 @@ function Tick {
   }
 
   # audio: the PC with the headphones receives the other PC's sound and sends its microphone; the other PC the opposite
-  # ponytail: audio is authenticated (HMAC) but not encrypted; anyone on the LAN can listen. Add AES-CTR if that matters.
   if (($now - $S.cableAt).TotalSeconds -ge 30) { $S.cableAt = $now; $S.cable = [Dg]::FindOutput('CABLE Input') }
   $a = Audio-Modes $C $online $S.active $S.peerVer $S.peerCable $S.cable
   [Dg]::Key = $S.key
@@ -1130,7 +1161,7 @@ $xaml = @'
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE71B;"/><TextBlock Style="{StaticResource H}" Text="Pairing"/></StackPanel>
             <StackPanel x:Name="PairedBox">
               <TextBlock x:Name="PairedText" FontWeight="SemiBold"/>
-              <TextBlock Style="{StaticResource Sub}" Margin="0,4,0,0" Text="Every message and sound packet between the two PCs is signed with your pairing key, so other devices can't control DeskGlide."/>
+              <TextBlock Style="{StaticResource Sub}" Margin="0,4,0,0" Text="Every message is signed with your pairing key, so other devices can't control DeskGlide. Sound, microphone and files are also encrypted."/>
               <Button x:Name="Unpair" Content="Unpair" HorizontalAlignment="Left" Margin="0,12,0,0"/>
             </StackPanel>
             <Border x:Name="PairHostMain"><StackPanel x:Name="PairPanel">
@@ -1491,7 +1522,7 @@ function Update-Ui {
   $ui.VolLabel.Text = "Volume of $sender"
   if (-not $S.volAt -and $ui.Vol.Value -ne $C.vol) { $ui.Vol.Value = $C.vol }
   $ui.VolPct.Text = "$($C.vol)%"
-  $ui.AudioWhy.Text = Audio-Status $C $paired $online $S.active
+  $ui.AudioWhy.Text = Audio-Status $C $paired $online $S.active $S.peerVer
   $ui.AudioDot.Fill = Brush $(if ([Dg]::SendMode -eq [Dg]::Sound -or [Dg]::RecvMode -eq [Dg]::Sound) { 'Good' } else { 'Fg2' })
 
   # files
