@@ -1,8 +1,80 @@
 // DeskGlide native helpers. DeskGlide.ps1 compiles this with Add-Type (C# 5, nothing to install).
-using System; using System.Text; using System.Net; using System.Net.Sockets; using System.Threading;
+using System; using System.Text; using System.Net; using System.Net.Sockets; using System.Threading; using System.IO;
 using System.Collections.Generic; using System.Runtime.InteropServices; using System.Security.Cryptography;
+using System.Drawing; using System.Drawing.Drawing2D; using System.Drawing.Imaging;
 
 public static class Dg {
+  // ---------- app icon: a monitor whose left half is this PC and right half the other PC ----------
+  // state: 0 = app icon (two-tone), 1 = this PC has the mouse, 2 = the other PC has it, 3 = grey (paused / not paired)
+  public static Bitmap DrawIcon(int size, int state) {
+    var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+    float k = size / 16f;   // drawn on a 16-unit grid so 16 px stays crisp
+    Color frame = state == 3 ? Color.FromArgb(110, 110, 110) : Color.FromArgb(38, 50, 66);
+    Color on = Color.FromArgb(0, 120, 212), soft = Color.FromArgb(96, 180, 245), off = Color.FromArgb(150, 160, 172), grey = Color.FromArgb(185, 185, 185);
+    Color left = state == 3 ? grey : state == 2 ? off : on;
+    Color right = state == 3 ? grey : state == 1 ? off : state == 2 ? on : soft;
+    using (var g = Graphics.FromImage(bmp)) {
+      g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.Half;
+      using (var b = new SolidBrush(frame)) {
+        g.FillPath(b, Round(1 * k, 2 * k, 14 * k, 10 * k, 1.5f * k));    // bezel
+        g.FillRectangle(b, 7 * k, 12 * k, 2 * k, 1 * k);                  // neck
+        g.FillPath(b, Round(4 * k, 13 * k, 8 * k, 2 * k, 0.8f * k));      // foot
+      }
+      float gap = size >= 32 ? 0.25f * k : 0;
+      using (var b = new SolidBrush(left)) g.FillRectangle(b, 2 * k, 3 * k, 6 * k - gap, 8 * k);
+      using (var b = new SolidBrush(right)) g.FillRectangle(b, 8 * k + gap, 3 * k, 6 * k - gap, 8 * k);
+    }
+    return bmp;
+  }
+  static GraphicsPath Round(float x, float y, float w, float h, float r) {
+    var p = new GraphicsPath(); float d = r * 2;
+    p.AddArc(x, y, d, d, 180, 90); p.AddArc(x + w - d, y, d, d, 270, 90);
+    p.AddArc(x + w - d, y + h - d, d, d, 0, 90); p.AddArc(x, y + h - d, d, d, 90, 90);
+    p.CloseFigure(); return p;
+  }
+  public static byte[] IconPng(int size, int state) {
+    using (var b = DrawIcon(size, state)) using (var ms = new MemoryStream()) { b.Save(ms, ImageFormat.Png); return ms.ToArray(); }
+  }
+  // .ico with PNG frames (Windows Vista and later read these)
+  public static void SaveIco(string path, int state, int[] sizes) {
+    var pngs = new List<byte[]>(); foreach (int z in sizes) pngs.Add(IconPng(z, state));
+    using (var w = new BinaryWriter(File.Create(path))) {
+      w.Write((short)0); w.Write((short)1); w.Write((short)sizes.Length);
+      int off = 6 + 16 * sizes.Length;
+      for (int i = 0; i < sizes.Length; i++) {
+        byte z = (byte)(sizes[i] >= 256 ? 0 : sizes[i]);
+        w.Write(z); w.Write(z); w.Write((short)0); w.Write((short)1); w.Write((short)32);
+        w.Write(pngs[i].Length); w.Write(off); off += pngs[i].Length;
+      }
+      foreach (var p in pngs) w.Write(p);
+    }
+  }
+
+  // ---------- window helpers ----------
+  [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int a, ref int v, int n);
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int n);
+  [StructLayout(LayoutKind.Sequential)] struct RECT { public int l, t, r, b; }
+  [DllImport("shell32.dll", CharSet=CharSet.Unicode)] static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+  public static void DarkTitle(IntPtr h, bool dark) { int v = dark ? 1 : 0; DwmSetWindowAttribute(h, 20, ref v, 4); }   // DWMWA_USE_IMMERSIVE_DARK_MODE
+  public static int[] FrameRect(IntPtr h) {   // the window's visible bounds in screen pixels (no invisible resize border)
+    RECT r; DwmGetWindowAttribute(h, 9, out r, 16); return new[] { r.l, r.t, r.r - r.l, r.b - r.t };
+  }
+  public static void AppId(string id) { SetCurrentProcessExplicitAppUserModelID(id); }   // own taskbar button, not grouped with PowerShell
+
+  // ---------- wake this PC's screen when the mouse arrives ----------
+  [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint f);
+  [DllImport("user32.dll")] static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
+  public static void WakeDisplay() { SetThreadExecutionState(2); mouse_event(1, 0, 0, 0, IntPtr.Zero); }   // ES_DISPLAY_REQUIRED, zero-distance MOUSEEVENTF_MOVE
+
+  // ---------- volume: the receiver scales the other PC's 16-bit samples, vol 0..1 ----------
+  public static volatile float Volume = 1f;
+  public static void Scale(byte[] b, int off, int len, float vol) {
+    if (vol >= 1f) return;
+    for (int i = off, end = off + len - 1; i < end; i += 2) {
+      int s = (int)((short)(b[i] | b[i + 1] << 8) * vol);
+      b[i] = (byte)s; b[i + 1] = (byte)(s >> 8);
+    }
+  }
   // ---------- monitor: DDC/CI VCP 0x60 (input select) via dxva2.dll ----------
   [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
   public struct PM { public IntPtr h; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string d; }
@@ -259,6 +331,7 @@ public static class Dg {
       got++;
       if (!RemoteOn) continue;   // follow mode: the mouse is on this PC, drop the other PC's sound
       if (wave == IntPtr.Zero || rate != wRate || ch != wCh) OpenOut(rate, ch);
+      Scale(p, 8, p.Length - AudioTagLen - 8, Volume);
       for (int i = 8, n = p.Length - AudioTagLen; i < n; ) {
         int k = Math.Min(blockBytes - fillLen, n - i);
         Buffer.BlockCopy(p, i, fill, fillLen, k); fillLen += k; i += k;
