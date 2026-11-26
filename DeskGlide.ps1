@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.3.3'
+$Version = '5.3.4'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = 'prasanthzodiac/Desk-Glide'   # 'owner/repo' on GitHub for auto-update (its latest release); empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -524,6 +524,12 @@ if ($Test) {
   $bad = [Dg]::Bad; [void]$pu.Send($ka, $ka.Length, '127.0.0.1', $ap); Start-Sleep -Milliseconds 300
   Check ([Dg]::Bad -eq $bad) 'audio keepalive ignored on arrival, not counted as bad'
   [Dg]::RecvMode = 0; [Dg]::Target = $null; [Dg]::Key = $null; $pu.Close()
+  # sound buffer: a short dry spell (late packets) grows it, silence doesn't, a calm half minute shrinks it, never past 120 ms
+  $jb = New-Object JitterBuf; $t = 1000000; $jb.Starved($t); $jb.Resumed($t + 50); $g1 = $jb.Target
+  $jb.Starved($t + 100); $jb.Resumed($t + 5000); $g2 = $jb.Target
+  1..10 | % { $jb.Starved($t + 6000); $jb.Resumed($t + 6040) }; $g3 = $jb.Target
+  $jb.Tick($t + 40000); $g4 = $jb.Target
+  Check ($g1 -eq 4 -and $g2 -eq 4 -and $g3 -eq [JitterBuf]::Max -and $g4 -eq [JitterBuf]::Max - 1 -and $jb.Gaps -eq 11) "sound buffer adapts: $g1 $g2 $g3 $g4 gaps $($jb.Gaps)"
 
   Check ((Parse-Address ' 192.168.1.20 ') -eq '192.168.1.20' -and (Parse-Address '100.101.5.7 (Tailscale)') -eq '100.101.5.7') 'address: IPv4'
   Check ((Parse-Address 'LAPTOP') -eq 'LAPTOP' -and (Parse-Address 'pc.tail1234.ts.net') -eq 'pc.tail1234.ts.net') 'address: names'
@@ -2335,6 +2341,7 @@ function Update-Ui {
   $ui.VolPct.Text = "$($C.vol)%"
   $w = Out-Warning $S.outCable $S.outName ($online -and $S.peerOutCable) (Peer-Label) $C.audio
   $ui.AudioWhy.Text = if ($w) { $w } else { Audio-Status $C $paired $online $S.active $S.peerVer }
+  if (-not $w -and [Dg]::AudioBufferMs -gt 20) { $ui.AudioWhy.Text += " The network is uneven, so sound plays $([Dg]::AudioBufferMs) ms late to stay smooth; a cable or a home router makes it quicker." }
   $ui.AudioDot.Fill = Brush $(if ([Dg]::SendMode -eq [Dg]::Sound -or [Dg]::RecvMode -eq [Dg]::Sound) { 'Good' } else { 'Fg2' })
 
   # update (footer)

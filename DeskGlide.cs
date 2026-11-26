@@ -761,8 +761,9 @@ public static class Dg {
   static readonly int LenOff = (int)Marshal.OffsetOf(typeof(WAVEHDR), "len");
   static readonly int FlagsOff = (int)Marshal.OffsetOf(typeof(WAVEHDR), "flags");
   const int Blocks = 6;      // 10 ms each: at most ~60 ms queued in the sound card
-  const int MaxPending = 3;  // at most ~30 ms waiting; older audio is dropped so delay stays low
-  const int Prebuffer = 2;   // after a gap, wait for 20 ms of audio before playing (fewer clicks)
+  static readonly JitterBuf jb = new JitterBuf(); static bool playing;   // how much to gather before playing: see JitterBuf
+  public static int AudioGaps { get { return jb.Gaps; } }
+  public static int AudioBufferMs { get { return jb.Target * 10; } }
 
   static UdpClient rx;
   static IntPtr wave = IntPtr.Zero; static int wRate, wCh, wDev = -2, blockBytes;
@@ -800,8 +801,10 @@ public static class Dg {
       if (busy[i] && (Marshal.ReadInt32(hdrs[i], FlagsOff) & 1) != 0) busy[i] = false;   // WHDR_DONE
       if (busy[i]) inFlight++;
     }
-    while (pending.Count > MaxPending) pending.Dequeue();
-    if (inFlight == 0 && pending.Count < Prebuffer) return;
+    int now = Environment.TickCount; jb.Tick(now);
+    if (playing && inFlight == 0 && pending.Count == 0) { playing = false; jb.Starved(now); }   // ran dry
+    while (pending.Count > jb.Target + 3) pending.Dequeue();   // a burst after a delay: drop the oldest, so the delay stays bounded
+    if (!playing) { if (pending.Count < jb.Target) return; playing = true; jb.Resumed(now); }
     for (int i = 0; i < Blocks && pending.Count > 0; i++) {
       if (busy[i]) continue;
       byte[] b = pending.Dequeue();
@@ -819,7 +822,7 @@ public static class Dg {
     int dev = RecvDevice; int r = waveOutOpen(out wave, dev, ref f, IntPtr.Zero, IntPtr.Zero, 0);   // -1 = default output device
     if (r != 0) { wave = IntPtr.Zero; throw new InvalidOperationException("waveOutOpen failed: " + r); }
     wRate = rate; wCh = ch; wDev = dev; blockBytes = rate / 100 * ch * 2;
-    fill = new byte[blockBytes]; fillLen = 0; pending.Clear();
+    fill = new byte[blockBytes]; fillLen = 0; pending.Clear(); playing = false;
     hdrs = new IntPtr[Blocks]; datas = new IntPtr[Blocks]; busy = new bool[Blocks];
     for (int i = 0; i < Blocks; i++) {
       datas[i] = Marshal.AllocHGlobal(blockBytes);
@@ -997,6 +1000,20 @@ public static class Geo {
     }
     x = bx; y = by;
   }
+}
+
+// How many 10 ms blocks of sound to gather before playing. Starts at 2 (20 ms). Running dry for a moment (under 300 ms:
+// late packets, not the other PC going quiet) adds 2, up to 12 (120 ms); 30 s without that takes 1 back. On a cable it
+// stays at 20 ms; on a busy Wi-Fi or a phone hotspot it grows until the sound is smooth.
+public class JitterBuf {
+  public const int Min = 2, Max = 12;
+  public int Target = Min, Gaps; int starvedAt = -1, calmAt = Environment.TickCount;
+  public void Starved(int now) { if (starvedAt < 0) starvedAt = now; }
+  public void Resumed(int now) {
+    if (starvedAt >= 0 && now - starvedAt < 300) { Gaps++; Target = Math.Min(Max, Target + 2); calmAt = now; }
+    starvedAt = -1;
+  }
+  public void Tick(int now) { if (Target > Min && now - calmAt > 30000) { Target--; calmAt = now; } }
 }
 
 // Relative movement (game mode): float deltas add up, whole pixels go out, the fraction stays for the next packet.

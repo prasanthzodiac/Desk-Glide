@@ -225,7 +225,7 @@ Admin control needs a Windows service running as SYSTEM, the most powerful accou
 - **Microphone** needs VB-Cable, a driver that takes administrator rights to install (a company laptop may not allow it); the microphone path is self-tested but not yet tried between two real PCs.
 - **Keyboard layouts:** keys are sent as scan codes, so both PCs should use the same layout.
 - **Pen tablets** and other absolute pointing devices only click on the other PC; they don't move its pointer.
-- **Delay:** sound arrives 50-100 ms late on a home network: fine for music and video, noticeable in games.
+- **Delay:** sound arrives a little late: about 50 ms on a cable, more on Wi-Fi or a phone hotspot, where DeskGlide's buffer grows by itself (up to 120 ms) whenever late packets would make the sound break up, and shrinks again when the network is calm. The Sound card says when it has grown. Fine for music and video, noticeable in games.
 - **Surround** sound is sent as stereo.
 - **Identical monitors:** two monitors of the same model are told apart by their order, which can differ between the PCs.
 - **Taking monitors off the desktop** is off by default: it couldn't be tested on a two-monitor setup yet, Windows rearranges windows each time, and it never applies to a PC's only screen. If a monitor stays off, press Win+P and choose Extend.
