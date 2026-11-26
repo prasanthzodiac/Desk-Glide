@@ -1411,7 +1411,7 @@ function New-Window {
   $script:logos = 0..3 | % { [Windows.Media.Imaging.BitmapFrame]::Create((New-Object IO.MemoryStream (, [Dg]::IconPng(176, $_))), 'None', 'OnLoad') }
   $ui.WizLogo.Source = $logos[0]; $ui.BigLogo.Source = $logos[0]
   $ui.Ver.Text = "DeskGlide $Version  -  $Name$(if ($DryRun) { '  -  dry run' })"
-  if ($Shot) { $win.WindowStartupLocation = 'Manual'; $win.Left = -20000; $win.Top = 0; $win.Height = 1180; $win.ShowActivated = $false; $win.ShowInTaskbar = $false }   # drawn off screen, never takes focus
+  if ($Shot) { $win.WindowStartupLocation = 'Manual'; $win.Left = -20000; $win.Top = 0; if ($S.key) { $win.Height = 1180 }; $win.ShowActivated = $false; $win.ShowInTaskbar = $false }   # drawn off screen, never takes focus
 
   On MonToggle Checked, Unchecked { if ($C.monitor -ne [bool]$ui.MonToggle.IsChecked) { $C.monitor = -not $C.monitor; Changed } }
   On PauseToggle Checked, Unchecked { if ($C.paused -ne [bool]$ui.PauseToggle.IsChecked) { $C.paused = -not $C.paused; Changed } }
