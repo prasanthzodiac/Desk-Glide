@@ -56,7 +56,7 @@ function Load-Config {
   $c = @{ peer = ''; key = ''; peerAddress = ''; input = 0; inputOverride = 0; monitor = $true; audio = 'follow'; hp = ''; vol = 100
           paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
           km = $false; kmHost = ''; deskflowExe = ''; inputs = @{}; monOff = @(); detach = $false
-          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048 }
+          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048; mic = 'off' }
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
   $c.inputs = To-Hash $c.inputs; $c.monOff = @($c.monOff | ? { $_ })
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
@@ -152,19 +152,21 @@ function Merge-Settings($cfg, $m) {
   if ($null -ne $m.k) { $cfg.km = [bool]$m.k }        # DeskGlide 4 settings: a DeskGlide 3 peer doesn't send them, keep ours
   if ($m.kh) { $cfg.kmHost = [string]$m.kh }
   if ($null -ne $m.mo) { $cfg.monOff = @($m.mo | ? { $_ }) }
+  if ($m.mc) { $cfg.mic = [string]$m.mc }
   $true
 }
 # h is for DeskGlide 2 peers (it had a per-PC headphones flag); ly is DeskGlide's layout; l is Synergy's, from the server
 # DeskGlide 4 adds ver, sn (screen name), k/kh (keyboard sharing, keyboard PC), fp (this PC's Deskflow certificate),
 # mi (this PC's input on each monitor), mo (monitors that don't follow the mouse) and hk/ha (a hotkey press, for 10 s:
-# its time and the PC it showed), fo (files copied here: { id; n = how many; b = bytes; names })
+# its time and the PC it showed), fo (files copied here: { id; n = how many; b = bytes; names }), mc (microphone mode) and
+# vc (VB-Cable is installed here)
 function State-Json($cfg) {
   @{ n = $Name; t = $S.t; s = $S.server; sa = ($S.active -eq 'me'); i = (My-Input); h = ($cfg.hp -eq $Name)
      m = $cfg.monitor; am = $cfg.audio; p = $cfg.paused; st = $cfg.syncAt; hp = $cfg.hp; v = $cfg.vol; ly = $cfg.layout
      l = @($(if ($S.server) { $S.links | % { "$($_.from) $($_.dir) $($_.to)" } }))
      ver = $Proto; sn = $S.screen; k = $cfg.km; kh = $cfg.kmHost; fp = $S.fp; mi = $cfg.inputs; mo = @($cfg.monOff)
      hk = $(if ((Now-Ms) - [long]$S.hk -lt 10000) { $S.hk } else { 0 }); ha = $S.hkTo
-     fo = $(if ($cfg.files) { $S.offer } else { $null }) } | ConvertTo-Json -Compress -Depth 4
+     fo = $(if ($cfg.files) { $S.offer } else { $null }); mc = $cfg.mic; vc = ($S.cable -ge 0) } | ConvertTo-Json -Compress -Depth 4
 }
 # The notice for files on the clipboard: small, so it fits in the state message; the names are only for the window
 function File-Offer([string]$id, [string[]]$paths, [long]$bytes) {
@@ -250,6 +252,38 @@ function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active) {
   "This PC's sound plays in the headphones on $peer while the mouse is here."
 }
 
+# What this PC's audio threads do: send and recv are 0, Sound (1) or Mic (2); dev is the waveOut device to play into (-1 = default).
+# The headphones PC receives the other PC's sound and sends its microphone; the other PC sends sound and plays the mic into VB-Cable.
+function Audio-Modes($cfg, [bool]$online, [string]$active, [int]$peerVer, [bool]$peerCable, [int]$cable) {
+  $here = $cfg.hp -eq $Name; $there = $cfg.hp -and $cfg.hp -eq $cfg.peer
+  $sound = $online -and $cfg.audio -ne 'off' -and -not $cfg.paused
+  $mic = $online -and $cfg.mic -ne 'off' -and -not $cfg.paused -and $peerVer -ge 4
+  $o = @{ send = 0; recv = 0; dev = -1 }
+  if ($here) {
+    if ($sound) { $o.recv = 1 }
+    if ($mic -and $peerCable -and ($cfg.mic -eq 'always' -or $active -eq 'peer')) { $o.send = 2 }   # follow: only while the other PC has the mouse
+  } elseif ($there) {
+    if ($sound) { $o.send = 1 }
+    if ($mic -and $cable -ge 0) { $o.recv = 2; $o.dev = $cable }
+  }
+  $o
+}
+# Why the microphone is or isn't shared, in plain words.
+function Mic-Status($cfg, [bool]$paired, [bool]$online, [string]$active, [int]$peerVer, [bool]$peerCable, [int]$cable) {
+  $peer = $cfg.peer
+  if (-not $paired) { return 'Off: pair with your other PC first.' }
+  if ($cfg.mic -eq 'off') { return 'Off. Choose Follow mouse or Always to use your headset microphone on both PCs.' }
+  if ($cfg.paused) { return 'Off while DeskGlide is paused.' }
+  $here = $cfg.hp -eq $Name; $there = $cfg.hp -and $cfg.hp -eq $peer
+  if (-not $here -and -not $there) { return 'Off: choose which PC your headphones are plugged into (Sound card). The microphone comes from that PC.' }
+  if ($there -and $cable -lt 0) { return "Off: install VB-Audio Virtual Cable on this PC to use the microphone of $peer here." }
+  if (-not $online) { return "Off: waiting for $peer to connect." }
+  if ($peerVer -lt 4) { return "Off: update DeskGlide on $peer to share the microphone." }
+  if ($here -and -not $peerCable) { return "Off: install VB-Audio Virtual Cable on $peer. DeskGlide plays your microphone into it there." }
+  if ($here) { if ($cfg.mic -eq 'always' -or $active -eq 'peer') { return "Your microphone goes to $peer. Apps there use CABLE Output as their microphone." } else { return "Your microphone stays here. It goes to $peer while the mouse is there." } }
+  "The microphone of $peer plays into CABLE Input here. In your apps, choose CABLE Output as the microphone$(if ($cfg.mic -eq 'follow') { '. It is live while the mouse is here' })."
+}
+
 $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $null; activeName = ''; want = $null; wantName = ''
         since = [DateTime]::MinValue; activeSince = Get-Date; inputOk = $false; readAt = [DateTime]::MinValue
         peerAddr = $null; peerSeen = [DateTime]::MinValue; peerInput = 0; peerLinks = @(); lastT = 0; t = [long]0
@@ -260,6 +294,7 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         code = ''; myAddrs = ''; pairStart = Get-Date; pairErr = ''; addrErr = ''; unpairAt = $null; volAt = $null
         wiz = 0; wizDone = $false; iconState = 3; dark = $null; shownAt = $null
         fp = ''; peerFp = ''; peerVer = 0; peerScreen = ''; df = $null; dfSig = ''; dfRole = ''; dfAt = [DateTime]::MinValue; dfRetryAt = [DateTime]::MinValue
+        cable = -1; cableAt = [DateTime]::MinValue; peerCable = $false
         offer = $null; peerOffer = $null; fetchedId = ''; pasted = ''; fileMsg = ''; fileErr = $false; fileSaved = @()
         hk = [long]0; hkTo = ''; hkSeen = [long]0; lastSa = $null; hkSig = ''; hkErr = ''; msgWin = $null
         mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{}
@@ -404,6 +439,25 @@ if ($Test) {
   $S.hk = (Now-Ms) - 20000; Check ((Msg $PA 'PC-A').hk -eq 0) 'old hotkey press not resent'
   $S.hk = 0; $S.hkTo = ''
 
+  # microphone: who sends and plays what, and why not
+  $Name = 'PC-A'; $q = @{ peer = 'PC-B'; hp = 'PC-A'; audio = 'follow'; mic = 'follow'; paused = $false }
+  $m = Audio-Modes $q $true 'me' 4 $true -1; Check ($m.recv -eq 1 -and $m.send -eq 0) 'headphones PC, mouse here: sound in, mic stays'
+  $m = Audio-Modes $q $true 'peer' 4 $true -1; Check ($m.recv -eq 1 -and $m.send -eq 2) 'headphones PC, mouse there: mic goes'
+  $m = Audio-Modes $q $true 'peer' 4 $false -1; Check ($m.send -eq 0) 'mic sent although the other PC has no VB-Cable'
+  $m = Audio-Modes $q $true 'peer' 3 $true -1; Check ($m.send -eq 0 -and $m.recv -eq 1) 'mic sent to DeskGlide 3'
+  $q.mic = 'always'; $m = Audio-Modes $q $true 'me' 4 $true -1; Check ($m.send -eq 2) 'mic always'
+  $q.hp = 'PC-B'; $m = Audio-Modes $q $true 'me' 4 $false 3; Check ($m.send -eq 1 -and $m.recv -eq 2 -and $m.dev -eq 3) 'other PC: sound out, mic into CABLE Input'
+  $m = Audio-Modes $q $true 'me' 4 $false -1; Check ($m.send -eq 1 -and $m.recv -eq 0) 'mic played without VB-Cable'
+  $q.audio = 'off'; $q.mic = 'off'; $m = Audio-Modes $q $true 'me' 4 $true 3; Check ($m.send -eq 0 -and $m.recv -eq 0) 'all off'
+  $q.mic = 'follow'; $q.paused = $true; Check ((Audio-Modes $q $true 'me' 4 $true 3).recv -eq 0 -and (Mic-Status $q $true $true 'me' 4 $true 3) -match 'paused') 'paused'
+  $q.paused = $false
+  Check ((Mic-Status $q $true $true 'me' 4 $false -1) -match 'install VB-Audio Virtual Cable on this PC') 'mic: VB-Cable missing here'
+  $q.hp = 'PC-A'; Check ((Mic-Status $q $true $true 'me' 4 $false -1) -match 'install VB-Audio Virtual Cable on PC-B') 'mic: VB-Cable missing there'
+  Check ((Mic-Status $q $true $true 'me' 4 $true -1) -match 'stays here') -and ((Mic-Status $q $true $true 'peer' 4 $true -1) -match 'goes to PC-B') 'mic: follow'
+  Check ((Mic-Status $q $true $true 'me' 3 $true -1) -match 'update DeskGlide') 'mic: DeskGlide 3 peer'
+  $PA.mic = 'off'; $PB.mic = 'always'; $PB.syncAt = 400; Check ((Merge-Settings $PA (Msg $PB 'PC-B')) -and $PA.mic -eq 'always') 'mic mode synced'
+  $S.cable = 2; Check ((Msg $PA 'PC-A').vc -eq $true) 'VB-Cable flag sent'; $S.cable = -1
+
   # encryption: AES-CBC + HMAC round trip, and anything changed or the wrong key is refused
   $pk = [Dg]::DeriveKey('abcd-efgh'); $sk = [Dg]::SessionKey($k2, 'audio', [byte[]](1..16)); $ad = [byte[]](7, 7)
   Check ($sk.Length -eq 32 -and [Dg]::Hex($sk) -ne [Dg]::Hex([Dg]::SessionKey($k2, 'audio', [byte[]](2..17))) -and [Dg]::Hex($sk) -ne [Dg]::Hex([Dg]::SessionKey($k2, 'files', [byte[]](1..16)))) 'session keys differ per nonce and purpose'
@@ -450,9 +504,9 @@ if ($Test) {
   Check ($plan.Count -eq 3 -and -not ($plan | ? { $_.to -ne 17 })) 'plan: DeskGlide 3 peer switches every monitor to its input'
   Check (@(Switch-Plan $mons @() @{} 0).Count -eq 0) 'plan: nothing known, nothing switched'
   Check ((To-Hash $null).Count -eq 0 -and (To-Hash @{ a = '5' }).a -eq 5) 'to-hash'
-  $PA.monOff = @(); $PB.monOff = @('DEL4321'); $PB.syncAt = 200
+  $PA.monOff = @(); $PB.monOff = @('DEL4321'); $PB.syncAt = 600
   Check ((Merge-Settings $PA (Msg $PB 'PC-B')) -and @($PA.monOff) -contains 'DEL4321') 'unchecked monitors synced'
-  $v3.st = 300; Check ((Merge-Settings $PA $v3) -and @($PA.monOff) -contains 'DEL4321') 'DeskGlide 3 message cleared the unchecked monitors'
+  $v3.st = 700; Check ((Merge-Settings $PA $v3) -and @($PA.monOff) -contains 'DEL4321') 'DeskGlide 3 message cleared the unchecked monitors'
 
   # install: only DeskGlide's own files go into the app folder, and the shortcut runs that copy
   $to = Join-Path $env:TEMP "dg-app-$PID"; $copied = @(Copy-App $PSScriptRoot $to)
@@ -570,7 +624,7 @@ function Receive-Control {
     if (-not $S.peerAddr -or -not $S.peerAddr.Equals($ep.Address)) { Say "Found $($m.n) at $($ep.Address)." }
     $S.peerAddr = $ep.Address; $S.peerSeen = Get-Date; $S.peerInput = [int]$m.i
     $S.peerVer = [int]$m.ver; $S.peerFp = [string]$m.fp; $S.peerScreen = if ($m.sn) { [string]$m.sn } else { [string]$m.n }
-    $S.peerInputs = To-Hash $m.mi; $S.peerOffer = $m.fo
+    $S.peerInputs = To-Hash $m.mi; $S.peerOffer = $m.fo; $S.peerCable = [bool]$m.vc
     # remember the address for the next start; only replace it once it went quiet, so a peer on two adapters doesn't flip-flop
     if ($S.fixedIp -and $S.fixedIp.Equals($ep.Address)) { $S.fixedSeen = Get-Date }
     elseif (((Get-Date) - $S.fixedSeen).TotalSeconds -gt 10) { $C.peerAddress = "$($ep.Address)"; $S.fixedIp = $ep.Address; $S.fixedSeen = Get-Date; Save-Config }
@@ -940,16 +994,16 @@ function Tick {
     Once inputs 'Almost done: show each PC on the monitor once. Move the mouse to it and, if the screen does not follow, press the monitor''s input button.'
   }
 
-  # audio: the PC with the headphones receives, the other one sends
+  # audio: the PC with the headphones receives the other PC's sound and sends its microphone; the other PC the opposite
   # ponytail: audio is authenticated (HMAC) but not encrypted; anyone on the LAN can listen. Add AES-CTR if that matters.
-  $on = $online -and $C.audio -ne 'off' -and -not $C.paused
+  if (($now - $S.cableAt).TotalSeconds -ge 30) { $S.cableAt = $now; $S.cable = [Dg]::FindOutput('CABLE Input') }
+  $a = Audio-Modes $C $online $S.active $S.peerVer $S.peerCable $S.cable
   [Dg]::Key = $S.key
   [Dg]::Target = if ($S.peerAddr) { New-Object Net.IPEndPoint($S.peerAddr, $AudioPort) } else { $null }
-  [Dg]::SendOn = $on -and $C.hp -and $C.hp -eq $C.peer
-  [Dg]::RecvOn = $on -and $C.hp -eq $Name
+  [Dg]::SendMode = $a.send; [Dg]::RecvMode = $a.recv; [Dg]::RecvDevice = $a.dev
   [Dg]::RemoteOn = $C.audio -eq 'both' -or $S.active -eq 'peer'
   [Dg]::Volume = [Math]::Max(0, [Math]::Min(100, [int]$C.vol)) / 100
-  if ([Dg]::RecvOn -and $C.audio -eq 'follow' -and $S.active -eq 'peer') { [Dg]::MuteOthers($true, $PID) }
+  if ($a.recv -eq [Dg]::Sound -and $C.audio -eq 'follow' -and $S.active -eq 'peer') { [Dg]::MuteOthers($true, $PID) }
   elseif ([Dg]::Muted.Count) { [Dg]::MuteOthers($false, $PID) }
   Save-Muted
   if ([Dg]::LastError) { Say "Audio: $([Dg]::LastError)" error }
@@ -1231,6 +1285,24 @@ $xaml = @'
               <TextBlock x:Name="AudioWhy" Grid.Column="1" Style="{StaticResource Body}"/>
             </Grid></Border>
           </StackPanel></Border>
+          <Border Style="{StaticResource CardBox}"><StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE720;"/><TextBlock Style="{StaticResource H}" Text="Microphone"/></StackPanel>
+            <Border Style="{StaticResource InsetBox}"><UniformGrid Rows="1">
+              <RadioButton x:Name="MFollow" GroupName="mic" Style="{StaticResource Seg}" Content="Follow mouse"/>
+              <RadioButton x:Name="MAlways" GroupName="mic" Style="{StaticResource Seg}" Content="Always"/>
+              <RadioButton x:Name="MOff" GroupName="mic" Style="{StaticResource Seg}" Content="Off"/>
+            </UniformGrid></Border>
+            <TextBlock Style="{StaticResource Sub}" Margin="0,8,0,0" Text="The microphone of the headphones PC, usable in apps on the other PC."/>
+            <Border Style="{StaticResource InsetBox}" Padding="12,9" Margin="0,12,0,0"><Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
+              <Ellipse x:Name="MicDot" Width="8" Height="8" Margin="0,6,10,0" VerticalAlignment="Top"/>
+              <TextBlock x:Name="MicWhy" Grid.Column="1" Style="{StaticResource Body}"/>
+            </Grid></Border>
+            <StackPanel x:Name="CableRow" Margin="0,12,0,0">
+              <TextBlock Style="{StaticResource Sub}" Text="VB-Audio Virtual Cable is a free virtual microphone. Its license doesn't allow DeskGlide to include or download it, so install it yourself once (it needs a restart):"/>
+              <TextBlock Style="{StaticResource Sub}" Margin="0,4,0,0"><Hyperlink x:Name="CableLink" Foreground="{DynamicResource Accent}">vb-audio.com/Cable</Hyperlink></TextBlock>
+            </StackPanel>
+          </StackPanel></Border>
         </StackPanel>
 
         <StackPanel Grid.Column="4">
@@ -1430,6 +1502,10 @@ function New-Window {
   On AFollow Checked { Set-Audio 'follow' }
   On ABoth Checked { Set-Audio 'both' }
   On AOff Checked { Set-Audio 'off' }
+  On MFollow Checked { if ($C.mic -ne 'follow') { $C.mic = 'follow'; Changed } }
+  On MAlways Checked { if ($C.mic -ne 'always') { $C.mic = 'always'; Changed } }
+  On MOff Checked { if ($C.mic -ne 'off') { $C.mic = 'off'; Changed } }
+  On CableLink Click { Start-Process 'https://vb-audio.com/Cable/' }
   On HpMe Checked { Set-Hp $Name }
   On HpPeer Checked { Set-Hp $C.peer }
   On Vol ValueChanged { $v = [int]$ui.Vol.Value; if ($v -ne $C.vol) { $C.vol = $v; $S.volAt = Get-Date } }
@@ -1613,7 +1689,7 @@ function Update-Ui {
   if (-not $S.volAt -and $ui.Vol.Value -ne $C.vol) { $ui.Vol.Value = $C.vol }
   $ui.VolPct.Text = "$($C.vol)%"
   $ui.AudioWhy.Text = Audio-Status $C $paired $online $S.active
-  $ui.AudioDot.Fill = Brush $(if ([Dg]::SendOn -or [Dg]::RecvOn) { 'Good' } else { 'Fg2' })
+  $ui.AudioDot.Fill = Brush $(if ([Dg]::SendMode -eq [Dg]::Sound -or [Dg]::RecvMode -eq [Dg]::Sound) { 'Good' } else { 'Fg2' })
 
   # files
   $ui.FilesToggle.IsChecked = $C.files
@@ -1621,6 +1697,12 @@ function Update-Ui {
   $ui.FileMsg.Text = if (-not $C.files) { 'Off.' } elseif ($S.fileMsg) { $S.fileMsg } elseif ($S.peerOffer -and $S.peerOffer.id -ne $S.fetchedId) { "Copied on ${peer}: $(Offer-Text $S.peerOffer). They come over when the mouse moves here." } else { 'Nothing copied yet.' }
   $ui.FileMsg.Foreground = Brush $(if ($S.fileErr) { 'Bad' } else { 'Fg' })
   Show-If $ui.FileBar $busy; if ($busy -and [Files]::Total -gt 0) { $ui.FileBar.Value = [Files]::Done / [Files]::Total }
+
+  # microphone
+  $ui.MFollow.IsChecked = $C.mic -eq 'follow'; $ui.MAlways.IsChecked = $C.mic -eq 'always'; $ui.MOff.IsChecked = $C.mic -eq 'off'
+  $ui.MicWhy.Text = Mic-Status $C $paired $online $S.active $S.peerVer $S.peerCable $S.cable
+  $ui.MicDot.Fill = Brush $(if ([Dg]::SendMode -eq [Dg]::Mic -or [Dg]::RecvMode -eq [Dg]::Mic) { 'Good' } else { 'Fg2' })
+  Show-If $ui.CableRow ($C.mic -ne 'off' -and $paired -and (($C.hp -eq $C.peer -and $S.cable -lt 0) -or ($C.hp -eq $Name -and -not $S.peerCable)))
 
   # pairing
   $waited = ((Get-Date) - $S.pairStart).TotalSeconds
@@ -1756,7 +1838,7 @@ try {
   try { Add-Content -LiteralPath $logPath $msg } catch {}
   if ($Console) { throw } else { [void][Windows.Forms.MessageBox]::Show($msg, 'DeskGlide', 'OK', 'Error') }
 } finally {
-  [Dg]::SendOn = $false; [Dg]::RecvOn = $false
+  [Dg]::SendMode = 0; [Dg]::RecvMode = 0
   if ($S.df) { try { $S.df.Kill() } catch {} }   # Deskflow runs only while DeskGlide does
   if ([Dg]::Detached) { [void][Dg]::Reattach() }   # never leave a monitor off the desktop
   if ([Dg]::Muted.Count) { [Dg]::MuteOthers($false, $PID) }

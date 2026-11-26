@@ -521,29 +521,56 @@ public static class Dg {
     return rate >= 8000 && rate <= 192000 && ch >= 1 && ch <= 2 && (n - 8) % (ch * 2) == 0;
   }
 
-  // ---------- audio thread: DeskGlide.ps1 sets these flags, the thread does the rest ----------
-  public static volatile bool SendOn, RecvOn, RemoteOn;
+  // ---------- audio threads: DeskGlide.ps1 sets these flags, the threads do the rest ----------
+  // Each PC sends one stream and receives one: the headphones PC receives the other PC's sound and sends its microphone,
+  // the other PC sends its sound and plays that microphone into VB-Cable. So one port and one packet format serve both.
+  public const int Sound = 1, Mic = 2;
+  public static volatile int SendMode, RecvMode;   // 0 off, Sound (loopback of the default output) or Mic (default microphone)
+  public static volatile int RecvDevice = -1;      // waveOut device to play into: -1 = default output, else CABLE Input
+  public static volatile bool RemoteOn;
   public static volatile IPEndPoint Target;
   public static volatile byte[] Key;
   public static int Sent, Got, Bad;
   public static string LastError = "";
 
   public static void StartAudio(int port) {
-    var t = new Thread(() => AudioLoop(port)); t.IsBackground = true; t.Start();
+    var t = new Thread(SendLoop); t.IsBackground = true; t.Start();
+    var r = new Thread(() => RecvLoop(port)); r.IsBackground = true; r.Start();
   }
-  static void AudioLoop(int port) {
+  static void SendLoop() {
     while (true) {
       try {
-        if (SendOn) { if (udp == null) udp = new UdpClient(); Sent += PumpSend(100); }
-        else StopCapture();
-        if (RecvOn) { if (rx == null) { rx = new UdpClient(port); rx.Client.ReceiveTimeout = 20; } Got += PumpReceive(100); }
-        else { CloseOut(); if (rx != null) { rx.Close(); rx = null; } }
-        if (!SendOn && !RecvOn) Thread.Sleep(100);
+        if (SendMode != capMode) StopCapture();   // switched between sound and microphone
+        if (SendMode != 0) { if (udp == null) udp = new UdpClient(); Sent += PumpSend(100); } else Thread.Sleep(100);
+      } catch (Exception e) { LastError = e.Message; Thread.Sleep(1000); }
+    }
+  }
+  static void RecvLoop(int port) {
+    while (true) {
+      try {
+        if (RecvMode != 0) { if (rx == null) { rx = new UdpClient(port); rx.Client.ReceiveTimeout = 20; } Got += PumpReceive(100); }
+        else { CloseOut(); if (rx != null) { rx.Close(); rx = null; } Thread.Sleep(100); }
       } catch (Exception e) { LastError = e.Message; Thread.Sleep(1000); }
     }
   }
 
-  // ---------- WASAPI loopback capture (COM interop) ----------
+  // waveOut device whose name starts with this ("CABLE Input" for VB-Audio Virtual Cable), or -1
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  struct WAVEOUTCAPS { public ushort mid, pid; public uint ver; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string name; public uint formats; public ushort ch, res; public uint support; }
+  [DllImport("winmm.dll")] static extern int waveOutGetNumDevs();
+  [DllImport("winmm.dll", CharSet=CharSet.Unicode)] static extern int waveOutGetDevCaps(IntPtr id, ref WAVEOUTCAPS c, int size);
+  public static string[] OutputDevices() {
+    var o = new List<string>();
+    for (int i = 0, n = waveOutGetNumDevs(); i < n; i++) { var c = new WAVEOUTCAPS(); o.Add(waveOutGetDevCaps(new IntPtr(i), ref c, Marshal.SizeOf(c)) == 0 ? c.name : ""); }
+    return o.ToArray();
+  }
+  public static int FindOutput(string prefix) {
+    var d = OutputDevices();
+    for (int i = 0; i < d.Length; i++) if (d[i].StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return i;
+    return -1;
+  }
+
+  // ---------- WASAPI capture: loopback of the default output, or the default microphone (COM interop) ----------
   [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorCo {}
   [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
   interface IMMDeviceEnumerator {
@@ -575,7 +602,7 @@ public static class Dg {
   }
   static void Check(int hr) { if (hr < 0) Marshal.ThrowExceptionForHR(hr); }
 
-  static IAudioClient client; static IAudioCaptureClient capture;
+  static IAudioClient client; static IAudioCaptureClient capture; static int capMode;
   static int srcCh, srcRate, srcBits; static bool srcFloat;
   static UdpClient udp; static ushort seq;
   static byte[] outBuf = new byte[4096]; static int outLen;
@@ -583,19 +610,20 @@ public static class Dg {
 
   static void InitCapture() {
     var en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCo();
-    IMMDevice dev; Check(en.GetDefaultAudioEndpoint(0, 0, out dev));   // eRender, eConsole
+    int mode = SendMode; bool mic = mode == Mic;
+    IMMDevice dev; Check(en.GetDefaultAudioEndpoint(mic ? 1 : 0, 0, out dev));   // eCapture or eRender, eConsole
     Guid iid = typeof(IAudioClient).GUID; object o;
     Check(dev.Activate(ref iid, 23, IntPtr.Zero, out o)); client = (IAudioClient)o;
     IntPtr fmt; Check(client.GetMixFormat(out fmt));
     int tag = (ushort)Marshal.ReadInt16(fmt, 0);
     srcCh = Marshal.ReadInt16(fmt, 2); srcRate = Marshal.ReadInt32(fmt, 4); srcBits = Marshal.ReadInt16(fmt, 14);
     srcFloat = tag == 3 || (tag == 0xFFFE && Marshal.ReadInt32(fmt, 24) == 3);
-    try { Check(client.Initialize(0, 0x00020000, 1000000, 0, fmt, IntPtr.Zero)); }   // shared, LOOPBACK, 100 ms
+    try { Check(client.Initialize(0, mic ? 0 : 0x00020000, 1000000, 0, fmt, IntPtr.Zero)); }   // shared, LOOPBACK for sound, 100 ms
     finally { Marshal.FreeCoTaskMem(fmt); }
     iid = typeof(IAudioCaptureClient).GUID;
     Check(client.GetService(ref iid, out o)); capture = (IAudioCaptureClient)o;
     Check(client.Start());
-    outLen = 0;
+    outLen = 0; capMode = mode;
   }
 
   static void StopCapture() {
@@ -603,7 +631,7 @@ public static class Dg {
     try { client.Stop(); } catch {}
     if (capture != null) Marshal.ReleaseComObject(capture);
     Marshal.ReleaseComObject(client);
-    capture = null; client = null;
+    capture = null; client = null; capMode = 0;
   }
 
   public static short ToPcm16(float v) {
@@ -668,7 +696,7 @@ public static class Dg {
   const int Prebuffer = 2;   // after a gap, wait for 20 ms of audio before playing (fewer clicks)
 
   static UdpClient rx;
-  static IntPtr wave = IntPtr.Zero; static int wRate, wCh, blockBytes;
+  static IntPtr wave = IntPtr.Zero; static int wRate, wCh, wDev = -2, blockBytes;
   static IntPtr[] hdrs, datas; static bool[] busy;
   static Queue<byte[]> pending = new Queue<byte[]>();
   static byte[] fill; static int fillLen;
@@ -681,9 +709,9 @@ public static class Dg {
       try { p = rx.Receive(ref ep); } catch (SocketException) { Feed(); continue; }
       int rate, ch; if (!ValidPacket(Key, p, out rate, out ch)) { Bad++; continue; }
       got++;
-      if (!RemoteOn) continue;   // follow mode: the mouse is on this PC, drop the other PC's sound
-      if (wave == IntPtr.Zero || rate != wRate || ch != wCh) OpenOut(rate, ch);
-      Scale(p, 8, p.Length - AudioTagLen - 8, Volume);
+      if (RecvMode == Sound && !RemoteOn) continue;   // follow mode: the mouse is on this PC, drop the other PC's sound
+      if (wave == IntPtr.Zero || rate != wRate || ch != wCh || RecvDevice != wDev) OpenOut(rate, ch);
+      if (RecvMode == Sound) Scale(p, 8, p.Length - AudioTagLen - 8, Volume);   // the volume slider is for the other PC's sound, not its microphone
       for (int i = 8, n = p.Length - AudioTagLen; i < n; ) {
         int k = Math.Min(blockBytes - fillLen, n - i);
         Buffer.BlockCopy(p, i, fill, fillLen, k); fillLen += k; i += k;
@@ -717,9 +745,9 @@ public static class Dg {
     CloseOut();
     var f = new WAVEFORMATEX { tag = 1, ch = (ushort)ch, rate = (uint)rate, bits = 16,
                                align = (ushort)(ch * 2), avg = (uint)(rate * ch * 2), cb = 0 };
-    int r = waveOutOpen(out wave, -1, ref f, IntPtr.Zero, IntPtr.Zero, 0);   // default output device
+    int dev = RecvDevice; int r = waveOutOpen(out wave, dev, ref f, IntPtr.Zero, IntPtr.Zero, 0);   // -1 = default output device
     if (r != 0) { wave = IntPtr.Zero; throw new InvalidOperationException("waveOutOpen failed: " + r); }
-    wRate = rate; wCh = ch; blockBytes = rate / 100 * ch * 2;
+    wRate = rate; wCh = ch; wDev = dev; blockBytes = rate / 100 * ch * 2;
     fill = new byte[blockBytes]; fillLen = 0; pending.Clear();
     hdrs = new IntPtr[Blocks]; datas = new IntPtr[Blocks]; busy = new bool[Blocks];
     for (int i = 0; i < Blocks; i++) {
