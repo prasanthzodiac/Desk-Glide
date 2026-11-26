@@ -16,6 +16,7 @@ param(
   [string]$Name = $env:COMPUTERNAME,
   [switch]$NoBroadcast,                   # find the peer by address only
   [switch]$MultiCore,                     # let a second deskflow-core run on this PC (two copies on one PC)
+  [string]$DropDir = "$env:USERPROFILE\Downloads\DeskGlide",   # where files from the other PC are saved
   [string]$Theme,                         # 'light' or 'dark' instead of the Windows setting
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
@@ -55,7 +56,7 @@ function Load-Config {
   $c = @{ peer = ''; key = ''; peerAddress = ''; input = 0; inputOverride = 0; monitor = $true; audio = 'follow'; hp = ''; vol = 100
           paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
           km = $false; kmHost = ''; deskflowExe = ''; inputs = @{}; monOff = @(); detach = $false
-          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left' }
+          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048 }
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
   $c.inputs = To-Hash $c.inputs; $c.monOff = @($c.monOff | ? { $_ })
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
@@ -156,13 +157,24 @@ function Merge-Settings($cfg, $m) {
 # h is for DeskGlide 2 peers (it had a per-PC headphones flag); ly is DeskGlide's layout; l is Synergy's, from the server
 # DeskGlide 4 adds ver, sn (screen name), k/kh (keyboard sharing, keyboard PC), fp (this PC's Deskflow certificate),
 # mi (this PC's input on each monitor), mo (monitors that don't follow the mouse) and hk/ha (a hotkey press, for 10 s:
-# its time and the PC it showed)
+# its time and the PC it showed), fo (files copied here: { id; n = how many; b = bytes; names })
 function State-Json($cfg) {
   @{ n = $Name; t = $S.t; s = $S.server; sa = ($S.active -eq 'me'); i = (My-Input); h = ($cfg.hp -eq $Name)
      m = $cfg.monitor; am = $cfg.audio; p = $cfg.paused; st = $cfg.syncAt; hp = $cfg.hp; v = $cfg.vol; ly = $cfg.layout
      l = @($(if ($S.server) { $S.links | % { "$($_.from) $($_.dir) $($_.to)" } }))
      ver = $Proto; sn = $S.screen; k = $cfg.km; kh = $cfg.kmHost; fp = $S.fp; mi = $cfg.inputs; mo = @($cfg.monOff)
-     hk = $(if ((Now-Ms) - [long]$S.hk -lt 10000) { $S.hk } else { 0 }); ha = $S.hkTo } | ConvertTo-Json -Compress
+     hk = $(if ((Now-Ms) - [long]$S.hk -lt 10000) { $S.hk } else { 0 }); ha = $S.hkTo
+     fo = $(if ($cfg.files) { $S.offer } else { $null }) } | ConvertTo-Json -Compress -Depth 4
+}
+# The notice for files on the clipboard: small, so it fits in the state message; the names are only for the window
+function File-Offer([string]$id, [string[]]$paths, [long]$bytes) {
+  @{ id = $id; n = $paths.Count; b = $bytes; names = @($paths | select -First 3 | % { Split-Path $_ -Leaf } | % { if ($_.Length -gt 60) { $_.Substring(0, 60) } else { $_ } }) }
+}
+function Size-Text([long]$b) { if ($b -ge 1GB) { '{0:0.0} GB' -f ($b / 1GB) } elseif ($b -ge 1MB) { '{0:0.0} MB' -f ($b / 1MB) } else { '{0:0} KB' -f [Math]::Ceiling($b / 1KB) } }
+function Offer-Text($o) {   # "report.pdf", "3 items: a, b, c", with the size
+  if (-not $o) { return '' }
+  $what = if ([int]$o.n -eq 1) { @($o.names)[0] } else { "$($o.n) items: $(@($o.names) -join ', ')$(if ([int]$o.n -gt @($o.names).Count) { ', ...' })" }
+  "$what ($(Size-Text ([long]$o.b)))"
 }
 
 # ---------- hotkeys ----------
@@ -248,6 +260,7 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         code = ''; myAddrs = ''; pairStart = Get-Date; pairErr = ''; addrErr = ''; unpairAt = $null; volAt = $null
         wiz = 0; wizDone = $false; iconState = 3; dark = $null; shownAt = $null
         fp = ''; peerFp = ''; peerVer = 0; peerScreen = ''; df = $null; dfSig = ''; dfRole = ''; dfAt = [DateTime]::MinValue; dfRetryAt = [DateTime]::MinValue
+        offer = $null; peerOffer = $null; fetchedId = ''; pasted = ''; fileMsg = ''; fileErr = $false; fileSaved = @()
         hk = [long]0; hkTo = ''; hkSeen = [long]0; lastSa = $null; hkSig = ''; hkErr = ''; msgWin = $null
         mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{}
         dfPos = 0; dfConn = $false; dfErr = ''; kmWhy = ''; dl = $null; dlTried = $false; dlMsg = ''; dlErr = $false; synergy = $null; synAt = [DateTime]::MinValue }
@@ -391,6 +404,42 @@ if ($Test) {
   $S.hk = (Now-Ms) - 20000; Check ((Msg $PA 'PC-A').hk -eq 0) 'old hotkey press not resent'
   $S.hk = 0; $S.hkTo = ''
 
+  # encryption: AES-CBC + HMAC round trip, and anything changed or the wrong key is refused
+  $pk = [Dg]::DeriveKey('abcd-efgh'); $sk = [Dg]::SessionKey($k2, 'audio', [byte[]](1..16)); $ad = [byte[]](7, 7)
+  Check ($sk.Length -eq 32 -and [Dg]::Hex($sk) -ne [Dg]::Hex([Dg]::SessionKey($k2, 'audio', [byte[]](2..17))) -and [Dg]::Hex($sk) -ne [Dg]::Hex([Dg]::SessionKey($k2, 'files', [byte[]](1..16)))) 'session keys differ per nonce and purpose'
+  $plain = [Text.Encoding]::UTF8.GetBytes('hello, other PC'); $e1 = [Dg]::Encrypt($sk, $ad, $plain, 0, $plain.Length); $e2 = [Dg]::Encrypt($sk, $ad, $plain, 0, $plain.Length)
+  Check ([Text.Encoding]::UTF8.GetString([Dg]::Decrypt($sk, $ad, $e1, 0, $e1.Length)) -eq 'hello, other PC' -and $e1.Length -eq 16 + 16 + 16) 'encrypt/decrypt round trip'
+  Check ([Dg]::Hex($e1) -ne [Dg]::Hex($e2) -and -not ([Text.Encoding]::ASCII.GetString($e1)).Contains('hello')) 'random IV, no plain text'
+  foreach ($i in 0, 20, ($e1.Length - 1)) { $t = [byte[]]$e1.Clone(); $t[$i] = $t[$i] -bxor 1; Check ($null -eq [Dg]::Decrypt($sk, $ad, $t, 0, $t.Length)) "tampered byte $i accepted" }
+  Check ($null -eq [Dg]::Decrypt($sk, [byte[]](7, 8), $e1, 0, $e1.Length) -and $null -eq [Dg]::Decrypt($pk, $ad, $e1, 0, $e1.Length) -and $null -eq [Dg]::Decrypt($sk, $ad, $e1, 0, 40)) 'other sequence, wrong key or cut short accepted'
+  $big = New-Object byte[] 70000; (New-Object Random 1).NextBytes($big); $eb = [Dg]::Encrypt($sk, $null, $big, 5, 65536)
+  Check ([Dg]::Hex([Dg]::Decrypt($sk, $null, $eb, 0, $eb.Length)) -eq [Dg]::Hex($big[5..65540])) 'large block with offset'
+
+  # files: offer message, safe names, and a real encrypted transfer over loopback TCP
+  $o = File-Offer 'ab12' @('C:\x\report.pdf', 'C:\x\Photos', 'C:\x\b.txt', 'C:\x\c.txt') 3145728
+  Check ($o.id -eq 'ab12' -and $o.n -eq 4 -and $o.b -eq 3145728 -and @($o.names).Count -eq 3 -and $o.names[1] -eq 'Photos') 'file offer: count, size, 3 names'
+  $S.offer = $o; $PA.files = $true; $fm = Msg $PA 'PC-A'
+  Check ($fm.fo.id -eq 'ab12' -and (Offer-Text $fm.fo) -eq '4 items: report.pdf, Photos, b.txt, ... (3.0 MB)') 'file offer in the state message'
+  $PA.files = $false; Check ($null -eq (Msg $PA 'PC-A').fo) 'no file offer while file copy is off'
+  $S.offer = $null; Check ((Offer-Text (File-Offer 'x' @('C:\a.txt') 100)) -eq 'a.txt (1 KB)') 'offer text, one file'
+  $root = Join-Path $env:TEMP "dg-files-$PID"
+  Check ([Files]::SafePath($root, 'dir/sub/a.txt') -eq "$root\dir\sub\a.txt") 'safe path'
+  foreach ($bad in '../x', 'a/../../x', '/x', 'C:/x', 'a\b', 'a//b', 'con:', 'a/./b', '', 'x.', 'a/b ') { Check ($null -eq [Files]::SafePath($root, $bad)) "unsafe path accepted: '$bad'" }
+  $src = Join-Path $root 'src'; $dst = Join-Path $root 'dst'
+  [void](New-Item -ItemType Directory -Force "$src\Photos\2026\empty", $dst); [IO.File]::WriteAllBytes("$src\report.pdf", $big)
+  Set-Content "$src\Photos\2026\a.txt" 'one'; Set-Content "$src\Photos\b.txt" 'two'; Set-Content "$dst\report.pdf" 'already here'
+  Check ([Files]::Unique($dst, 'report.pdf') -eq "$dst\report (2).pdf" -and [Files]::Unique($dst, 'new.txt') -eq "$dst\new.txt") 'unique names'
+  Check ([Files]::Measure([string[]]@("$src\report.pdf", "$src\Photos"), 1GB) -eq 70000 + 5 + 5 -and [Files]::Measure([string[]]@("$src\Photos"), 5) -eq -1) 'measure, limit'
+  $fport = 47000 + $PID % 1000; [Files]::Key = $pk; [Files]::Serve($fport); [Files]::Offer([string[]]@("$src\report.pdf", "$src\Photos"))
+  function Pull($key, $id, $limit) { [Files]::Fetch('127.0.0.1', $fport, $key, $id, $dst, $limit); $t0 = Get-Date; while ([Files]::Status -eq 'busy' -and ((Get-Date) - $t0).TotalSeconds -lt 15) { Start-Sleep -Milliseconds 50 }; [Files]::Status }
+  Check ((Pull $k2 ([Files]::OfferId) 1GB) -match 'not paired') 'transfer with the wrong key not refused'
+  Check ((Pull $pk 'other-id' 1GB) -match 'no longer offers') 'transfer of an old offer not refused'
+  Check ((Pull $pk ([Files]::OfferId) 100) -match 'larger than the limit') 'receiver limit not applied'
+  $st = Pull $pk ([Files]::OfferId) 1GB; $got = @([Files]::Result)
+  Check ($st -eq 'ok' -and $got.Count -eq 2 -and $got[0] -eq "$dst\report (2).pdf" -and $got[1] -eq "$dst\Photos") "transfer: $st $($got -join ',')"
+  Check ([Dg]::Hex([IO.File]::ReadAllBytes("$dst\report (2).pdf")) -eq [Dg]::Hex($big) -and (Get-Content "$dst\Photos\2026\a.txt") -eq 'one' -and (Test-Path "$dst\Photos\2026\empty") -and -not (Get-ChildItem $dst -Filter '.incoming*')) 'transfer: contents, empty folder, no leftovers'
+  [Files]::Offer($null); Remove-Item -Recurse -Force $root
+
   # monitors: each PC's input per monitor, unchecked monitors stay put, DeskGlide 3 peers have one input for all
   $mons = @(@{ id = 'MSI4CE8'; path = 'p1'; name = 'MAG 275QF' }, @{ id = 'DEL4321'; path = 'p2'; name = 'DELL U2720Q' }, @{ id = 'DEL4321-2'; path = 'p3'; name = 'DELL U2720Q' })
   $pi = To-Hash ('{"MSI4CE8":17,"DEL4321":16}' | ConvertFrom-Json)
@@ -469,7 +518,7 @@ if ($Install -or $Uninstall) {
 }
 
 # ---------------------------------------------------------------- the app
-function Say([string]$text, [string]$kind) {   # kind: '' = log only, 'error' / 'info' = also a balloon (info only for pairing success)
+function Say([string]$text, [string]$kind) {   # kind: '' = log only, 'error' / 'info' = also a balloon (info: pairing succeeded, files ready)
   if ($kind -eq 'error') {
     if ($text -eq $S.lastErr -and ((Get-Date) - $S.lastErrAt).TotalMinutes -lt 5) { return }
     $S.lastErr = $text; $S.lastErrAt = Get-Date
@@ -521,7 +570,7 @@ function Receive-Control {
     if (-not $S.peerAddr -or -not $S.peerAddr.Equals($ep.Address)) { Say "Found $($m.n) at $($ep.Address)." }
     $S.peerAddr = $ep.Address; $S.peerSeen = Get-Date; $S.peerInput = [int]$m.i
     $S.peerVer = [int]$m.ver; $S.peerFp = [string]$m.fp; $S.peerScreen = if ($m.sn) { [string]$m.sn } else { [string]$m.n }
-    $S.peerInputs = To-Hash $m.mi
+    $S.peerInputs = To-Hash $m.mi; $S.peerOffer = $m.fo
     # remember the address for the next start; only replace it once it went quiet, so a peer on two adapters doesn't flip-flop
     if ($S.fixedIp -and $S.fixedIp.Equals($ep.Address)) { $S.fixedSeen = Get-Date }
     elseif (((Get-Date) - $S.fixedSeen).TotalSeconds -gt 10) { $C.peerAddress = "$($ep.Address)"; $S.fixedIp = $ep.Address; $S.fixedSeen = Get-Date; Save-Config }
@@ -542,7 +591,7 @@ function Set-Active($new, [string]$screen) {
   Say "Mouse is on $(if ($new -eq 'me') { 'this PC' } elseif ($C.peer) { $C.peer } else { $screen })."
   if ($S.server) { Send-State }   # tell the peer right away; it wakes its screen when the mouse arrives there
   if ($new -eq 'me' -and $old) { [Dg]::WakeDisplay() }   # so the monitor doesn't switch to a sleeping screen
-  if ($new -eq 'me') { Reattach-Monitors }
+  if ($new -eq 'me') { Reattach-Monitors; Fetch-Files }
   # The PC on screen sends the switch: many monitors ignore DDC from an input they aren't showing.
   if ($old -eq 'me' -and $new -eq 'peer' -and $C.monitor -and -not $C.paused) { Switch-Monitor }
   if ($C.onSwitch) {
@@ -577,6 +626,43 @@ function Set-HotkeyText([string]$which, [string]$text) {   # from the Settings c
   if (-not $k) { $S.hkErr = "`"$text`" isn't a hotkey DeskGlide understands. Use Ctrl, Alt, Shift or Win with an arrow, a letter, a digit or F1-F24, like Ctrl+Alt+Right."; return }
   if ($C[$which] -eq $k.text) { $S.hkErr = ''; return }
   $C[$which] = $k.text; Save-Config; Apply-Hotkeys ($S.dfRole -eq 'server')
+}
+# ---------- files: copy on one PC, paste on the other ----------
+function Check-Clipboard {   # the clipboard changed: offer copied files to the other PC
+  [MsgWin]::ClipChanged = $false
+  if (-not $C.files) { return }
+  $list = @(); try { if ([Windows.Forms.Clipboard]::ContainsFileDropList()) { $list = @([Windows.Forms.Clipboard]::GetFileDropList()) } } catch { return }   # busy: next change
+  if (($list -join '|') -eq $S.pasted -and $list.Count) { return }   # the files DeskGlide just put there
+  if (-not $list.Count) { if ($S.offer) { $S.offer = $null; [Files]::Offer($null); Send-State }; return }
+  $limit = [long]$C.fileLimitMB * 1MB
+  $bytes = try { [Files]::Measure([string[]]$list, $limit) } catch { -2 }
+  if ($bytes -lt 0) {
+    $S.offer = $null; [Files]::Offer($null); Send-State
+    $S.fileErr = $true; $S.fileMsg = if ($bytes -eq -1) { "The files you copied are over the $(Size-Text $limit) limit (Settings), so they stay here." } else { "DeskGlide can't read the files you copied." }
+    Say $S.fileMsg; return
+  }
+  [Files]::Offer([string[]]$list); $S.offer = File-Offer ([Files]::OfferId) $list $bytes
+  $S.fileErr = $false; $S.fileMsg = "Copied here: $(Offer-Text $S.offer). Move the mouse to $(Peer-Label) and paste."
+  Say "Offering $(Offer-Text $S.offer)"; Send-State
+}
+function Fetch-Files {   # the mouse arrived here: pull the other PC's copied files
+  $o = $S.peerOffer
+  if (-not $C.files -or -not $o -or -not $o.id -or $o.id -eq $S.fetchedId -or [Files]::Status -eq 'busy' -or -not $S.peerAddr) { return }
+  $S.fetchedId = [string]$o.id; $S.fileErr = $false; $S.fileMsg = "Getting $(Offer-Text $o) from $(Peer-Label)..."
+  Say "Fetching $(Offer-Text $o)"
+  [Files]::Fetch("$($S.peerAddr)", $PeerPort + 1, $S.key, [string]$o.id, $DropDir, [long]$C.fileLimitMB * 1MB)
+}
+function Poll-Fetch {
+  $st = [Files]::Status
+  if ($st -eq '' -or $st -eq 'busy') { return }
+  [Files]::Status = ''
+  if ($st -ne 'ok') { $S.fileErr = $true; $S.fileMsg = "Couldn't get the files: $($st -replace '^error: ')"; Say $S.fileMsg error; return }
+  $S.fileSaved = @([Files]::Result)
+  $sc = New-Object Collections.Specialized.StringCollection; foreach ($p in $S.fileSaved) { [void]$sc.Add($p) }
+  $S.pasted = $S.fileSaved -join '|'
+  try { [Windows.Forms.Clipboard]::SetFileDropList($sc) } catch { Say "The files are in $DropDir, but the clipboard was busy." }
+  $S.fileErr = $false; $S.fileMsg = "Ready to paste: $(($S.fileSaved | % { Split-Path $_ -Leaf }) -join ', '). Saved in $DropDir."
+  Say "Files ready to paste (Ctrl+V): $(($S.fileSaved | % { Split-Path $_ -Leaf }) -join ', ')" info
 }
 function Refresh-Monitors {   # not while one is off the desktop: Windows doesn't list it then
   if ([Dg]::Detached) { return }
@@ -816,6 +902,7 @@ function Tick {
   if ($showEvt.WaitOne(0)) { Show-Window }   # DeskGlide was started again: show this copy instead
   $hk = [MsgWin]::Pressed
   if ($hk) { [MsgWin]::Pressed = 0; Show-Pc $(if ($hk -eq 1) { 'peer' } else { 'me' }) }
+  if ([MsgWin]::ClipChanged) { Check-Clipboard }
   if ($S.n++ % 5) { return }   # the rest twice a second
 
   $online = Peer-Online
@@ -828,6 +915,7 @@ function Tick {
   if ($S.n % 30 -eq 1) { Read-Layout }   # every 3 s
   Poll-DeskflowDownload
   Sync-Deskflow
+  Poll-Fetch; [Files]::Key = $S.key
   if ($win -and $win.IsVisible -and ($now - $S.synAt).TotalSeconds -ge 5) { $S.synAt = $now; $S.synergy = @(Get-Process -ErrorAction SilentlyContinue | ? { $_.ProcessName -match '^synergy' }).Count }
   Check-Switch
   if ($S.volAt -and ($now - $S.volAt).TotalMilliseconds -ge 400) { $S.volAt = $null; Changed }   # slider: sync when it stops moving
@@ -1143,6 +1231,9 @@ $xaml = @'
               <TextBlock x:Name="AudioWhy" Grid.Column="1" Style="{StaticResource Body}"/>
             </Grid></Border>
           </StackPanel></Border>
+        </StackPanel>
+
+        <StackPanel Grid.Column="4">
           <Border Style="{StaticResource CardBox}"><StackPanel>
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE71B;"/><TextBlock Style="{StaticResource H}" Text="Pairing"/></StackPanel>
             <StackPanel x:Name="PairedBox">
@@ -1172,9 +1263,15 @@ $xaml = @'
               <Button x:Name="PairCancel" Style="{StaticResource Link}" Content="Cancel" HorizontalAlignment="Left" Margin="0,8,0,0"/>
             </StackPanel></Border>
           </StackPanel></Border>
-        </StackPanel>
-
-        <StackPanel Grid.Column="4">
+          <Border Style="{StaticResource CardBox}"><StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE8C8;"/><TextBlock Style="{StaticResource H}" Text="Copy files"/></StackPanel>
+            <CheckBox x:Name="FilesToggle" Style="{StaticResource Switch}"><StackPanel>
+              <TextBlock Text="Copy and paste files between the PCs"/>
+              <TextBlock Style="{StaticResource Sub}" Text="Copy files or folders, move the mouse to the other PC, press Ctrl+V. Sent encrypted."/></StackPanel></CheckBox>
+            <TextBlock x:Name="FileMsg" Style="{StaticResource Body}" Margin="0,12,0,0"/>
+            <ProgressBar x:Name="FileBar" Height="3" Margin="0,8,0,0" Maximum="1" Foreground="{DynamicResource Accent}" Background="{DynamicResource Inset}" BorderThickness="0"/>
+            <TextBlock Style="{StaticResource Sub}" Margin="0,8,0,0"><Hyperlink x:Name="OpenDrop" Foreground="{DynamicResource Accent}">Open received files</Hyperlink></TextBlock>
+          </StackPanel></Border>
           <Border Style="{StaticResource CardBox}"><StackPanel>
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE713;"/><TextBlock Style="{StaticResource H}" Text="Settings"/></StackPanel>
             <CheckBox x:Name="StartupToggle" Style="{StaticResource Switch}" Content="Start with Windows"/>
@@ -1199,6 +1296,8 @@ $xaml = @'
               <StackPanel Grid.Column="2"><TextBlock Style="{StaticResource Sub}" Text="Show this PC"/><TextBox x:Name="HkMe" Margin="0,4,0,0"/></StackPanel>
             </Grid>
             <TextBlock x:Name="HkMsg" Style="{StaticResource Sub}" Margin="0,4,0,0"/>
+            <TextBlock Style="{StaticResource Label}" Text="Largest file copy, in MB"/>
+            <TextBox x:Name="FileLimit"/>
           </StackPanel></Border>
         </StackPanel>
       </Grid>
@@ -1322,7 +1421,7 @@ function New-Window {
   $script:logos = 0..3 | % { [Windows.Media.Imaging.BitmapFrame]::Create((New-Object IO.MemoryStream (, [Dg]::IconPng(176, $_))), 'None', 'OnLoad') }
   $ui.WizLogo.Source = $logos[0]; $ui.BigLogo.Source = $logos[0]
   $ui.Ver.Text = "DeskGlide $Version  -  $Name$(if ($DryRun) { '  -  dry run' })"
-  if ($Shot) { $win.Topmost = $true }
+  if ($Shot) { $win.WindowStartupLocation = 'Manual'; $win.Left = -20000; $win.Top = 0; $win.Height = 1180; $win.ShowActivated = $false; $win.ShowInTaskbar = $false }   # drawn off screen, never takes focus
 
   On MonToggle Checked, Unchecked { if ($C.monitor -ne [bool]$ui.MonToggle.IsChecked) { $C.monitor = -not $C.monitor; Changed } }
   On PauseToggle Checked, Unchecked { if ($C.paused -ne [bool]$ui.PauseToggle.IsChecked) { $C.paused = -not $C.paused; Changed } }
@@ -1347,6 +1446,9 @@ function New-Window {
   On LogPath LostFocus { Set-Log $ui.LogPath.Text }
   On BrowseLog Click { $f = Browse 'Choose the Synergy or Deskflow log file' 'Log files|*.log;*.txt|All files|*.*' "$env:LOCALAPPDATA\synergy-dragon\logs"; if ($f) { Set-Log $f } }
   On Script LostFocus { $C.onSwitch = $ui.Script.Text.Trim(); Save-Config }
+  On FilesToggle Checked, Unchecked { if ($C.files -ne [bool]$ui.FilesToggle.IsChecked) { $C.files = -not $C.files; Save-Config; if (-not $C.files) { $S.offer = $null; [Files]::Offer($null) }; Send-State } }
+  On OpenDrop Click { [void](New-Item -ItemType Directory -Force $DropDir); Start-Process explorer.exe "`"$DropDir`"" }
+  On FileLimit LostFocus { $n = 0; if ([int]::TryParse($ui.FileLimit.Text.Trim(), [ref]$n) -and $n -ge 1 -and $n -le 1048576) { $C.fileLimitMB = $n; Save-Config } }
   On HkPeer LostFocus { Set-HotkeyText 'hotkeyPeer' $ui.HkPeer.Text }
   On HkMe LostFocus { Set-HotkeyText 'hotkeyMe' $ui.HkMe.Text }
   On HkPeer KeyDown { if ($args[1].Key -eq 'Return') { Set-HotkeyText 'hotkeyPeer' $ui.HkPeer.Text } }
@@ -1513,6 +1615,13 @@ function Update-Ui {
   $ui.AudioWhy.Text = Audio-Status $C $paired $online $S.active
   $ui.AudioDot.Fill = Brush $(if ([Dg]::SendOn -or [Dg]::RecvOn) { 'Good' } else { 'Fg2' })
 
+  # files
+  $ui.FilesToggle.IsChecked = $C.files
+  $busy = [Files]::Status -eq 'busy'
+  $ui.FileMsg.Text = if (-not $C.files) { 'Off.' } elseif ($S.fileMsg) { $S.fileMsg } elseif ($S.peerOffer -and $S.peerOffer.id -ne $S.fetchedId) { "Copied on ${peer}: $(Offer-Text $S.peerOffer). They come over when the mouse moves here." } else { 'Nothing copied yet.' }
+  $ui.FileMsg.Foreground = Brush $(if ($S.fileErr) { 'Bad' } else { 'Fg' })
+  Show-If $ui.FileBar $busy; if ($busy -and [Files]::Total -gt 0) { $ui.FileBar.Value = [Files]::Done / [Files]::Total }
+
   # pairing
   $waited = ((Get-Date) - $S.pairStart).TotalSeconds
   Show-If $ui.PairedBox $paired; $ui.PairedText.Text = "Paired with $peer"
@@ -1535,7 +1644,7 @@ function Update-Ui {
   $ui.StartupToggle.IsChecked = Test-Path $lnk; $ui.PauseToggle.IsChecked = $C.paused; $ui.DetachToggle.IsChecked = $C.detach
   $ui.HkMsg.Text = if ($S.hkErr) { $S.hkErr } elseif ($S.dfRole -eq 'server') { 'Deskflow handles these keys now, so the mouse moves too.' } else { 'With keyboard sharing on, the mouse moves too.' }
   $ui.HkMsg.Foreground = Brush $(if ($S.hkErr) { 'Bad' } else { 'Fg2' })
-  foreach ($p in @(@('LogPath', 'synergyLog'), @('AddrSet', 'peerAddress'), @('Script', 'onSwitch'), @('HkPeer', 'hotkeyPeer'), @('HkMe', 'hotkeyMe'))) {
+  foreach ($p in @(@('LogPath', 'synergyLog'), @('AddrSet', 'peerAddress'), @('Script', 'onSwitch'), @('HkPeer', 'hotkeyPeer'), @('HkMe', 'hotkeyMe'), @('FileLimit', 'fileLimitMB'))) {
     if (-not $ui[$p[0]].IsKeyboardFocused) { $ui[$p[0]].Text = $C[$p[1]] }
   }
   $ui.RoleText.Text = if ($S.server) { "This PC is the Synergy server. Log: $($S.log)" } elseif ($C.synergyLog -and -not (Test-Path -LiteralPath $C.synergyLog)) { "This file doesn't exist." } else { "This PC is a Synergy client.$(if (-not $C.synergyLog) { " Empty means Synergy 3's log." })" }
@@ -1556,11 +1665,22 @@ function Update-Ui {
   }
 }
 
-function Save-Shot {   # -Shot: the window as it is on screen
-  $r = [Dg]::FrameRect((New-Object Windows.Interop.WindowInteropHelper $win).Handle)
-  $bmp = New-Object Drawing.Bitmap $r[2], $r[3]
-  $g = [Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($r[0], $r[1], 0, 0, $bmp.Size); $g.Dispose()
-  $bmp.Save($Shot, [Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+function Save-Shot {   # -Shot: the window's content rendered off screen, under a title bar drawn like Windows 11's
+  $root = $win.Content; $root.Background = $win.Background
+  $w = [int]$root.ActualWidth; $h = [int]$root.ActualHeight
+  $rtb = New-Object Windows.Media.Imaging.RenderTargetBitmap $w, $h, 96, 96, ([Windows.Media.PixelFormats]::Pbgra32); $rtb.Render($root)
+  $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder; $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($rtb)); $ms = New-Object IO.MemoryStream; $enc.Save($ms)
+  $body = [Drawing.Image]::FromStream($ms); $bar = 32
+  $bmp = New-Object Drawing.Bitmap $w, ($h + $bar); $g = [Drawing.Graphics]::FromImage($bmp)
+  $g.TextRenderingHint = 'ClearTypeGridFit'; $g.SmoothingMode = 'AntiAlias'
+  $bg = [Drawing.ColorTranslator]::FromHtml($(if ($S.dark) { '#202020' } else { '#F3F3F3' })); $fg = [Drawing.ColorTranslator]::FromHtml($(if ($S.dark) { '#FFFFFF' } else { '#1B1B1B' }))
+  $g.Clear($bg); $g.DrawImage($body, 0, $bar, $w, $h)
+  $g.DrawImage(([Dg]::DrawIcon(16, 0)), 10, 8)
+  $fb = New-Object Drawing.SolidBrush $fg
+  $g.DrawString('DeskGlide', (New-Object Drawing.Font('Segoe UI', 9)), $fb, 34, 8)
+  $glyphs = New-Object Drawing.Font('Segoe Fluent Icons', 7.5)
+  $i = 0; foreach ($c in [char]0xE8BB, [char]0xE922, [char]0xE921) { $g.DrawString([string]$c, $glyphs, $fb, $w - 30 - 46 * $i, 11); $i++ }   # close, maximize, minimize
+  $g.Dispose(); $bmp.Save($Shot, [Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose(); $body.Dispose()
   Say "Saved a screenshot to $Shot"
 }
 
@@ -1609,6 +1729,7 @@ try {
   [void]$udp.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null)   # SIO_UDP_CONNRESET off: ignore ICMP "port unreachable"
   [Dg]::StartAudio($AudioPort)
   $S.msgWin = New-Object MsgWin; Apply-Hotkeys $false
+  [void]$S.msgWin.ListenClipboard(); [Files]::Key = $S.key; [Files]::Serve($Port + 1)   # files: TCP on the control port + 1
   $S.screen = if ($C.screenName) { $C.screenName } else { $Name }
   if ($C.key) { $S.key = [Convert]::FromBase64String($C.key) }
   if ($PairCode) { Set-Key $PairCode }

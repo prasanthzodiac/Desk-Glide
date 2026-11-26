@@ -64,6 +64,147 @@ public class MsgWin : System.Windows.Forms.NativeWindow {
   }
 }
 
+// File copy-paste. The PC where files were copied serves them over TCP; the other PC pulls them when the mouse
+// arrives there. Every frame is encrypted and authenticated (Dg.Encrypt) with a key for this one connection.
+public static class Files {
+  // ---- sender ----
+  public static volatile string OfferId = "";   // the files on this PC's clipboard, as offered to the other PC
+  public static volatile string[] OfferPaths;
+  public static volatile byte[] Key;            // the pairing key
+  public static volatile string ServeError = "";
+  // Total bytes of the files (folders walked), or -1 if over limit. ponytail: walks on the caller's thread, stops at the limit
+  public static long Measure(string[] paths, long limit) {
+    long n = 0;
+    foreach (var p in paths) {
+      if (File.Exists(p)) n += new FileInfo(p).Length;
+      else if (Directory.Exists(p)) foreach (var f in new DirectoryInfo(p).EnumerateFiles("*", SearchOption.AllDirectories)) { n += f.Length; if (n > limit) return -1; }
+      if (n > limit) return -1;
+    }
+    return n;
+  }
+  public static void Offer(string[] paths) { OfferPaths = paths; OfferId = paths == null ? "" : Dg.Hex(Dg.Random(8)); }
+  public static void Serve(int port) {
+    var t = new Thread(() => {
+      var l = new TcpListener(IPAddress.Any, port); l.Start();
+      while (true) { var c = l.AcceptTcpClient(); var w = new Thread(() => ServeOne(c)); w.IsBackground = true; w.Start(); }
+    });
+    t.IsBackground = true; t.Start();
+  }
+  static void ServeOne(TcpClient c) {
+    try {
+      using (c) {
+        c.ReceiveTimeout = 15000; c.SendTimeout = 60000; var s = c.GetStream();
+        byte[] nr = ReadN(s, 16), ns = Dg.Random(16); s.Write(ns, 0, 16);
+        byte[] k = Dg.SessionKey(Key, "files", Cat(nr, ns)); long rx = 0, tx = 0;
+        string id = Encoding.UTF8.GetString(ReadFrame(s, k, 'R', rx++));   // a PC without the pairing key fails here, before anything is sent
+        string[] paths = OfferPaths;
+        if (paths == null || id != OfferId) { WriteFrame(s, k, 'S', tx++, Encoding.UTF8.GetBytes("gone"), 0, 4); return; }
+        var list = new List<KeyValuePair<string, string>>(); var m = new StringBuilder();   // relative path -> full path
+        foreach (var p in paths) {
+          string top = Path.GetFileName(p.TrimEnd('\\'));
+          if (File.Exists(p)) { list.Add(new KeyValuePair<string, string>(top, p)); m.Append("F\t" + new FileInfo(p).Length + "\t" + top + "\n"); continue; }
+          var root = new DirectoryInfo(p); m.Append("D\t" + top + "\n");
+          foreach (var d in root.EnumerateDirectories("*", SearchOption.AllDirectories)) m.Append("D\t" + top + "/" + Rel(root, d.FullName) + "\n");
+          foreach (var f in root.EnumerateFiles("*", SearchOption.AllDirectories)) {
+            string r = top + "/" + Rel(root, f.FullName); list.Add(new KeyValuePair<string, string>(r, f.FullName)); m.Append("F\t" + f.Length + "\t" + r + "\n");
+          }
+        }
+        byte[] mb = Encoding.UTF8.GetBytes("ok\n" + m); WriteFrame(s, k, 'S', tx++, mb, 0, mb.Length);
+        var buf = new byte[65536];
+        foreach (var e in list) using (var f = new FileStream(e.Value, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+          int n; while ((n = f.Read(buf, 0, buf.Length)) > 0) WriteFrame(s, k, 'S', tx++, buf, 0, n);
+        }
+        WriteFrame(s, k, 'S', tx++, buf, 0, 0);   // end
+      }
+    } catch (Exception e) { ServeError = e.Message; }
+  }
+  static string Rel(DirectoryInfo root, string full) { return full.Substring(root.FullName.TrimEnd('\\').Length + 1).Replace('\\', '/'); }
+
+  // ---- receiver ----
+  public static volatile string Status = "";    // "" idle, "busy", "ok", or "error: ..."
+  public static long Done, Total;
+  public static string[] Result;                 // the saved files and folders, top level
+  public static void Fetch(string host, int port, byte[] key, string id, string root, long limit) {
+    Status = "busy"; Done = 0; Total = 0; Result = null;
+    var t = new Thread(() => { try { FetchRun(host, port, key, id, root, limit); Status = "ok"; } catch (Exception e) { Status = "error: " + e.Message; } });
+    t.IsBackground = true; t.Start();
+  }
+  static void FetchRun(string host, int port, byte[] key, string id, string root, long limit) {
+    Directory.CreateDirectory(root);
+    string stage = Path.Combine(root, ".incoming-" + Dg.Hex(Dg.Random(4))); var tops = new List<string>();
+    try {
+      using (var c = new TcpClient()) {
+        c.Connect(host, port); c.ReceiveTimeout = 60000; c.SendTimeout = 15000; var s = c.GetStream();
+        byte[] nr = Dg.Random(16); s.Write(nr, 0, 16); byte[] ns = ReadN(s, 16);
+        byte[] k = Dg.SessionKey(key, "files", Cat(nr, ns)); long rx = 0, tx = 0;
+        byte[] ib = Encoding.UTF8.GetBytes(id); WriteFrame(s, k, 'R', tx++, ib, 0, ib.Length);
+        string man;   // the sender drops a request it cannot decrypt, so a closed connection here means another pairing key
+        try { man = Encoding.UTF8.GetString(ReadFrame(s, k, 'S', rx++)); } catch (IOException) { throw new IOException("the other PC refused: it is not paired with this one"); }
+        if (!man.StartsWith("ok\n")) throw new IOException("the other PC no longer offers these files (copied something else?)");
+        var files = new List<KeyValuePair<string, long>>();
+        foreach (var line in man.Substring(3).Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)) {
+          var a = line.Split('\t'); string rel = a[a.Length - 1];
+          string full = SafePath(stage, rel); if (full == null) throw new IOException("unsafe file name: " + rel);
+          string top = rel.Split('/')[0]; if (!tops.Contains(top)) tops.Add(top);
+          if (a[0] == "D" && a.Length == 2) Directory.CreateDirectory(full);
+          else if (a[0] == "F" && a.Length == 3) { long n = long.Parse(a[1]); if (n < 0) throw new IOException("bad size"); files.Add(new KeyValuePair<string, long>(full, n)); Total += n; }
+          else throw new IOException("bad file list");
+        }
+        if (Total > limit) throw new IOException("the files are larger than the limit set in Settings");
+        foreach (var f in files) {
+          Directory.CreateDirectory(Path.GetDirectoryName(f.Key));
+          using (var o = File.Create(f.Key)) {
+            long left = f.Value;
+            while (left > 0) {
+              byte[] b = ReadFrame(s, k, 'S', rx++);
+              if (b.Length == 0 || b.Length > left) throw new IOException("the transfer was cut short");
+              o.Write(b, 0, b.Length); left -= b.Length; Done += b.Length;
+            }
+          }
+        }
+        if (ReadFrame(s, k, 'S', rx++).Length != 0) throw new IOException("bad end of transfer");
+      }
+      var done = new List<string>();
+      foreach (var top in tops) { string src = Path.Combine(stage, top), dst = Unique(root, top); if (Directory.Exists(src)) Directory.Move(src, dst); else File.Move(src, dst); done.Add(dst); }
+      Result = done.ToArray();
+    } finally { try { if (Directory.Exists(stage)) Directory.Delete(stage, true); } catch {} }
+  }
+  // "dir/sub/a.txt" under root, or null if it could leave root or isn't a plain relative name
+  public static string SafePath(string root, string rel) {
+    if (string.IsNullOrEmpty(rel) || rel.Length > 400 || rel.IndexOf('\\') >= 0 || rel.IndexOf(':') >= 0) return null;
+    foreach (var part in rel.Split('/')) if (part == "" || part == "." || part == ".." || part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || part.EndsWith(".") || part.EndsWith(" ")) return null;
+    string r = Path.GetFullPath(root).TrimEnd('\\') + "\\", full = Path.GetFullPath(Path.Combine(r, rel.Replace('/', '\\')));
+    return full.StartsWith(r, StringComparison.OrdinalIgnoreCase) ? full : null;
+  }
+  // root\name, or root\name (2).ext if that exists
+  public static string Unique(string root, string name) {
+    string p = Path.Combine(root, name); if (!File.Exists(p) && !Directory.Exists(p)) return p;
+    string b = Path.GetFileNameWithoutExtension(name), x = Path.GetExtension(name);
+    if (Directory.Exists(p)) { b = name; x = ""; }
+    for (int i = 2; ; i++) { p = Path.Combine(root, b + " (" + i + ")" + x); if (!File.Exists(p) && !Directory.Exists(p)) return p; }
+  }
+
+  // frame: [length:4][Dg.Encrypt(key, direction + sequence, data)]. The sequence in the MAC stops reordering and replay.
+  static void WriteFrame(Stream s, byte[] k, char dir, long seq, byte[] b, int off, int n) {
+    byte[] e = Dg.Encrypt(k, Ad(dir, seq), b, off, n);
+    s.Write(BitConverter.GetBytes(e.Length), 0, 4); s.Write(e, 0, e.Length);
+  }
+  static byte[] ReadFrame(Stream s, byte[] k, char dir, long seq) {
+    int n = BitConverter.ToInt32(ReadN(s, 4), 0);
+    if (n < 0 || n > 70000) throw new IOException("bad frame");
+    byte[] d = Dg.Decrypt(k, Ad(dir, seq), ReadN(s, n), 0, n);
+    if (d == null) throw new IOException("the other PC isn't paired with this one, or the data was changed on the way");
+    return d;
+  }
+  static byte[] Ad(char dir, long seq) { var a = new byte[9]; a[0] = (byte)dir; BitConverter.GetBytes(seq).CopyTo(a, 1); return a; }
+  static byte[] ReadN(Stream s, int n) {
+    var b = new byte[n]; int got = 0;
+    while (got < n) { int r = s.Read(b, got, n - got); if (r <= 0) throw new IOException("the connection closed"); got += r; }
+    return b;
+  }
+  static byte[] Cat(byte[] a, byte[] b) { var o = new byte[a.Length + b.Length]; a.CopyTo(o, 0); b.CopyTo(o, a.Length); return o; }
+}
+
 public static class Dg {
   public static string Hex(byte[] b) { var s = new StringBuilder(); foreach (byte x in b) s.Append(x.ToString("x2")); return s.ToString(); }
 
@@ -317,6 +458,37 @@ public static class Dg {
       return k.GetBytes(32);
   }
   static byte[] Mac(byte[] key, byte[] data, int len) { using (var h = new HMACSHA256(key)) return h.ComputeHash(data, 0, len); }
+
+  // ---------- encryption: AES-256-CBC, then HMAC-SHA256 over it (encrypt-then-MAC; .NET Framework has no AES-GCM) ----------
+  static readonly RandomNumberGenerator Rng = RandomNumberGenerator.Create();
+  public static byte[] Random(int n) { var b = new byte[n]; lock (Rng) Rng.GetBytes(b); return b; }
+  // A key for one session (a sound stream, a file transfer): the pairing key with a purpose and fresh random nonces
+  public static byte[] SessionKey(byte[] pairKey, string purpose, byte[] nonce) {
+    byte[] p = Encoding.UTF8.GetBytes("DeskGlide " + purpose + " "), b = new byte[p.Length + nonce.Length];
+    p.CopyTo(b, 0); nonce.CopyTo(b, p.Length); return Mac(pairKey, b, b.Length);
+  }
+  public const int CryptoOverhead = 16 + 16 + 16;   // IV, up to one block of padding, tag
+  static byte[] SubKey(byte[] key, string label) { var b = Encoding.ASCII.GetBytes(label); return Mac(key, b, b.Length); }
+  // [IV:16][AES-CBC ciphertext][tag:16], tag = HMAC-SHA256(mac key, ad + IV + ciphertext) cut to 16 bytes. ad: authenticated, not sent.
+  public static byte[] Encrypt(byte[] key, byte[] ad, byte[] data, int off, int len) {
+    byte[] iv = Random(16), ct;
+    using (var a = Aes.Create()) { a.Key = SubKey(key, "enc"); a.IV = iv; a.Mode = CipherMode.CBC; a.Padding = PaddingMode.PKCS7; using (var e = a.CreateEncryptor()) ct = e.TransformFinalBlock(data, off, len); }
+    var o = new byte[16 + ct.Length + 16];
+    iv.CopyTo(o, 0); ct.CopyTo(o, 16);
+    Buffer.BlockCopy(Tag(key, ad, o, 16 + ct.Length), 0, o, 16 + ct.Length, 16);
+    return o;
+  }
+  // The data, or null if the key is wrong or anything was changed (checked before decrypting).
+  public static byte[] Decrypt(byte[] key, byte[] ad, byte[] p, int off, int len) {
+    if (key == null || p == null || len < 48 || (len - 32) % 16 != 0 || off < 0 || off + len > p.Length) return null;
+    var body = new byte[len]; Buffer.BlockCopy(p, off, body, 0, len);
+    if (!Same(Tag(key, ad, body, len - 16), body, len - 16, 16)) return null;
+    var iv = new byte[16]; Buffer.BlockCopy(body, 0, iv, 0, 16);
+    using (var a = Aes.Create()) { a.Key = SubKey(key, "enc"); a.IV = iv; a.Mode = CipherMode.CBC; a.Padding = PaddingMode.PKCS7; using (var d = a.CreateDecryptor()) return d.TransformFinalBlock(body, 16, len - 32); }
+  }
+  static byte[] Tag(byte[] key, byte[] ad, byte[] b, int n) {
+    using (var h = new HMACSHA256(SubKey(key, "mac"))) { if (ad != null && ad.Length > 0) h.TransformBlock(ad, 0, ad.Length, null, 0); h.TransformFinalBlock(b, 0, n); return h.Hash; }
+  }
   static bool Same(byte[] a, byte[] b, int bOff, int n) { int d = 0; for (int i = 0; i < n; i++) d |= a[i] ^ b[bOff + i]; return d == 0; }
 
   // Control message: base64(HMAC-SHA256(json)) + "|" + json.
