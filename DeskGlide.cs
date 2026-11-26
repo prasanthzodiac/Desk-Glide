@@ -91,33 +91,88 @@ public static class Files {
     t.IsBackground = true; t.Start();
   }
   static void ServeOne(TcpClient c) {
+    bool handed = false;
     try {
-      using (c) {
-        c.ReceiveTimeout = 15000; c.SendTimeout = 60000; var s = c.GetStream();
-        byte[] nr = ReadN(s, 16), ns = Dg.Random(16); s.Write(ns, 0, 16);
-        byte[] k = Dg.SessionKey(Key, "files", Cat(nr, ns)); long rx = 0, tx = 0;
-        string id = Encoding.UTF8.GetString(ReadFrame(s, k, 'R', rx++));   // a PC without the pairing key fails here, before anything is sent
-        if (id.StartsWith("clip:")) { Clip.Serve(s, k, id.Substring(5), ref tx); return; }   // text or a picture (DeskGlide Link)
-        string[] paths = OfferPaths;
-        if (paths == null || id != OfferId) { WriteFrame(s, k, 'S', tx++, Encoding.UTF8.GetBytes("gone"), 0, 4); return; }
-        var list = new List<KeyValuePair<string, string>>(); var m = new StringBuilder();   // relative path -> full path
-        foreach (var p in paths) {
-          string top = Path.GetFileName(p.TrimEnd('\\'));
-          if (File.Exists(p)) { list.Add(new KeyValuePair<string, string>(top, p)); m.Append("F\t" + new FileInfo(p).Length + "\t" + top + "\n"); continue; }
-          var root = new DirectoryInfo(p); m.Append("D\t" + top + "\n");
-          foreach (var d in root.EnumerateDirectories("*", SearchOption.AllDirectories)) m.Append("D\t" + top + "/" + Rel(root, d.FullName) + "\n");
-          foreach (var f in root.EnumerateFiles("*", SearchOption.AllDirectories)) {
-            string r = top + "/" + Rel(root, f.FullName); list.Add(new KeyValuePair<string, string>(r, f.FullName)); m.Append("F\t" + f.Length + "\t" + r + "\n");
-          }
-        }
-        byte[] mb = Encoding.UTF8.GetBytes("ok\n" + m); WriteFrame(s, k, 'S', tx++, mb, 0, mb.Length);
-        var buf = new byte[65536];
-        foreach (var e in list) using (var f = new FileStream(e.Value, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
-          int n; while ((n = f.Read(buf, 0, buf.Length)) > 0) WriteFrame(s, k, 'S', tx++, buf, 0, n);
-        }
-        WriteFrame(s, k, 'S', tx++, buf, 0, 0);   // end
-      }
+      c.ReceiveTimeout = 15000; c.SendTimeout = 60000; var s = c.GetStream();
+      byte[] first = ReadN(s, 16);
+      if (Arrived(first, c)) { handed = true; return; }   // the other PC connected out to here, for a transfer this PC asked for
+      ServeStream(s, first);
     } catch (Exception e) { ServeError = e.Message; }
+    finally { if (!handed) c.Close(); }
+  }
+  // Asked over the control channel by the other PC, whose connections in to here a firewall blocks (a company laptop's,
+  // say): connect out to it and serve on that connection instead. Same protocol, same keys; only who dials differs.
+  static string lastTicket;
+  public static void Reverse(string host, int port, string ticket) {
+    if (ticket == null || !System.Text.RegularExpressions.Regex.IsMatch(ticket, "^[0-9a-f]{16}$") || ticket == lastTicket) return;
+    lastTicket = ticket;   // the request is sent twice in case one is lost
+    var t = new Thread(() => {
+      try {
+        using (var c = new TcpClient()) {
+          if (!c.ConnectAsync(host, port).Wait(5000)) return;
+          c.ReceiveTimeout = 15000; c.SendTimeout = 60000; var s = c.GetStream();
+          s.Write(Encoding.ASCII.GetBytes(ticket), 0, 16); ServeStream(s, ReadN(s, 16));
+        }
+      } catch (Exception e) { ServeError = e.Message; }
+    });
+    t.IsBackground = true; t.Start();
+  }
+  // ---- this PC asks the other to connect out to here: tickets it waits for ----
+  static readonly Dictionary<string, System.Threading.Tasks.TaskCompletionSource<TcpClient>> waiting = new Dictionary<string, System.Threading.Tasks.TaskCompletionSource<TcpClient>>();
+  public static string NewTicket() { string t = Dg.Hex(Dg.Random(8)); lock (waiting) waiting[t] = new System.Threading.Tasks.TaskCompletionSource<TcpClient>(); return t; }
+  static bool Arrived(byte[] first, TcpClient c) {
+    System.Threading.Tasks.TaskCompletionSource<TcpClient> w; string t = Encoding.ASCII.GetString(first);
+    lock (waiting) { if (!waiting.TryGetValue(t, out w)) return false; waiting.Remove(t); }
+    if (!w.TrySetResult(c)) c.Close();   // the fetch already gave up or went the direct way
+    return true;
+  }
+  // A connection to the other PC: whichever comes first, connecting to it, or (with a ticket) it connecting out to here.
+  // ponytail: the ticket only routes the connection; the pairing key still decides, so a stranger with the ticket gets nothing
+  internal static TcpClient Open(string host, int port, string ticket, int ms) {
+    System.Threading.Tasks.TaskCompletionSource<TcpClient> w = null;
+    if (ticket != null) lock (waiting) waiting.TryGetValue(ticket, out w);
+    var direct = new TcpClient(); System.Threading.Tasks.Task dt = direct.ConnectAsync(host, port);
+    TcpClient got = null; DateTime until = DateTime.UtcNow.AddMilliseconds(ms);
+    try {
+      while (got == null) {
+        if (w != null && w.Task.Status == System.Threading.Tasks.TaskStatus.RanToCompletion) { got = w.Task.Result; break; }
+        if (dt != null && dt.IsCompleted) { if (dt.Status == System.Threading.Tasks.TaskStatus.RanToCompletion) { got = direct; break; } dt = null; }   // refused: still wait for the other PC
+        int left = (int)(until - DateTime.UtcNow).TotalMilliseconds;
+        if (left <= 0 || (dt == null && w == null)) break;
+        var all = new List<System.Threading.Tasks.Task>(); if (dt != null) all.Add(dt); if (w != null) all.Add(w.Task);
+        System.Threading.Tasks.Task.WaitAny(all.ToArray(), left);
+      }
+    } finally {
+      if (ticket != null) lock (waiting) waiting.Remove(ticket);
+      if (w != null && !w.TrySetCanceled() && w.Task.Status == System.Threading.Tasks.TaskStatus.RanToCompletion && w.Task.Result != got) w.Task.Result.Close();
+      if (got != direct) direct.Close();
+    }
+    if (got == null) throw new IOException("the other PC didn't answer");
+    return got;
+  }
+  static void ServeStream(Stream s, byte[] nr) {
+    byte[] ns = Dg.Random(16); s.Write(ns, 0, 16);
+    byte[] k = Dg.SessionKey(Key, "files", Cat(nr, ns)); long rx = 0, tx = 0;
+    string id = Encoding.UTF8.GetString(ReadFrame(s, k, 'R', rx++));   // a PC without the pairing key fails here, before anything is sent
+    if (id.StartsWith("clip:")) { Clip.Serve(s, k, id.Substring(5), ref tx); return; }   // text or a picture (DeskGlide Link)
+    string[] paths = OfferPaths;
+    if (paths == null || id != OfferId) { WriteFrame(s, k, 'S', tx++, Encoding.UTF8.GetBytes("gone"), 0, 4); return; }
+    var list = new List<KeyValuePair<string, string>>(); var m = new StringBuilder();   // relative path -> full path
+    foreach (var p in paths) {
+      string top = Path.GetFileName(p.TrimEnd('\\'));
+      if (File.Exists(p)) { list.Add(new KeyValuePair<string, string>(top, p)); m.Append("F\t" + new FileInfo(p).Length + "\t" + top + "\n"); continue; }
+      var root = new DirectoryInfo(p); m.Append("D\t" + top + "\n");
+      foreach (var d in root.EnumerateDirectories("*", SearchOption.AllDirectories)) m.Append("D\t" + top + "/" + Rel(root, d.FullName) + "\n");
+      foreach (var f in root.EnumerateFiles("*", SearchOption.AllDirectories)) {
+        string r = top + "/" + Rel(root, f.FullName); list.Add(new KeyValuePair<string, string>(r, f.FullName)); m.Append("F\t" + f.Length + "\t" + r + "\n");
+      }
+    }
+    byte[] mb = Encoding.UTF8.GetBytes("ok\n" + m); WriteFrame(s, k, 'S', tx++, mb, 0, mb.Length);
+    var buf = new byte[65536];
+    foreach (var e in list) using (var f = new FileStream(e.Value, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+      int n; while ((n = f.Read(buf, 0, buf.Length)) > 0) WriteFrame(s, k, 'S', tx++, buf, 0, n);
+    }
+    WriteFrame(s, k, 'S', tx++, buf, 0, 0);   // end
   }
   static string Rel(DirectoryInfo root, string full) { return full.Substring(root.FullName.TrimEnd('\\').Length + 1).Replace('\\', '/'); }
 
@@ -125,17 +180,19 @@ public static class Files {
   public static volatile string Status = "";    // "" idle, "busy", "ok", or "error: ..."
   public static long Done, Total;
   public static string[] Result;                 // the saved files and folders, top level
-  public static void Fetch(string host, int port, byte[] key, string id, string root, long limit) {
+  public static void Fetch(string host, int port, byte[] key, string id, string root, long limit) { Fetch(host, port, key, id, root, limit, null); }
+  // ticket: from NewTicket, after asking the other PC to connect out to here with it
+  public static void Fetch(string host, int port, byte[] key, string id, string root, long limit, string ticket) {
     Status = "busy"; Done = 0; Total = 0; Result = null;
-    var t = new Thread(() => { try { FetchRun(host, port, key, id, root, limit); Status = "ok"; } catch (Exception e) { Status = "error: " + e.Message; } });
+    var t = new Thread(() => { try { FetchRun(host, port, key, id, root, limit, ticket); Status = "ok"; } catch (Exception e) { Status = "error: " + e.Message; } });
     t.IsBackground = true; t.Start();
   }
-  static void FetchRun(string host, int port, byte[] key, string id, string root, long limit) {
+  static void FetchRun(string host, int port, byte[] key, string id, string root, long limit, string ticket) {
     Directory.CreateDirectory(root);
     string stage = Path.Combine(root, ".incoming-" + Dg.Hex(Dg.Random(4))); var tops = new List<string>();
     try {
-      using (var c = new TcpClient()) {
-        c.Connect(host, port); c.ReceiveTimeout = 60000; c.SendTimeout = 15000; var s = c.GetStream();
+      using (var c = Open(host, port, ticket, 10000)) {
+        c.ReceiveTimeout = 60000; c.SendTimeout = 15000; var s = c.GetStream();
         byte[] nr = Dg.Random(16); s.Write(nr, 0, 16); byte[] ns = ReadN(s, 16);
         byte[] k = Dg.SessionKey(key, "files", Cat(nr, ns)); long rx = 0, tx = 0;
         byte[] ib = Encoding.UTF8.GetBytes(id); WriteFrame(s, k, 'R', tx++, ib, 0, ib.Length);
@@ -1785,14 +1842,14 @@ public static class Clip {
   }
   public static volatile string Status = "";   // "" idle, "busy", "ok", or "error: ..."
   public static string ResultKind; public static byte[] Result;
-  public static void Fetch(string host, int port, byte[] key, string id) {
+  public static void Fetch(string host, int port, byte[] key, string id) { Fetch(host, port, key, id, null); }
+  public static void Fetch(string host, int port, byte[] key, string id, string ticket) {   // ticket: as Files.Fetch
     Status = "busy"; Result = null;
-    var t = new Thread(() => { try { FetchRun(host, port, key, id); Status = "ok"; } catch (Exception e) { Status = "error: " + e.Message; } });
+    var t = new Thread(() => { try { FetchRun(host, port, key, id, ticket); Status = "ok"; } catch (Exception e) { Status = "error: " + e.Message; } });
     t.IsBackground = true; t.Start();
   }
-  static void FetchRun(string host, int port, byte[] key, string id) {
-    using (var c = new TcpClient()) {
-      if (!c.ConnectAsync(host, port).Wait(5000)) throw new IOException("the other PC didn't answer");
+  static void FetchRun(string host, int port, byte[] key, string id, string ticket) {
+    using (var c = Files.Open(host, port, ticket, 5000)) {
       c.ReceiveTimeout = 15000; c.SendTimeout = 15000; var s = c.GetStream();
       byte[] nr = Dg.Random(16); s.Write(nr, 0, 16); byte[] ns = Files.ReadN(s, 16);
       byte[] k = Dg.SessionKey(key, "files", Files.Cat(nr, ns)); long rx = 0;

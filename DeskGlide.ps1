@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.2.3'
+$Version = '5.3'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -660,6 +660,17 @@ if ($Test) {
   function PullClip($key, $id) { [Clip]::Fetch('127.0.0.1', $fport, $key, $id); $t0 = Get-Date; while ([Clip]::Status -eq 'busy' -and ((Get-Date) - $t0).TotalSeconds -lt 10) { Start-Sleep -Milliseconds 20 }; [Clip]::Status }
   Check ((PullClip $pk ([Clip]::OfferId)) -eq 'ok' -and [Clip]::ResultKind -eq 'text' -and [Dg]::Hex([Clip]::Result) -eq [Dg]::Hex($txt)) 'clip transfer'
   Check ((PullClip $pk 'old') -eq 'error: gone' -and (PullClip $k2 ([Clip]::OfferId)) -match '^error') 'clip: old offer or wrong key refused'
+  # the other PC's firewall blocks connections in (a company laptop): it connects out to here with the ticket this PC sent
+  $tl = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $tl.Start(); $closed = $tl.LocalEndpoint.Port; $tl.Stop()   # nothing listens: the blocked way in
+  $tk = [Files]::NewTicket(); [Clip]::Fetch('127.0.0.1', $closed, $pk, [Clip]::OfferId, $tk); [Files]::Reverse('127.0.0.1', $fport, $tk)
+  $t0 = Get-Date; while ([Clip]::Status -eq 'busy' -and ((Get-Date) - $t0).TotalSeconds -lt 10) { Start-Sleep -Milliseconds 20 }
+  Check ([Clip]::Status -eq 'ok' -and [Dg]::Hex([Clip]::Result) -eq [Dg]::Hex($txt)) "clip: the other PC connects out when it can't be reached: $([Clip]::Status)"
+  [Files]::Fetch('127.0.0.1', $closed, $pk, [Files]::OfferId, $dst, 1GB, ($tk = [Files]::NewTicket())); [Files]::Reverse('127.0.0.1', $fport, $tk)
+  $t0 = Get-Date; while ([Files]::Status -eq 'busy' -and ((Get-Date) - $t0).TotalSeconds -lt 15) { Start-Sleep -Milliseconds 50 }
+  Check ([Files]::Status -eq 'ok' -and @([Files]::Result).Count -eq 2) "files: the other PC connects out when it can't be reached: $([Files]::Status)"
+  [Clip]::Fetch('127.0.0.1', $closed, $pk, [Clip]::OfferId); $t0 = Get-Date; while ([Clip]::Status -eq 'busy' -and ((Get-Date) - $t0).TotalSeconds -lt 10) { Start-Sleep -Milliseconds 20 }
+  Check ([Clip]::Status -match "didn't answer" -and ((Get-Date) - $t0).TotalSeconds -lt 3) "clip: no way through fails fast: $([Clip]::Status)"
+  Check (-not (Test-Path "$dst\.incoming*")) 'reverse transfer: no leftovers'
   Check (-not [Clip]::Offer('png', (New-Object byte[] ([Clip]::Max + 1))) -and [Clip]::OfferId -eq '') 'clip: over the cap not offered'
   [Files]::Offer($null); Remove-Item -Recurse -Force $root
 
@@ -1143,6 +1154,9 @@ function Receive-Control {
     if (-not $C.peer) { $C.peer = $m.n; $S.code = ''; Save-Config; Say "Paired with $($m.n)." info }
     if ($m.n -ne $C.peer) { continue }
     if ($m.adm) { Admin-Pairing $m $ep; continue }   # pairing the other PC's admin control service: its own messages
+    # the other PC wants what was copied here but can't connect in (firewall): connect out to it. Always to the known
+    # peer, never an address from a message. ponytail: no replay guard; a replay only makes this PC dial the peer, which needs the key
+    if ($m.rv) { if ($S.peerAddr) { [Files]::Reverse("$($S.peerAddr)", $PeerPort + 1, [string]$m.rv) }; continue }
     # ponytail: replay guard is "timestamp must grow"; it resets after 30 s of silence so a peer whose clock jumped back recovers
     if (((Get-Date) - $S.peerSeen).TotalSeconds -gt 30) { $S.lastT = 0 }
     if ([long]$m.t -le $S.lastT) { continue }
@@ -1303,7 +1317,7 @@ function Offer-Clip($text, $img) {   # text or a picture for the other PC, pulle
 function Fetch-Clip {   # the mouse arrived here (Link): pull the text or picture copied on the other PC
   $o = $S.peerClip
   if (-not (Link-Used) -or -not $o -or -not $o.id -or $o.id -eq $S.clipGot -or [Clip]::Status -eq 'busy' -or -not $S.peerAddr) { return }
-  $S.clipGot = [string]$o.id; [Clip]::Fetch("$($S.peerAddr)", $PeerPort + 1, $S.key, [string]$o.id)
+  $S.clipGot = [string]$o.id; [Clip]::Fetch("$($S.peerAddr)", $PeerPort + 1, $S.key, [string]$o.id, (Ask-Reverse))
 }
 function Poll-Clip {
   $st = [Clip]::Status
@@ -1359,7 +1373,17 @@ function Fetch-Files {   # the mouse arrived here: pull the other PC's copied fi
   if (-not $C.files -or -not $o -or -not $o.id -or $o.id -eq $S.fetchedId -or [Files]::Status -eq 'busy' -or -not $S.peerAddr) { return }
   $S.fetchedId = [string]$o.id; $S.fileErr = $false; $S.fileMsg = "Getting $(Offer-Text $o) from $(Peer-Label)..."
   Say "Fetching $(Offer-Text $o)"
-  [Files]::Fetch("$($S.peerAddr)", $PeerPort + 1, $S.key, [string]$o.id, $DropDir, [long]$C.fileLimitMB * 1MB)
+  [Files]::Fetch("$($S.peerAddr)", $PeerPort + 1, $S.key, [string]$o.id, $DropDir, [long]$C.fileLimitMB * 1MB, (Ask-Reverse))
+}
+# A ticket the other PC brings when it connects out to here: the transfer then works even if its firewall blocks
+# connections in (company laptops). Whichever way connects first is used. Sent twice: it's UDP.
+function Ask-Reverse {
+  $tk = [Files]::NewTicket()
+  if ($S.key -and $S.peerAddr) {
+    $b = [Text.Encoding]::UTF8.GetBytes([Dg]::Seal($S.key, (@{ n = $Name; rv = $tk } | ConvertTo-Json -Compress)))
+    1..2 | % { try { [void]$udp.Send($b, $b.Length, (New-Object Net.IPEndPoint($S.peerAddr, $PeerPort))) } catch {} }
+  }
+  $tk
 }
 function Poll-Fetch {
   $st = [Files]::Status

@@ -264,7 +264,7 @@ Click **Open log** at the bottom of the window to see what DeskGlide saw and did
 - **Without keyboard and mouse sharing, nothing happens when the mouse crosses:** the Synergy log path is wrong or the log isn't written. Synergy's log is `%LOCALAPPDATA%\synergy-dragon\logs\synergy-dragon-agent.log`.
 - **It always switches to the other input:** your Synergy screen name isn't the Windows computer name; set `screenName`.
 - **No sound or microphone:** the line in the Sound or Microphone card says why.
-- **Files don't arrive:** the Copy files card shows the error. Allow PowerShell through the firewall on the PC you copied on (TCP 6992), and check the size limit in Settings.
+- **Files don't arrive:** the Copy files card shows the error. Files and copied text travel over TCP 6992. Since 5.3 it's enough for *one* of the two PCs to accept connections there: if the PC you copied on blocks them (a company laptop's firewall, say), it connects out to the other PC instead. If both block it, allow PowerShell through the firewall on one of them. Also check the size limit in Settings.
 - **Windows rearranges after a switch:** some monitors drop the DisplayPort link when they change input. Try another cable or port, or turn off the monitor's "DP auto-switch" or deep-sleep option.
 - **Debugging:** `powershell -ExecutionPolicy Bypass -File .\DeskGlide.ps1 -Console` runs with output to the console (quit the tray copy first); add `-ShowWindow` for the window. `-Test` runs the built-in self-check. `-NoInject` runs keyboard and mouse sharing without hooks or injection and logs what it would type.
 
