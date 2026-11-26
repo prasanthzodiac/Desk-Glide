@@ -1817,14 +1817,14 @@ public static class Clip {
 public static class SvcPipe {
   public const string Name = "DeskGlideService";
   public static string Exe { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"DeskGlide\DeskGlideService.exe"); } }
-  // The reply, or null if nothing answered. service: the pipe's server must be DeskGlideService.exe from Program Files running
-  // in session 0, not a program that took the pipe's name first; false only for the self-test's console-mode service.
+  // The reply, or null if nothing answered. service: the pipe's server must be a SYSTEM service, not a program that took
+  // the pipe's name first; false only for the self-test's console-mode service.
   // Identification level: the service can check who asks, but can't act as the caller.
   public static string Call(string pipe, string line, int timeoutMs, bool service) {
     try {
       using (var c = new System.IO.Pipes.NamedPipeClientStream(".", pipe, System.IO.Pipes.PipeDirection.InOut, System.IO.Pipes.PipeOptions.None, System.Security.Principal.TokenImpersonationLevel.Identification)) {
         c.Connect(timeoutMs);
-        if (service && !ServerIs(c.SafePipeHandle.DangerousGetHandle(), Exe)) { LastError = "the pipe's server isn't DeskGlide's service"; return null; }
+        if (service && !ServerIs(c.SafePipeHandle.DangerousGetHandle())) { LastError = "the pipe's server isn't DeskGlide's service"; return null; }
         var b = Encoding.UTF8.GetBytes(line.Replace("\n", " ") + "\n"); c.Write(b, 0, b.Length); c.Flush();
         var t = System.Threading.Tasks.Task.Run(() => new StreamReader(c, Encoding.UTF8).ReadLine());
         return t.Wait(timeoutMs + 2000) ? t.Result : null;
@@ -1832,11 +1832,16 @@ public static class SvcPipe {
     } catch (Exception e) { LastError = e.Message; return null; }
   }
   public static volatile string LastError;
-  public static bool ServerIs(IntPtr pipe, string exe) {
-    uint pid, sess; if (!GetNamedPipeServerProcessId(pipe, out pid) || !ProcessIdToSessionId(pid, out sess) || sess != 0) return false;   // only services run in session 0
-    IntPtr p = OpenProcess(0x1000, false, pid); if (p == IntPtr.Zero) return false;   // PROCESS_QUERY_LIMITED_INFORMATION
-    try { var s = new StringBuilder(1024); int n = s.Capacity; return QueryFullProcessImageName(p, 0, s, ref n) && string.Equals(s.ToString(), exe, StringComparison.OrdinalIgnoreCase); }
-    finally { CloseHandle(p); }
+  // A normal user can't open a SYSTEM service's process (5.2 checked its file path that way, so the app never reached the
+  // service). The pipe's owner is readable, though: a pipe owned by SYSTEM or Administrators in session 0 was made by a
+  // SYSTEM service or an admin, both of which could replace DeskGlide's service anyway. LOCAL/NETWORK SERVICE own their own.
+  public static bool ServerIs(IntPtr pipe) {
+    uint sess; if (!GetNamedPipeServerSessionId(pipe, out sess) || sess != 0) return false;   // only services run in session 0 (asked of the pipe: ProcessIdToSessionId needs the process too)
+    IntPtr owner, sd; if (GetSecurityInfo(pipe, 6, 1, out owner, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out sd) != 0) return false;   // SE_KERNEL_OBJECT, OWNER
+    try { return TrustedOwner(new System.Security.Principal.SecurityIdentifier(owner)); } finally { LocalFree(sd); }
+  }
+  public static bool TrustedOwner(System.Security.Principal.SecurityIdentifier s) {
+    return s.IsWellKnown(System.Security.Principal.WellKnownSidType.LocalSystemSid) || s.IsWellKnown(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid);
   }
   // The app polls the service's status on its own thread, so a missing or busy service never stalls the window
   public static volatile string Last; static Thread watch;
@@ -1845,11 +1850,9 @@ public static class SvcPipe {
     watch = new Thread(() => { while (true) { Last = File.Exists(Exe) ? Call(Name, "status", 500, true) : null; Thread.Sleep(2000); } });
     watch.IsBackground = true; watch.Start();
   }
-  [DllImport("kernel32.dll")] static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint pid);
-  [DllImport("kernel32.dll")] static extern bool ProcessIdToSessionId(uint pid, out uint session);
-  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
-  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr p, int flags, StringBuilder name, ref int size);
-  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll")] static extern bool GetNamedPipeServerSessionId(IntPtr pipe, out uint session);
+  [DllImport("advapi32.dll")] static extern uint GetSecurityInfo(IntPtr h, int type, int info, out IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl, out IntPtr sd);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
 }
 
 // Pairing the other PC's service: an ECDH P-256 exchange carried in control messages (signed with the pairing key), checked

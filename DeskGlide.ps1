@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.2.1'
+$Version = '5.2.2'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -895,6 +895,9 @@ if ($Test) {
     $deny = foreach ($v in "pair $([Convert]::ToBase64String((New-Object byte[] 32))) - -", 'unpair', 'disable', 'enable', 'peer 1.2.3.4', 'bogus') { [SvcPipe]::Call($pipe, $v, 2000, $false) }
     Check (@($deny | ? { $_ -ne 'refused' }).Count -eq 0 -and (Logged "refused 'pair' from .*only an elevated administrator")) 'service pipe: pairing and settings refused for a non-elevated user, and logged'
     Check ($null -eq [SvcPipe]::Call($pipe, 'status', 2000, $true)) 'service pipe: the app talks only to the installed service in session 0'
+    # as a normal user (5.2 couldn't, so the app never saw its service): Windows' service control manager passes, a LOCAL SERVICE pipe doesn't
+    function Server-Ok($n) { $c = New-Object IO.Pipes.NamedPipeClientStream('.', $n, [IO.Pipes.PipeDirection]::InOut); try { $c.Connect(1000); [SvcPipe]::ServerIs($c.SafePipeHandle.DangerousGetHandle()) } catch { $false } finally { $c.Dispose() } }
+    Check ((Server-Ok 'ntsvcs') -and -not (Server-Ok 'eventlog')) 'service pipe: a SYSTEM service is recognised by its pipe owner, other services are not'
     Check ([SvcPipe]::Call($pipe, 'panic', 2000, $false) -eq 'ok' -and (Until { [SvcPipe]::Call($pipe, 'status', 2000, $false) -match 'controlled=0' }) -and (Until { (Logged 'sc 1D flags 10') -and (Logged 'sc 38 flags 10') })) 'service pipe: panic ends control, releases the held Ctrl and Alt'
     $bad = [LinkProto]::Seal([Dg]::DeriveKey('zzzz-zzzz'), 0, [byte[]](1..8), (New-Object byte[] 20), 20, [LinkProto]::Version)
     $u = New-Object Net.Sockets.UdpClient; 1..200 | % { [void]$u.Send($bad, $bad.Length, '127.0.0.1', $lp + 1) }; $u.Close(); Start-Sleep -Milliseconds 300
