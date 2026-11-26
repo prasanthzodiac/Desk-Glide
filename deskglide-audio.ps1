@@ -14,6 +14,9 @@ param(
   [int]   $Port = 6990,  # UDP port, same on both PCs
   [string]$From,         # receiver: only accept audio from this address
   [int]   $Seconds = 0,  # stop after this many seconds (0 = run until Ctrl+C)
+  [switch]$Follow,       # receiver: hear only the PC that has the mouse (reads the Synergy/Deskflow log)
+  [string]$Me  = $env:COMPUTERNAME,  # receiver -Follow: this PC's Synergy screen name
+  [string]$Log = "$env:LOCALAPPDATA\synergy-dragon\logs\synergy-dragon-agent.log",
   [switch]$Test          # self-check, no audio
 )
 
@@ -193,6 +196,7 @@ public static class DgAudio {
       if (allowFrom != null && !ep.Address.Equals(allowFrom)) continue;
       int rate, ch; if (!ValidPacket(p, out rate, out ch)) continue;
       LastSender = ep.Address.ToString(); got++;
+      if (!RemoteOn) continue;   // -Follow: mouse is on this PC, drop the other PC's sound
       if (wave == IntPtr.Zero || rate != wRate || ch != wCh) OpenOut(rate, ch);
       for (int i = 8; i < p.Length; ) {
         int n = Math.Min(blockBytes - fillLen, p.Length - i);
@@ -253,6 +257,70 @@ public static class DgAudio {
   }
 
   public static void StopReceive() { CloseOut(); if (rx != null) rx.Close(); rx = null; }
+
+  // ---------- follow the mouse: per-app mute on this PC ----------
+  public static bool RemoteOn = true;
+  public static HashSet<string> Muted = new HashSet<string>();   // session ids WE muted
+
+  [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IAudioSessionManager2 {
+    int GetAudioSessionControl(IntPtr g, int f, out IntPtr c);
+    int GetSimpleAudioVolume(IntPtr g, int f, out IntPtr v);
+    int GetSessionEnumerator(out IAudioSessionEnumerator e);
+  }
+  [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IAudioSessionEnumerator {
+    int GetCount(out int n);
+    int GetSession(int i, [MarshalAs(UnmanagedType.IUnknown)] out object s);
+  }
+  [ComImport, Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IAudioSessionControl2 {
+    int GetState(out int s);
+    int GetDisplayName(out IntPtr n);
+    int SetDisplayName(IntPtr n, IntPtr g);
+    int GetIconPath(out IntPtr p);
+    int SetIconPath(IntPtr p, IntPtr g);
+    int GetGroupingParam(out Guid g);
+    int SetGroupingParam(IntPtr g, IntPtr c);
+    int RegisterAudioSessionNotification(IntPtr n);
+    int UnregisterAudioSessionNotification(IntPtr n);
+    int GetSessionIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
+    int GetSessionInstanceIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string id);
+    int GetProcessId(out uint pid);
+  }
+  [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface ISimpleAudioVolume {
+    int SetMasterVolume(float v, IntPtr ctx);
+    int GetMasterVolume(out float v);
+    int SetMute(bool m, IntPtr ctx);
+    int GetMute(out bool m);
+  }
+
+  // mute=true: mute every app on the default output except selfPid (new apps get caught on the next call).
+  // mute=false: unmute only the apps we muted, so apps the user muted stay muted.
+  public static void MuteOthers(bool mute, int selfPid) {
+    var en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCo();
+    IMMDevice dev; Check(en.GetDefaultAudioEndpoint(0, 0, out dev));
+    Guid iid = typeof(IAudioSessionManager2).GUID; object o;
+    Check(dev.Activate(ref iid, 23, IntPtr.Zero, out o));
+    var mgr = (IAudioSessionManager2)o;
+    IAudioSessionEnumerator list; Check(mgr.GetSessionEnumerator(out list));
+    int n; Check(list.GetCount(out n));
+    for (int i = 0; i < n; i++) {
+      object s; if (list.GetSession(i, out s) < 0 || s == null) continue;
+      try {
+        var ctl = (IAudioSessionControl2)s; var vol = (ISimpleAudioVolume)s;
+        uint pid; ctl.GetProcessId(out pid);
+        if (pid == (uint)selfPid) continue;
+        string id; if (ctl.GetSessionIdentifier(out id) < 0 || id == null) continue;
+        bool m; vol.GetMute(out m);
+        if (mute && !m) { vol.SetMute(true, IntPtr.Zero); Muted.Add(id); }
+        else if (!mute && m && Muted.Contains(id)) vol.SetMute(false, IntPtr.Zero);
+      } finally { Marshal.ReleaseComObject(s); }
+    }
+    if (!mute) Muted.Clear();
+    Marshal.ReleaseComObject(list); Marshal.ReleaseComObject(mgr); Marshal.ReleaseComObject(dev); Marshal.ReleaseComObject(en);
+  }
 }
 "@
 
@@ -288,14 +356,62 @@ if ($Send) {
     "sent $total packets"
   } finally { [DgAudio]::StopSend() }
 } else {
+  # -Follow: apps we muted are saved here, so a crash or power cut doesn't leave them muted
+  $state = Join-Path $env:TEMP 'deskglide-muted.txt'
+  function Save-Muted {
+    if ([DgAudio]::Muted.Count) { Set-Content $state ([string[]][DgAudio]::Muted) } elseif (Test-Path $state) { Remove-Item $state }
+  }
+  # Returns this computer's or the other's screen name from the last switch line in $text.
+  function Get-Active([string]$text) {
+    $m = [regex]::Matches($text, 'switch from "[^"]+" to "([^"]+)"')
+    if ($m.Count) { $m[$m.Count - 1].Groups[1].Value }
+  }
+  function Read-Log([long]$from, [long]$to) {
+    $fs = [IO.File]::Open($Log, 'Open', 'Read', 'ReadWrite,Delete')
+    try { $fs.Position = $from; $b = New-Object byte[] ($to - $from); $n = $fs.Read($b, 0, $b.Length) } finally { $fs.Close() }
+    [Text.Encoding]::UTF8.GetString($b, 0, $n)
+  }
+
+  if ($Follow) {
+    if (-not (Test-Path $Log)) { throw "Log not found: $Log  (pass -Log <path to your Synergy/Deskflow log>)" }
+    if (Test-Path $state) {   # left over from a crash: unmute those apps first
+      Get-Content $state | % { [void][DgAudio]::Muted.Add($_) }
+      [DgAudio]::MuteOthers($false, $PID); Remove-Item $state
+    }
+    $pos = (Get-Item $Log).Length
+    $active = Get-Active (Read-Log ([Math]::Max(0, $pos - 262144)) $pos)   # where the mouse is now
+    if (-not $active) { $active = $Me }
+  }
+
   [DgAudio]::StartReceive($Port, $From)
-  "Listening on UDP $Port, playing on the default output device  (Ctrl+C to stop)"
+  "Listening on UDP $Port, playing on the default output device$(if($Follow){', following the mouse'})  (Ctrl+C to stop)"
   try {
-    $who = ''; $total = 0
+    $who = ''; $total = 0; $shown = ''
     while ((Get-Date) -lt $until) {
+      if ($Follow) {
+        $len = (Get-Item $Log).Length
+        if ($len -lt $pos) { $pos = 0 }
+        if ($len -gt $pos) {
+          $text = Read-Log $pos $len
+          $cut = $text.LastIndexOf("`n")   # only whole lines; the rest is read next time
+          if ($cut -ge 0) {
+            $pos += [Text.Encoding]::UTF8.GetByteCount($text.Substring(0, $cut + 1))
+            $t = Get-Active $text.Substring(0, $cut + 1); if ($t) { $active = $t }
+          }
+        }
+        $remote = $active -ne $Me
+        [DgAudio]::RemoteOn = $remote
+        if ($remote) { [DgAudio]::MuteOthers($true, $PID) } elseif ([DgAudio]::Muted.Count) { [DgAudio]::MuteOthers($false, $PID) }
+        Save-Muted
+        if ($active -ne $shown) { $shown = $active; "{0:HH:mm:ss} hearing: {1}" -f (Get-Date), $(if ($remote) { "$active (this PC muted)" } else { "$Me (other PC muted)" }) }
+      }
       $total += [DgAudio]::PumpReceive(250)
       if ([DgAudio]::LastSender -ne $who) { $who = [DgAudio]::LastSender; "receiving from $who" }
     }
     "received $total packets"
-  } finally { [DgAudio]::StopReceive() }
+  } finally {
+    [DgAudio]::StopReceive()
+    if ([DgAudio]::Muted.Count) { [DgAudio]::MuteOthers($false, $PID) }
+    Save-Muted
+  }
 }

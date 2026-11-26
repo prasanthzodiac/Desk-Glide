@@ -113,6 +113,14 @@ Both tools dropped file drag-and-drop, so for files use something Windows alread
    ```
 3. Play something on the other computer. The receiver prints `receiving from <address>` and you hear it.
 
+**Hear only the computer that has the mouse:** add `-Follow` on the receiver. It must be the Synergy/Deskflow server:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deskglide-audio.ps1 -Receive -Follow
+```
+
+When the mouse moves to the other computer, you hear its sound and this computer's apps are muted. When the mouse comes back, the other computer's sound is dropped and your apps are unmuted. Apps you muted yourself stay muted. If the script is closed or crashes while apps are muted, they are unmuted the next time it starts.
+
 Good to know:
 
 - Delay is about 50–100 ms on a wired or home Wi-Fi network: fine for music and video, noticeable in games. For zero delay, a small hardware audio mixer is the better tool.
