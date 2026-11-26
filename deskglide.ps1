@@ -1,4 +1,4 @@
-# Switches a shared monitor's input whenever Synergy / Deskflow moves the cursor between computers.
+# DeskGlide: switches a shared monitor's input whenever Synergy / Deskflow moves the cursor between computers.
 #
 # Run it on the SERVER (the computer whose keyboard and mouse are shared). It watches the
 # Synergy or Deskflow log for lines like
@@ -6,11 +6,11 @@
 # and sends the DDC/CI command VCP 0x60 (Input Select) to the monitor.
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File synergy-monitor-switch.ps1 -Show                # list monitor inputs
-#   powershell -ExecutionPolicy Bypass -File synergy-monitor-switch.ps1 -MyInput 15 -OtherInput 17
-#   powershell -ExecutionPolicy Bypass -File synergy-monitor-switch.ps1 -Log C:\path\deskflow.log
-#   powershell -ExecutionPolicy Bypass -File synergy-monitor-switch.ps1 -DryRun              # print only
-#   powershell -ExecutionPolicy Bypass -File synergy-monitor-switch.ps1 -Test                # parser self-check
+#   powershell -ExecutionPolicy Bypass -File deskglide.ps1 -Show                # list monitor inputs
+#   powershell -ExecutionPolicy Bypass -File deskglide.ps1 -MyInput 15 -OtherInput 17
+#   powershell -ExecutionPolicy Bypass -File deskglide.ps1 -Log C:\path\deskflow.log
+#   powershell -ExecutionPolicy Bypass -File deskglide.ps1 -DryRun              # print only
+#   powershell -ExecutionPolicy Bypass -File deskglide.ps1 -Test                # parser self-check
 param(
   [string]$Me         = $env:COMPUTERNAME,  # this computer's screen name in Synergy/Deskflow (case-insensitive)
   [int]   $MyInput    = 15,   # input this computer uses. Common: 15=DisplayPort 1, 16=DP 2, 17=HDMI 1, 18=HDMI 2

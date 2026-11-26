@@ -1,4 +1,4 @@
-# synergy-monitor-switch
+# DeskGlide
 
 **One keyboard, one mouse, one monitor, two computers. No reaching for the monitor's input button.**
 
@@ -48,7 +48,7 @@ Now check that moving the mouse past that edge controls the other computer. If i
 On the server, open PowerShell in this folder and run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\synergy-monitor-switch.ps1 -Show
+powershell -ExecutionPolicy Bypass -File .\deskglide.ps1 -Show
 ```
 
 Example output:
@@ -63,7 +63,7 @@ Generic PnP Monitor : current input = 15   supported inputs = 17, 18, 15
 ### 3. Run it
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\synergy-monitor-switch.ps1 -MyInput 15 -OtherInput 17
+powershell -ExecutionPolicy Bypass -File .\deskglide.ps1 -MyInput 15 -OtherInput 17
 ```
 
 With Deskflow, add `-Log "C:\path\to\deskflow.log"`.
@@ -80,10 +80,10 @@ Move the mouse to the other computer and back. Each switch prints a line:
 Run this in the same folder, with your own input numbers. It puts a shortcut in your Startup folder that runs the script with no window:
 
 ```powershell
-$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Synergy Monitor Switch.lnk"); $s.TargetPath = "powershell.exe"; $s.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$((Resolve-Path .\synergy-monitor-switch.ps1).Path)`" -MyInput 15 -OtherInput 17"; $s.Save()
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\DeskGlide.lnk"); $s.TargetPath = "powershell.exe"; $s.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$((Resolve-Path .\deskglide.ps1).Path)`" -MyInput 15 -OtherInput 17"; $s.Save()
 ```
 
-To stop it starting automatically, delete `Synergy Monitor Switch` from the Startup folder (press Win+R and type `shell:startup`).
+To stop it starting automatically, delete `DeskGlide` from the Startup folder (press Win+R and type `shell:startup`).
 
 ## Copy-paste between the computers
 
