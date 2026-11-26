@@ -1,30 +1,124 @@
-# DeskGlide audio: hear another PC's sound in the headphones plugged into this PC.
-#
-# On the PC whose sound you want to hear (sender):
-#   powershell -ExecutionPolicy Bypass -File deskglide-audio.ps1 -Send 192.168.1.20
-# On the PC with the headphones (receiver):
-#   powershell -ExecutionPolicy Bypass -File deskglide-audio.ps1 -Receive
-#
-# The sender records whatever its default speakers/headphones are playing (WASAPI loopback),
-# converts it to 16-bit PCM and sends it over UDP. The receiver plays it on its default
-# output device. Both PCs' sound mix in your headphones. Nothing to install.
-param(
-  [string]$Send,         # sender: address of the PC with the headphones
-  [switch]$Receive,      # receiver: play incoming audio
-  [int]   $Port = 6990,  # UDP port, same on both PCs
-  [string]$From,         # receiver: only accept audio from this address
-  [int]   $Seconds = 0,  # stop after this many seconds (0 = run until Ctrl+C)
-  [switch]$Follow,       # receiver: hear only the PC that has the mouse (reads the Synergy/Deskflow log)
-  [string]$Me  = $env:COMPUTERNAME,  # receiver -Follow: this PC's Synergy screen name
-  [string]$Log = "$env:LOCALAPPDATA\synergy-dragon\logs\synergy-dragon-agent.log",
-  [switch]$Test          # self-check, no audio
-)
+// DeskGlide native helpers. DeskGlide.ps1 compiles this with Add-Type (C# 5, nothing to install).
+using System; using System.Text; using System.Net; using System.Net.Sockets; using System.Threading;
+using System.Collections.Generic; using System.Runtime.InteropServices; using System.Security.Cryptography;
 
-Add-Type @"
-using System; using System.Net; using System.Net.Sockets; using System.Threading;
-using System.Collections.Generic; using System.Runtime.InteropServices;
+public static class Dg {
+  // ---------- monitor: DDC/CI VCP 0x60 (input select) via dxva2.dll ----------
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct PM { public IntPtr h; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string d; }
+  delegate bool MEP(IntPtr hm, IntPtr dc, IntPtr r, IntPtr p);
+  [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MEP cb, IntPtr p);
+  [DllImport("dxva2.dll")] static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hm, out uint n);
+  [DllImport("dxva2.dll")] static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr hm, uint n, [Out] PM[] a);
+  [DllImport("dxva2.dll")] static extern bool DestroyPhysicalMonitors(uint n, PM[] a);
+  [DllImport("dxva2.dll")] static extern bool SetVCPFeature(IntPtr h, byte code, uint value);
+  [DllImport("dxva2.dll")] static extern bool GetVCPFeatureAndVCPFeatureReply(IntPtr h, byte code, IntPtr t, out uint cur, out uint max);
 
-public static class DgAudio {
+  static void Each(Action<PM> f) {
+    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (hm, dc, r, p) => {
+      uint n; if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hm, out n) || n == 0) return true;
+      var a = new PM[n]; if (!GetPhysicalMonitorsFromHMONITOR(hm, n, a)) return true;
+      foreach (var m in a) f(m);
+      DestroyPhysicalMonitors(n, a); return true;
+    }, IntPtr.Zero);
+  }
+  // ponytail: talks to every DDC monitor; fine for one shared monitor, filter by name if you have more
+  public static bool SetInput(uint v) { bool ok = false; Each(m => ok |= SetVCPFeature(m.h, 0x60, v)); return ok; }
+  public static int GetInput() {   // -1 = no DDC/CI reply
+    int v = -1;
+    Each(m => { uint cur, max; if (v < 0 && GetVCPFeatureAndVCPFeatureReply(m.h, 0x60, IntPtr.Zero, out cur, out max)) v = (int)(cur & 0xFF); });
+    return v;
+  }
+
+  // ---------- discovery: 255.255.255.255 leaves through one adapter only, so also send each subnet's broadcast ----------
+  public static List<IPAddress> Broadcasts() {
+    var o = new List<IPAddress> { IPAddress.Broadcast };
+    foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()) {
+      if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+      foreach (var u in ni.GetIPProperties().UnicastAddresses) {
+        if (u.Address.AddressFamily != AddressFamily.InterNetwork || u.IPv4Mask == null || IPAddress.IsLoopback(u.Address)) continue;
+        byte[] a = u.Address.GetAddressBytes(), m = u.IPv4Mask.GetAddressBytes();
+        for (int i = 0; i < 4; i++) a[i] |= (byte)~m[i];
+        o.Add(new IPAddress(a));
+      }
+    }
+    return o;
+  }
+
+  // ---------- pairing and authentication ----------
+  const string Alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // 32 symbols, no I/O/0/1
+  public const int AudioTagLen = 8;
+
+  public static string NewCode() {   // 8 symbols = 40 bits, shown as ABCD-EFGH
+    var b = new byte[8]; using (var r = new RNGCryptoServiceProvider()) r.GetBytes(b);
+    var s = new StringBuilder();
+    for (int i = 0; i < 8; i++) { if (i == 4) s.Append('-'); s.Append(Alphabet[b[i] % 32]); }
+    return s.ToString();
+  }
+  public static string NormCode(string code) {
+    var s = new StringBuilder();
+    foreach (char c in (code ?? "").ToUpperInvariant()) if (Alphabet.IndexOf(c) >= 0) s.Append(c);
+    return s.ToString();
+  }
+  public static byte[] DeriveKey(string code) {
+    using (var k = new Rfc2898DeriveBytes(NormCode(code), Encoding.UTF8.GetBytes("DeskGlide pairing v2"), 100000, HashAlgorithmName.SHA256))
+      return k.GetBytes(32);
+  }
+  static byte[] Mac(byte[] key, byte[] data, int len) { using (var h = new HMACSHA256(key)) return h.ComputeHash(data, 0, len); }
+  static bool Same(byte[] a, byte[] b, int bOff, int n) { int d = 0; for (int i = 0; i < n; i++) d |= a[i] ^ b[bOff + i]; return d == 0; }
+
+  // Control message: base64(HMAC-SHA256(json)) + "|" + json.
+  public static string Seal(byte[] key, string json) {
+    byte[] b = Encoding.UTF8.GetBytes(json);
+    return Convert.ToBase64String(Mac(key, b, b.Length)) + "|" + json;
+  }
+  // Returns the json, or null if the tag is wrong (other key, tampered, garbage).
+  public static string Open(byte[] key, string pkt) {
+    if (key == null || pkt == null || pkt.IndexOf('|') != 44) return null;
+    byte[] tag; try { tag = Convert.FromBase64String(pkt.Substring(0, 44)); } catch (FormatException) { return null; }
+    string json = pkt.Substring(45); byte[] b = Encoding.UTF8.GetBytes(json);
+    return tag.Length == 32 && Same(Mac(key, b, b.Length), tag, 0, 32) ? json : null;
+  }
+
+  // Audio packet: [rate:4][channels:2][seq:2][16-bit PCM][first 8 bytes of HMAC-SHA256].
+  public static byte[] MakePacket(byte[] key, int rate, int ch, ushort seq, byte[] pcm, int len) {
+    byte[] p = new byte[8 + len + AudioTagLen];
+    BitConverter.GetBytes(rate).CopyTo(p, 0); BitConverter.GetBytes((ushort)ch).CopyTo(p, 4); BitConverter.GetBytes(seq).CopyTo(p, 6);
+    Buffer.BlockCopy(pcm, 0, p, 8, len);
+    Buffer.BlockCopy(Mac(key, p, 8 + len), 0, p, 8 + len, AudioTagLen);
+    return p;
+  }
+  public static bool ValidPacket(byte[] key, byte[] p, out int rate, out int ch) {
+    rate = 0; ch = 0;
+    if (key == null || p == null || p.Length < 10 + AudioTagLen || p.Length > 8 + 8192 + AudioTagLen) return false;
+    int n = p.Length - AudioTagLen;
+    if (!Same(Mac(key, p, n), p, n, AudioTagLen)) return false;
+    rate = BitConverter.ToInt32(p, 0); ch = BitConverter.ToUInt16(p, 4);
+    return rate >= 8000 && rate <= 192000 && ch >= 1 && ch <= 2 && (n - 8) % (ch * 2) == 0;
+  }
+
+  // ---------- audio thread: DeskGlide.ps1 sets these flags, the thread does the rest ----------
+  public static volatile bool SendOn, RecvOn, RemoteOn;
+  public static volatile IPEndPoint Target;
+  public static volatile byte[] Key;
+  public static int Sent, Got, Bad;
+  public static string LastError = "";
+
+  public static void StartAudio(int port) {
+    var t = new Thread(() => AudioLoop(port)); t.IsBackground = true; t.Start();
+  }
+  static void AudioLoop(int port) {
+    while (true) {
+      try {
+        if (SendOn) { if (udp == null) udp = new UdpClient(); Sent += PumpSend(100); }
+        else StopCapture();
+        if (RecvOn) { if (rx == null) { rx = new UdpClient(port); rx.Client.ReceiveTimeout = 20; } Got += PumpReceive(100); }
+        else { CloseOut(); if (rx != null) { rx.Close(); rx = null; } }
+        if (!SendOn && !RecvOn) Thread.Sleep(100);
+      } catch (Exception e) { LastError = e.Message; Thread.Sleep(1000); }
+    }
+  }
+
   // ---------- WASAPI loopback capture (COM interop) ----------
   [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorCo {}
   [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -57,20 +151,11 @@ public static class DgAudio {
   }
   static void Check(int hr) { if (hr < 0) Marshal.ThrowExceptionForHR(hr); }
 
-  public static string LastError = "";
   static IAudioClient client; static IAudioCaptureClient capture;
   static int srcCh, srcRate, srcBits; static bool srcFloat;
-  static UdpClient udp; static IPEndPoint target; static ushort seq;
+  static UdpClient udp; static ushort seq;
   static byte[] outBuf = new byte[4096]; static int outLen;
   const int ChunkFrames = 288;   // 6 ms at 48 kHz; 1152 bytes stereo, fits one UDP packet
-
-  public static void StartSend(string host, int port) {
-    IPAddress ip;
-    if (!IPAddress.TryParse(host, out ip))
-      ip = Array.Find(Dns.GetHostAddresses(host), a => a.AddressFamily == AddressFamily.InterNetwork);
-    if (ip == null) throw new ArgumentException("Cannot resolve " + host);
-    target = new IPEndPoint(ip, port); udp = new UdpClient();
-  }
 
   static void InitCapture() {
     var en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCo();
@@ -90,9 +175,10 @@ public static class DgAudio {
   }
 
   static void StopCapture() {
-    try { if (client != null) client.Stop(); } catch {}
+    if (client == null) return;
+    try { client.Stop(); } catch {}
     if (capture != null) Marshal.ReleaseComObject(capture);
-    if (client != null) Marshal.ReleaseComObject(client);
+    Marshal.ReleaseComObject(client);
     capture = null; client = null;
   }
 
@@ -102,7 +188,7 @@ public static class DgAudio {
   }
 
   // Captures and sends for about ms milliseconds. Returns packets sent.
-  public static int PumpSend(int ms) {
+  static int PumpSend(int ms) {
     int sent = 0; DateTime end = DateTime.UtcNow.AddMilliseconds(ms);
     while (DateTime.UtcNow < end) {
       try {
@@ -126,7 +212,10 @@ public static class DgAudio {
             short s = ToPcm16(v);
             outBuf[outLen++] = (byte)s; outBuf[outLen++] = (byte)(s >> 8);
           }
-          if (outLen >= ChunkFrames * och * 2) { SendChunk(och); sent++; }
+          if (outLen >= ChunkFrames * och * 2) {
+            byte[] pkt = MakePacket(Key, srcRate, och, seq++, outBuf, outLen); outLen = 0;
+            IPEndPoint t = Target; if (t != null) { udp.Send(pkt, pkt.Length, t); sent++; }
+          }
         }
         LastError = "";
       } catch (Exception e) {
@@ -135,26 +224,6 @@ public static class DgAudio {
       }
     }
     return sent;
-  }
-
-  static void SendChunk(int och) {
-    byte[] pkt = new byte[8 + outLen];
-    BitConverter.GetBytes(srcRate).CopyTo(pkt, 0);
-    BitConverter.GetBytes((ushort)och).CopyTo(pkt, 4);
-    BitConverter.GetBytes(seq++).CopyTo(pkt, 6);
-    Buffer.BlockCopy(outBuf, 0, pkt, 8, outLen);
-    udp.Send(pkt, pkt.Length, target);
-    outLen = 0;
-  }
-
-  public static void StopSend() { StopCapture(); if (udp != null) udp.Close(); udp = null; }
-
-  // ---------- packet check (receiver trust boundary) ----------
-  public static bool ValidPacket(byte[] p, out int rate, out int ch) {
-    rate = 0; ch = 0;
-    if (p == null || p.Length < 10 || p.Length > 8 + 8192) return false;
-    rate = BitConverter.ToInt32(p, 0); ch = BitConverter.ToUInt16(p, 4);
-    return rate >= 8000 && rate <= 192000 && ch >= 1 && ch <= 2 && (p.Length - 8) % (ch * 2) == 0;
   }
 
   // ---------- winmm playback ----------
@@ -174,33 +243,25 @@ public static class DgAudio {
   const int MaxPending = 3;  // at most ~30 ms waiting; older audio is dropped so delay stays low
   const int Prebuffer = 2;   // after a gap, wait for 20 ms of audio before playing (fewer clicks)
 
-  static UdpClient rx; static IPAddress allowFrom;
+  static UdpClient rx;
   static IntPtr wave = IntPtr.Zero; static int wRate, wCh, blockBytes;
   static IntPtr[] hdrs, datas; static bool[] busy;
   static Queue<byte[]> pending = new Queue<byte[]>();
   static byte[] fill; static int fillLen;
-  public static string LastSender = "";
-  public static bool Playing { get { return wave != IntPtr.Zero; } }
 
-  public static void StartReceive(int port, string from) {
-    rx = new UdpClient(port); rx.Client.ReceiveTimeout = 20;
-    allowFrom = string.IsNullOrEmpty(from) ? null : IPAddress.Parse(from);
-  }
-
-  // Receives and plays for about ms milliseconds. Returns packets accepted.
-  public static int PumpReceive(int ms) {
+  // Receives and plays for about ms milliseconds. Returns authenticated packets.
+  static int PumpReceive(int ms) {
     int got = 0; DateTime end = DateTime.UtcNow.AddMilliseconds(ms);
     while (DateTime.UtcNow < end) {
       byte[] p; IPEndPoint ep = null;
       try { p = rx.Receive(ref ep); } catch (SocketException) { Feed(); continue; }
-      if (allowFrom != null && !ep.Address.Equals(allowFrom)) continue;
-      int rate, ch; if (!ValidPacket(p, out rate, out ch)) continue;
-      LastSender = ep.Address.ToString(); got++;
-      if (!RemoteOn) continue;   // -Follow: mouse is on this PC, drop the other PC's sound
+      int rate, ch; if (!ValidPacket(Key, p, out rate, out ch)) { Bad++; continue; }
+      got++;
+      if (!RemoteOn) continue;   // follow mode: the mouse is on this PC, drop the other PC's sound
       if (wave == IntPtr.Zero || rate != wRate || ch != wCh) OpenOut(rate, ch);
-      for (int i = 8; i < p.Length; ) {
-        int n = Math.Min(blockBytes - fillLen, p.Length - i);
-        Buffer.BlockCopy(p, i, fill, fillLen, n); fillLen += n; i += n;
+      for (int i = 8, n = p.Length - AudioTagLen; i < n; ) {
+        int k = Math.Min(blockBytes - fillLen, n - i);
+        Buffer.BlockCopy(p, i, fill, fillLen, k); fillLen += k; i += k;
         if (fillLen == blockBytes) { pending.Enqueue(fill); fill = new byte[blockBytes]; fillLen = 0; }
       }
       Feed();
@@ -256,10 +317,7 @@ public static class DgAudio {
     waveOutClose(wave); wave = IntPtr.Zero;
   }
 
-  public static void StopReceive() { CloseOut(); if (rx != null) rx.Close(); rx = null; }
-
   // ---------- follow the mouse: per-app mute on this PC ----------
-  public static bool RemoteOn = true;
   public static HashSet<string> Muted = new HashSet<string>();   // session ids WE muted
 
   [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -320,98 +378,5 @@ public static class DgAudio {
     }
     if (!mute) Muted.Clear();
     Marshal.ReleaseComObject(list); Marshal.ReleaseComObject(mgr); Marshal.ReleaseComObject(dev); Marshal.ReleaseComObject(en);
-  }
-}
-"@
-
-if ($Test) {
-  $r = 0; $c = 0
-  function Pkt([int]$rate, [int]$ch, [int]$bytes) {
-    [byte[]](([BitConverter]::GetBytes($rate)) + ([BitConverter]::GetBytes([uint16]$ch)) + @(0, 0) + (,0 * $bytes))
-  }
-  if (-not [DgAudio]::ValidPacket((Pkt 48000 2 1152), [ref]$r, [ref]$c) -or $r -ne 48000 -or $c -ne 2) { throw 'valid stereo packet rejected' }
-  if (-not [DgAudio]::ValidPacket((Pkt 44100 1 2), [ref]$r, [ref]$c)) { throw 'valid mono packet rejected' }
-  if ([DgAudio]::ValidPacket((Pkt 48000 2 3), [ref]$r, [ref]$c))  { throw 'odd length accepted' }
-  if ([DgAudio]::ValidPacket((Pkt 48000 6 12), [ref]$r, [ref]$c)) { throw '6 channels accepted' }
-  if ([DgAudio]::ValidPacket((Pkt 1 2 4), [ref]$r, [ref]$c))      { throw 'bad sample rate accepted' }
-  if ([DgAudio]::ValidPacket([byte[]](1, 2, 3), [ref]$r, [ref]$c)) { throw 'short packet accepted' }
-  if ([DgAudio]::ToPcm16(2.0) -ne 32767 -or [DgAudio]::ToPcm16(-2.0) -ne -32768 -or [DgAudio]::ToPcm16(0) -ne 0) { throw 'clipping wrong' }
-  'self-check ok'; return
-}
-
-if (-not $Send -and -not $Receive) { throw 'Use -Send <address of the PC with headphones> or -Receive' }
-$until = if ($Seconds -gt 0) { (Get-Date).AddSeconds($Seconds) } else { [DateTime]::MaxValue }
-$err = ''
-
-if ($Send) {
-  [DgAudio]::StartSend($Send, $Port)
-  "Sending this PC's sound to ${Send}:$Port  (Ctrl+C to stop)"
-  # ponytail: audio is not encrypted; use on your own network only
-  try {
-    $total = 0
-    while ((Get-Date) -lt $until) {
-      $total += [DgAudio]::PumpSend(250)
-      if ([DgAudio]::LastError -ne $err) { $err = [DgAudio]::LastError; if ($err) { "capture error, retrying: $err" } }
-    }
-    "sent $total packets"
-  } finally { [DgAudio]::StopSend() }
-} else {
-  # -Follow: apps we muted are saved here, so a crash or power cut doesn't leave them muted
-  $state = Join-Path $env:TEMP 'deskglide-muted.txt'
-  function Save-Muted {
-    if ([DgAudio]::Muted.Count) { Set-Content $state ([string[]][DgAudio]::Muted) } elseif (Test-Path $state) { Remove-Item $state }
-  }
-  # Returns this computer's or the other's screen name from the last switch line in $text.
-  function Get-Active([string]$text) {
-    $m = [regex]::Matches($text, 'switch from "[^"]+" to "([^"]+)"')
-    if ($m.Count) { $m[$m.Count - 1].Groups[1].Value }
-  }
-  function Read-Log([long]$from, [long]$to) {
-    $fs = [IO.File]::Open($Log, 'Open', 'Read', 'ReadWrite,Delete')
-    try { $fs.Position = $from; $b = New-Object byte[] ($to - $from); $n = $fs.Read($b, 0, $b.Length) } finally { $fs.Close() }
-    [Text.Encoding]::UTF8.GetString($b, 0, $n)
-  }
-
-  if ($Follow) {
-    if (-not (Test-Path $Log)) { throw "Log not found: $Log  (pass -Log <path to your Synergy/Deskflow log>)" }
-    if (Test-Path $state) {   # left over from a crash: unmute those apps first
-      Get-Content $state | % { [void][DgAudio]::Muted.Add($_) }
-      [DgAudio]::MuteOthers($false, $PID); Remove-Item $state
-    }
-    $pos = (Get-Item $Log).Length
-    $active = Get-Active (Read-Log ([Math]::Max(0, $pos - 262144)) $pos)   # where the mouse is now
-    if (-not $active) { $active = $Me }
-  }
-
-  [DgAudio]::StartReceive($Port, $From)
-  "Listening on UDP $Port, playing on the default output device$(if($Follow){', following the mouse'})  (Ctrl+C to stop)"
-  try {
-    $who = ''; $total = 0; $shown = ''
-    while ((Get-Date) -lt $until) {
-      if ($Follow) {
-        $len = (Get-Item $Log).Length
-        if ($len -lt $pos) { $pos = 0 }
-        if ($len -gt $pos) {
-          $text = Read-Log $pos $len
-          $cut = $text.LastIndexOf("`n")   # only whole lines; the rest is read next time
-          if ($cut -ge 0) {
-            $pos += [Text.Encoding]::UTF8.GetByteCount($text.Substring(0, $cut + 1))
-            $t = Get-Active $text.Substring(0, $cut + 1); if ($t) { $active = $t }
-          }
-        }
-        $remote = $active -ne $Me
-        [DgAudio]::RemoteOn = $remote
-        if ($remote) { [DgAudio]::MuteOthers($true, $PID) } elseif ([DgAudio]::Muted.Count) { [DgAudio]::MuteOthers($false, $PID) }
-        Save-Muted
-        if ($active -ne $shown) { $shown = $active; "{0:HH:mm:ss} hearing: {1}" -f (Get-Date), $(if ($remote) { "$active (this PC muted)" } else { "$Me (other PC muted)" }) }
-      }
-      $total += [DgAudio]::PumpReceive(250)
-      if ([DgAudio]::LastSender -ne $who) { $who = [DgAudio]::LastSender; "receiving from $who" }
-    }
-    "received $total packets"
-  } finally {
-    [DgAudio]::StopReceive()
-    if ([DgAudio]::Muted.Count) { [DgAudio]::MuteOthers($false, $PID) }
-    Save-Muted
   }
 }
