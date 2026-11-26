@@ -222,7 +222,8 @@ Admin control needs a Windows service running as SYSTEM, the most powerful accou
 - **Lock screen, UAC prompts, admin windows and Ctrl+Alt+Del:** without [admin control](#admin-control-optional), DeskGlide runs as your user, so it can't type into admin windows (Task Manager, installers) or on the other PC's secure desktop (lock screen, UAC prompts), and Ctrl+Alt+Del can't be sent; the card says when Windows refuses input. With admin control they work, Ctrl+Alt+Del as Ctrl+Alt+End. Setting it up needs one UAC prompt on the controlled PC, which you answer with that PC's own mouse.
 - **Admin control** works on a second PC for admin windows, UAC prompts and the taskbar; signing in on the lock screen and Ctrl+Alt+End are not tested on real PCs yet. It can't detect games on the controlled PC (game mode needs the normal app there), and Lock both PCs together doesn't lock a PC whose service receives. While it's on, that PC can't be the keyboard PC: turn it off first. Auto-update doesn't touch the installed service (that needs Windows' permission): after an update, turn admin control off and on again to rebuild it.
 - **Games** on the other PC need game mode, and a borderless-windowed game on this PC doesn't stop the pointer crossing (see [Keyboard and mouse](#keyboard-and-mouse)).
-- **Microphone** needs VB-Cable, a driver that takes administrator rights to install (a company laptop may not allow it); the microphone path is self-tested but not yet tried between two real PCs.
+- **Microphone** needs VB-Cable, a driver that takes administrator rights to install (a company laptop may not allow it). On that PC, choose **CABLE Output** as the default microphone (Win+R, `mmsys.cpl`, Recording) or in each app; keep its real speakers (or the monitor) as the default speaker.
+- **Headphones moved to the other PC** aren't noticed: change **Headphones are plugged into**, and the two PCs' default speaker and microphone, yourself.
 - **Keyboard layouts:** keys are sent as scan codes, so both PCs should use the same layout.
 - **Pen tablets** and other absolute pointing devices only click on the other PC; they don't move its pointer.
 - **Delay:** sound arrives a little late: about 50 ms on a cable, more on Wi-Fi or a phone hotspot, where DeskGlide's buffer grows by itself (up to 120 ms) whenever late packets would make the sound break up, and shrinks again when the network is calm. The Sound card says when it has grown. Fine for music and video, noticeable in games.
@@ -283,10 +284,9 @@ Click **Open log** at the bottom of the window to see what DeskGlide saw and did
 
 ## Tested on
 
-- Two real PCs, a Windows 11 desktop and a company-managed Windows laptop, sharing one MSI monitor (DisplayPort + HDMI) over a phone hotspot: the monitor following the mouse, keyboard and mouse sharing, admin control (admin windows, UAC prompts, the taskbar), and copying text and files both ways with the laptop's firewall blocking connections in
-- Sound between two Windows PCs on the same Wi-Fi network (earlier versions)
+- Two real PCs, a Windows 11 desktop and a company-managed Windows laptop, sharing one MSI monitor (DisplayPort + HDMI) over a phone hotspot: the monitor following the mouse, keyboard and mouse sharing, admin control (admin windows, UAC prompts, the taskbar), copying text and files both ways, and the laptop's sound in the desktop's headphones with the headset microphone used by apps on the laptop (VB-Cable), with the laptop's firewall blocking connections in
 - The self-check (`-Test`) on Windows 11: two engines over loopback for latency, loss and outages, and the admin service in its test mode with its security checks
-- Not yet on real PCs: the microphone, signing in on the lock screen and Ctrl+Alt+End through admin control, game mode, the second network path
+- Not yet on real PCs: signing in on the lock screen and Ctrl+Alt+End through admin control, game mode, the second network path
 
 ## Credits
 
