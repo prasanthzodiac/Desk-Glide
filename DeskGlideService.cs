@@ -120,6 +120,7 @@ public class SvcCore {
     IPAddress a; string p = Peer; if (p != null && IPAddress.TryParse(p, out a)) l.Peer = a;
     l.SetLocal(mons);
     l.Start(o.Port, o.PeerPort); link = l;
+    l.SetLocal(mons);   // the helper's report may have come in between: it saw no link yet, and reports again only on a change
     Log("DeskGlide Link receiving on UDP port " + o.Port);
   }
   void StopLink(string why) {

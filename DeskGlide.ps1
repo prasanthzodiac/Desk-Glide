@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.3'
+$Version = '5.3.1'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -897,7 +897,8 @@ if ($Test) {
   $sp = Start-Process "$sb\DeskGlideService.exe" "-Console -Data `"$sd`" -Pipe $pipe -Port $($lp + 1) -PeerPort $lp -NoInject -SeedKey $([Convert]::ToBase64String($pk))" -PassThru -WindowStyle Hidden
   try {
     [Link]::NoInject = $true; $A = New-Link $one 'PC-A'; $A.Sender = $true; $A.Dir = 'r'; $A.SetCursor(1900, 540); $A.Start($lp, $lp + 1)
-    Check ((Until { $A.Up -and $A.HasRemote } 15000) -and (Until { Logged 'helper: input desktop: ' } 5000))   # the helper can take 8+ s to start on a busy PC 'service: connected; its helper follows the input desktop and reports the monitors'
+    # the helper can take 8+ s to start on a busy PC
+    Check ((Until { $A.Up -and $A.HasRemote } 15000) -and (Until { Logged 'helper: input desktop: ' } 5000)) "service: connected; its helper follows the input desktop and reports the monitors (up $($A.Up), monitors $($A.HasRemote); log: $(if (Test-Path $sl) { (Get-Content $sl | select -Last 4) -join ' | ' }))"
     $A.FeedMouse(30, 0, 0, 0); Check ((Until { $A.Active }) -and (Until { Logged 'would inject mouse -?\d+,-?\d+ data 0 flags C001' })) 'service: across the edge, an absolute move through the helper'
     $A.FeedKey(0x41, 0x1E, 0, 1); $A.FeedKey(0x41, 0x1E, 0x80, 2)
     Check (Until { (Logged 'would inject key vk 00 sc 1E flags 8') -and (Logged 'would inject key vk 00 sc 1E flags 10') }) 'service: a key down and up by scan code'
