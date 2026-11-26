@@ -25,7 +25,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Version = '5.3.1'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
-$UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
+$UpdateRepo = 'prasanthzodiac/Desk-Glide'   # 'owner/repo' on GitHub for auto-update (its latest release); empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
 Add-Type -Path "$PSScriptRoot\DeskGlide.cs" -ReferencedAssemblies System.Drawing, System.Core, System.IO.Compression, System.IO.Compression.FileSystem, System.Windows.Forms
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, PresentationFramework, PresentationCore, WindowsBase, WindowsFormsIntegration, System.Security
