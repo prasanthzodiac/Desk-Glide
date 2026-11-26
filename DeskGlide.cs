@@ -1140,7 +1140,7 @@ public class Link {
   readonly bool[] phys = new bool[256]; volatile bool remoteGame; volatile int remoteX, remoteY;
   HookWatch hwKb, hwMs; long fwdAt, idleAt = -100000, hookNoteAt = -100000; int hookFixes;
   readonly int[] hx = new int[Hist], hy = new int[Hist]; int hn, mTail; byte[] lastM; long lastMAt;   // the sender's last positions
-  const int Hist = 4;   // positions per mouse packet: the newest and the 3 before it
+  const int Hist = 8;   // positions per mouse packet: the newest and the 7 before it (1 ms pacing: covers 7 lost in a row)
   readonly Held held = new Held(); int lastX = int.MinValue, lastY, rxSumX, rxSumY; bool rxRel, rxFresh; uint exec; IPAddress ifFor;   // receiver
   volatile IPAddress Peer2; Socket sock2; volatile IPAddress[] peerAddrs; IPAddress[] myAddrs = new IPAddress[0]; int firstIf = -1; long addrsAt = -100000;
   IntPtr qos; long lastDue, outageUntil; Thread delayer;
@@ -1155,6 +1155,7 @@ public class Link {
     try { sock.IOControl(-1744830452, new byte[4], null); } catch {}   // SIO_UDP_CONNRESET off: ignore "port unreachable"
     sock.SendBufferSize = sock.ReceiveBufferSize = 1 << 20;   // a Wi-Fi stall doesn't overflow them
     try { var v = new QOS_VERSION { Major = 1 }; if (!QOSCreateHandle(ref v, out qos)) qos = IntPtr.Zero; } catch { qos = IntPtr.Zero; }
+    NoTimerThrottling();
     msgs = Run(MsgLoop); winReady.WaitOne(3000);
     net = Run(NetLoop); pump = Run(PumpLoop);
     NetworkChange.NetworkAddressChanged += OnNetChange;
@@ -1240,7 +1241,19 @@ public class Link {
       }
     }
     Exec(false);
-    if (Active != timer1) { if (Active) timeBeginPeriod(1); else timeEndPeriod(1); timer1 = Active; }   // 1 ms waits only while in use
+    bool fine = Active || Controlled;   // both sides: the sender's 1 ms pacing, the receiver's acks and resends
+    if (fine != timer1) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); timer1 = fine; }   // 1 ms waits only while in use
+  }
+  // Windows 11 ignores timeBeginPeriod for processes with no visible window (DeskGlide lives in the tray),
+  // so every 1 ms wait became a 15.6 ms tick (loopback p99 15 ms). Opt out of that throttling, and of EcoQoS.
+  [StructLayout(LayoutKind.Sequential)] struct POWER_THROTTLING { public uint Version, ControlMask, StateMask; }
+  [DllImport("kernel32.dll")] static extern bool SetProcessInformation(IntPtr process, int infoClass, ref POWER_THROTTLING info, int size);
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  static void NoTimerThrottling() {
+    try {   // ProcessPowerThrottling = 4; EXECUTION_SPEED 0x1 | IGNORE_TIMER_RESOLUTION 0x4 controlled, state 0 = never throttle
+      var s = new POWER_THROTTLING { Version = 1, ControlMask = 0x1 | 0x4, StateMask = 0 };
+      SetProcessInformation(GetCurrentProcess(), 4, ref s, Marshal.SizeOf(typeof(POWER_THROTTLING)));
+    } catch {}   // older Windows: nothing to opt out of
   }
   void Kick(string why) { bool down; lock (gate) { conn.Kick(Ms); down = !conn.Up; } if (down && Key != null) Note("reconnecting: " + why); }
   void NewSession(string why) {   // a fresh nonce makes both PCs start a new session: no stale keys survive
@@ -1508,7 +1521,7 @@ public class Link {
       peerAddrs = a;
     }
   }
-  // The newest position wins by sequence; one to three lost packets are filled in from the history the next one carries
+  // The newest position wins by sequence; up to seven lost packets are filled in from the history the next one carries
   void Mouse(uint seq, int mode, byte[] p) {
     if (!Controlled) return;
     if (rxMSeq != 0 && (int)(seq - rxMSeq) <= 0) { Stale++; return; }   // older than what is already here, or a copy
