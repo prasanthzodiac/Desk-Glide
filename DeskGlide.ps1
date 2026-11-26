@@ -3,8 +3,11 @@
 #   -Test        self-check of the pure logic (no network, no monitor, no audio)
 #   -Console     output to this console instead of the tray, for debugging
 #   -ShowWindow  open the DeskGlide window right away
+#   -ServiceSetup / -ServiceRemove  (elevated, started by the app) install or remove the admin control service on this PC
 param(
   [switch]$Console, [switch]$Test, [switch]$Install, [switch]$Uninstall, [switch]$ShowWindow,
+  [switch]$ServiceSetup, [switch]$ServiceRemove,   # admin control (DeskGlideService.cs): run elevated by the app
+  [string]$SetupKey, [string]$SetupPeer, [string]$SetupPeerName,   # -ServiceSetup: the pairing key, the other PC's address and name
   # hidden, for debugging and for running two copies on one PC:
   [switch]$DryRun,                        # never send a DDC command, only print it
   [switch]$NoInject,                      # DeskGlide Link: no hooks, no Raw Input, no SendInput; log what it would inject
@@ -20,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.1'
+$Version = '5.2'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -36,8 +39,18 @@ $opp       = @{ left = 'right'; right = 'left'; up = 'down'; down = 'up' }
 
 # DeskGlide runs from its own copy in $appDir, so the downloaded folder can be moved or deleted and updates have one place to go
 $appDir   = Join-Path $DataDir 'app'
-$appFiles = 'DeskGlide.ps1', 'DeskGlide.cs', 'DeskGlide.ico', 'README.md', 'LICENSE', 'Install.cmd', 'Uninstall.cmd'
+$appFiles = 'DeskGlide.ps1', 'DeskGlide.cs', 'DeskGlideService.cs', 'DeskGlideHelper.cs', 'DeskGlide.ico', 'README.md', 'LICENSE', 'Install.cmd', 'Uninstall.cmd'
 function Arg-Line([string]$ps1) { "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ps1`"" }
+$svcName = 'DeskGlideService'; $svcDir = Join-Path $env:ProgramFiles 'DeskGlide'; $svcData = Join-Path $env:ProgramData 'DeskGlide\service'
+function Build-Service([string]$src, [string]$out) {
+  $csc = "$env:windir\Microsoft.NET\Framework64\v4.0.30319\csc.exe"; if (-not (Test-Path $csc)) { $csc = "$env:windir\Microsoft.NET\Framework\v4.0.30319\csc.exe" }
+  [void](New-Item -ItemType Directory -Force $out)
+  $refs = 'System', 'System.Core', 'System.Drawing', 'System.Windows.Forms', 'System.IO.Compression', 'System.IO.Compression.FileSystem', 'System.Security', 'System.ServiceProcess' | % { "/r:$_.dll" }
+  $o = & $csc /nologo /optimize /target:exe /main:ServiceMain "/out:$out\DeskGlideService.exe" @refs "$src\DeskGlide.cs" "$src\DeskGlideService.cs" "$src\DeskGlideHelper.cs" 2>&1
+  if ($LASTEXITCODE) { throw "can't build the service: $(($o | ? { $_ -match 'error' }) -join ' ')" }
+  $o = & $csc /nologo /optimize /target:winexe /main:HelperMain "/out:$out\DeskGlideHelper.exe" /r:System.Core.dll "$src\DeskGlideHelper.cs" 2>&1
+  if ($LASTEXITCODE) { throw "can't build the helper: $(($o | ? { $_ -match 'error' }) -join ' ')" }
+}
 function Copy-App([string]$from, [string]$to) {   # DeskGlide's own files only (no .git, docs or settings); returns the copies
   [void](New-Item -ItemType Directory -Force $to)
   foreach ($f in $appFiles) { $src = Join-Path $from $f; if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src (Join-Path $to $f) -Force; Join-Path $to $f } }
@@ -52,7 +65,8 @@ function Load-Config {
           paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
           kmHost = ''; inputs = @{}; monOff = @(); detach = $false
           hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048; mic = 'off'; updateAt = 0
-          link = -not (Test-Path $cfgPath); linkSpeed = 100; game = $false; lockSync = $false; panicKey = 'Ctrl+Alt+Pause'; dualPath = $true }   # Link: on for new installs; dualPath: Ethernet + Wi-Fi both
+          link = -not (Test-Path $cfgPath); linkSpeed = 100; game = $false; lockSync = $false; panicKey = 'Ctrl+Alt+Pause'; dualPath = $true
+          adminKey = ''; peerAdmin = $false }   # Link: on for new installs; dualPath: Ethernet + Wi-Fi both
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
   $c.inputs = To-Hash $c.inputs; $c.monOff = @($c.monOff | ? { $_ })
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
@@ -60,12 +74,13 @@ function Load-Config {
     $c.Remove('headphones')
   }
   $c.key = Unprotect-Key $c.key   # DeskGlide 3 stored it in plain text: the next Save-Config protects it
+  $c.adminKey = Unprotect-Key $c.adminKey   # the other PC's admin control service, when this PC controls it
   if (-not $c.key) { $c.peer = '' }   # no readable key (copied from another user or PC): pair again
   $c
 }
 function Save-Config {   # the pairing key goes to disk only encrypted for this Windows user (DPAPI)
   [void](New-Item -ItemType Directory -Force $ConfigDir)
-  $o = $C.Clone(); $o.key = Protect-Key $C.key
+  $o = $C.Clone(); $o.key = Protect-Key $C.key; $o.adminKey = Protect-Key $C.adminKey
   $o | ConvertTo-Json | Set-Content "$cfgPath.tmp" -Encoding UTF8; Move-Item -Force "$cfgPath.tmp" $cfgPath   # atomic: a crash never leaves half a file
 }
 # The pairing key (base64) <-> 'dpapi:<base64 blob>' in config.json, readable only by this Windows user on this PC.
@@ -173,7 +188,8 @@ function Merge-Settings($cfg, $m) {
 # mi (this PC's input on each monitor), mo (monitors that don't follow the mouse) and hk/ha (a hotkey press, for 10 s:
 # its time and the PC it showed), fo (files copied here: { id; n = how many; b = bytes; names }), mc (microphone mode) and
 # vc (VB-Cable is installed here). DeskGlide 5 adds lk (DeskGlide Link on), ls (lock both PCs together) and co (text or a
-# picture copied here: { id; k = 'text' or 'png'; b = bytes })
+# picture copied here: { id; k = 'text' or 'png'; b = bytes }). DeskGlide 5.2 adds as (admin control: this PC's service
+# receives the keyboard and mouse) and, in their own messages, adm (pairing that service: offer, answer, done).
 function State-Json($cfg) {
   @{ n = $Name; t = $S.t; s = $S.server; sa = ($S.active -eq 'me'); i = (My-Input); h = ($cfg.hp -eq $Name)
      m = $cfg.monitor; am = $cfg.audio; p = $cfg.paused; st = $cfg.syncAt; hp = $cfg.hp; v = $cfg.vol; ly = $cfg.layout
@@ -181,7 +197,7 @@ function State-Json($cfg) {
      ver = $Proto; sn = $S.screen; kh = $cfg.kmHost; mi = $cfg.inputs; mo = @($cfg.monOff)
      hk = $(if ((Now-Ms) - [long]$S.hk -lt 10000) { $S.hk } else { 0 }); ha = $S.hkTo
      fo = $(if ($cfg.files) { $S.offer } else { $null }); mc = $cfg.mic; vc = ($S.cable -ge 0)
-     lk = [bool]$cfg.link; ls = [bool]$cfg.lockSync; co = $S.clipOffer } | ConvertTo-Json -Compress -Depth 4
+     lk = [bool]$cfg.link; ls = [bool]$cfg.lockSync; co = $S.clipOffer; as = (Svc-On $S.svc) } | ConvertTo-Json -Compress -Depth 4
 }
 # The notice for files on the clipboard: small, so it fits in the state message; the names are only for the window
 function File-Offer([string]$id, [string[]]$paths, [long]$bytes) {
@@ -287,12 +303,18 @@ function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active, [int]
 }
 
 # DeskGlide Link's state in plain words. $l: the engine (or $null), $synergy: Synergy runs on this PC.
-function Link-Status($cfg, [bool]$paired, [bool]$online, [int]$peerVer, $l, [bool]$synergy) {
+function Link-Status($cfg, [bool]$paired, [bool]$online, [int]$peerVer, $l, [bool]$synergy, $svc = $null) {
   $peer = if ($cfg.peer) { $cfg.peer } else { 'the other PC' }
   if (-not $cfg.link) { return 'Off. Synergy shares the keyboard and mouse, and DeskGlide follows its log.' }
   if (-not $paired) { return 'Pair with your other PC first.' }
   if (-not $cfg.kmHost) { return 'Choose the PC your keyboard and mouse are plugged into.' }
   if ($synergy) { return 'Synergy is running on this PC. Quit it (and its service), so only DeskGlide moves the mouse.' }
+  if (Svc-On $svc) {   # admin control: the service receives here, not this app
+    if ($cfg.kmHost -eq $Name) { return "Admin control is on, so DeskGlide's service holds this PC's keyboard and mouse port. Turn admin control off to share this PC's keyboard and mouse." }
+    if ($svc.up -ne '1') { return "Admin control: on (service). Waiting for $peer..." }
+    if ($svc.controlled -eq '1') { return "The keyboard and mouse of $peer are on this PC, admin windows, UAC prompts and the lock screen included." }
+    return "Connected. The keyboard and mouse of $peer come here when its pointer crosses the edge, admin windows and the lock screen included."
+  }
   if ($online -and $peerVer -lt 5) { return "Update DeskGlide on $peer to share the keyboard and mouse." }
   if (-not $l) { return 'Starting...' }
   if ($l.VersionMsg) { return $l.VersionMsg }
@@ -306,6 +328,26 @@ function Link-Status($cfg, [bool]$paired, [bool]$online, [int]$peerVer, $l, [boo
   }
   if ($l.Controlled) { return "The keyboard and mouse of $peer are on this PC." }
   "Connected. The keyboard and mouse of $peer come here when its pointer crosses the edge."
+}
+# Admin control (DeskGlideService.cs) in plain words. $svc: the service's status here; $busy/$want: its elevated setup is
+# open; on the keyboard PC it describes the other PC's service instead.
+function Svc-State([string]$line) {   # 'ok enabled=1 paired=1 ...' -> @{ enabled = '1'; ... }, or $null
+  if ($line -notlike 'ok *') { return $null }
+  $h = @{}; foreach ($kv in $line.Substring(3) -split ' ') { $k, $v = $kv -split '=', 2; if ($k) { $h[$k] = $v } }; $h
+}
+function Svc-On($svc) { [bool]($svc -and $svc.enabled -eq '1' -and $svc.paired -eq '1') }
+function Admin-Status($cfg, $svc, [bool]$installed, [bool]$busy, [bool]$want, [bool]$hasKey) {
+  $peer = if ($cfg.peer) { $cfg.peer } else { 'the other PC' }
+  if ($busy) { if ($want) { return "Finish in the admin window that Windows opened: check that $peer shows the same number." } else { return 'Finish in the admin window that Windows opened.' } }
+  if ($cfg.kmHost -eq $Name -and -not (Svc-On $svc)) {
+    if ($cfg.peerAdmin -and $hasKey) { return "On at $peer`: its admin windows, UAC prompts and lock screen work from here. Ctrl+Alt+End there = Ctrl+Alt+Del." }
+    if ($cfg.peerAdmin) { return "On at $peer, but not paired with this PC. Turn it off and on again in DeskGlide on $peer." }
+    return "Turn this on in DeskGlide on $peer, the PC being controlled."
+  }
+  if (Svc-On $svc) { return "On (service). Ctrl+Alt+Del: $(if ($svc.sas -eq '1') { "press Ctrl+Alt+End on $peer" } else { 'not allowed' })." }
+  if ($svc) { return "DeskGlide's service runs here but isn't paired. Turn this off and on again." }
+  if ($installed) { return "DeskGlide's service is installed but doesn't answer. Turn this off and on again." }
+  "Off. Turning it on installs a small Windows service; Windows asks for permission once."
 }
 # The connection in one word: round trip and its jitter (ms), packet loss (%)
 function Link-Quality([double]$rtt, [double]$jitter, [double]$loss) {
@@ -368,7 +410,8 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         hk = [long]0; hkTo = ''; hkSeen = [long]0; lastSa = $null; hkSig = ''; hkErr = ''; msgWin = $null
         mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{}
         link = $null; linkAt = [DateTime]::MinValue; linkWant = $null; synergy = $false; synAt = [DateTime]::MinValue; speedAt = $null; psave = $false; psaveAt = [DateTime]::MinValue
-        clipOffer = $null; peerClip = $null; clipGot = ''; clipSig = ''; clipSetAt = [DateTime]::MinValue }
+        clipOffer = $null; peerClip = $null; clipGot = ''; clipSig = ''; clipSetAt = [DateTime]::MinValue
+        svc = $null; adminKey = $null; adminPend = $null; adminWant = $false; adminUntil = $null }
 $tray = $null; $win = $null; $ui = @{}; $icons = @(); $logos = @()
 
 function My-Input { if ($C.inputOverride) { [int]$C.inputOverride } else { [int]$C.input } }
@@ -528,6 +571,21 @@ if ($Test) {
   $eng.VersionMsg = 'DeskGlide on PC-B is older.'; Check ((Link-Status $L5 $true $true 5 $eng $false) -eq 'DeskGlide on PC-B is older.') 'link status: version mismatch'
   $L5.kmHost = ''; Check ((Link-Status $L5 $true $true 5 $eng $false) -match 'Choose the PC') 'link status: no keyboard PC'
   $L5.link = $false; Check ((Link-Status $L5 $true $true 5 $null $false) -match '^Off') 'link status: off'
+  # admin control: the service's status line, the card's texts on both PCs
+  $sv = Svc-State 'ok enabled=1 paired=1 link=1 up=1 controlled=1 helper=1 sas=1 peer=PC-A refused=0 dropped=0'
+  Check ($sv.controlled -eq '1' -and (Svc-On $sv) -and -not (Svc-On (Svc-State 'ok enabled=1 paired=0')) -and -not (Svc-On (Svc-State 'ok enabled=0 paired=1')) -and -not (Svc-State 'refused') -and -not (Svc-State '')) 'service status parsed'
+  $L5.link = $true; $L5.kmHost = 'PC-A'; $L5.peer = 'PC-A'; $Name = 'PC-B'
+  Check ((Link-Status $L5 $true $true 5 $null $false $sv) -match 'admin windows, UAC prompts and the lock screen included') 'link status: controlled through the service'
+  $sv.controlled = '0'; $sv.up = '0'; Check ((Link-Status $L5 $true $true 5 $null $false $sv) -match '^Admin control: on \(service\). Waiting for PC-A') 'link status: service waiting'
+  Check ((Admin-Status $L5 $sv $true $false $false $false) -match '^On \(service\). Ctrl\+Alt\+Del: press Ctrl\+Alt\+End on PC-A') 'admin status: on, Ctrl+Alt+Del allowed'
+  Check ((Admin-Status $L5 $null $false $false $false $false) -match '^Off. Turning it on installs') 'admin status: off'
+  Check ((Admin-Status $L5 $null $true $false $false $false) -match "installed but doesn't answer") 'admin status: installed, not running'
+  Check ((Admin-Status $L5 $null $false $true $true $false) -match 'check that PC-A shows the same number') 'admin status: setup open'
+  $Name = 'PC-A'; $L5.peer = 'PC-B'
+  Check ((Link-Status $L5 $true $true 5 $eng $false $sv) -match "service holds this PC's keyboard and mouse port") 'link status: service here, but this is the keyboard PC'
+  Check ((Admin-Status $L5 $null $false $false $false $false) -match '^Turn this on in DeskGlide on PC-B') 'admin status: keyboard PC'
+  $L5.peerAdmin = $true; Check (((Admin-Status $L5 $null $false $false $false $true) -match '^On at PC-B') -and ((Admin-Status $L5 $null $false $false $false $false) -match 'not paired with this PC')) 'admin status: the other PC has it'
+  $L5.peerAdmin = $false
 
   # hotkeys: RegisterHotKey values
   $k = Parse-Hotkey 'Ctrl+Alt+Right'; Check ($k.mods -eq 3 -and $k.vk -eq 0x27 -and $k.text -eq 'Ctrl+Alt+Right') 'hotkey: default'
@@ -811,7 +869,44 @@ if ($Test) {
   $vp = [LinkProto]::Seal($hk, 0, [byte[]](9..16), $hb, $hb.Length, [LinkProto]::Version + 1); $u = New-Object Net.Sockets.UdpClient; [void]$u.Send($vp, $vp.Length, '127.0.0.1', $lp); $u.Close()
   Check ((Until { $A.VersionMsg }) -and $A.VersionMsg -match 'PC-C is newer. Update DeskGlide on this PC') "version mismatch shown: $($A.VersionMsg)"
   $A.Stop(); $B.Stop(); [Link]::NoInject = $false
+
+  # admin control: build the service and helper (Windows' csc.exe), run the service's own security self-test, then the
+  # service in console mode (this user, temp folder, its own pipe, no injection: the helper logs what it would inject)
+  # receiving from an engine here over loopback
+  $sb = Join-Path $env:TEMP "dg-svc-$PID"; Build-Service $PSScriptRoot $sb
+  $st = & "$sb\DeskGlideService.exe" -SelfTest; Check ($LASTEXITCODE -eq 0 -and ($st -join "`n") -match 'service self-test ok \((\d+) checks\)') "service self-test: $($st | select -Last 1)"
+  $script:svcChecks = $matches[1]; $st | ? { $_ -match '^(  \w|authorization|this process|paths|pairing)' } | % { "  $_" }
+  $sd = Join-Path $sb 'data'; $sl = Join-Path $sd 'service.log'; [void](New-Item -ItemType Directory -Force $sd); $pipe = "DeskGlideTest-$PID"
+  function Logged([string]$pat) { (Test-Path $sl) -and ((Get-Content $sl -Raw) -match $pat) }
+  $sp = Start-Process "$sb\DeskGlideService.exe" "-Console -Data `"$sd`" -Pipe $pipe -Port $($lp + 1) -PeerPort $lp -NoInject -SeedKey $([Convert]::ToBase64String($pk))" -PassThru -WindowStyle Hidden
+  try {
+    [Link]::NoInject = $true; $A = New-Link $one 'PC-A'; $A.Sender = $true; $A.Dir = 'r'; $A.SetCursor(1900, 540); $A.Start($lp, $lp + 1)
+    Check ((Until { $A.Up -and $A.HasRemote } 8000) -and (Logged 'helper: input desktop: ')) 'service: connected; its helper follows the input desktop and reports the monitors'
+    $A.FeedMouse(30, 0, 0, 0); Check ((Until { $A.Active }) -and (Until { Logged 'would inject mouse -?\d+,-?\d+ data 0 flags C001' })) 'service: across the edge, an absolute move through the helper'
+    $A.FeedKey(0x41, 0x1E, 0, 1); $A.FeedKey(0x41, 0x1E, 0x80, 2)
+    Check (Until { (Logged 'would inject key vk 00 sc 1E flags 8') -and (Logged 'would inject key vk 00 sc 1E flags 10') }) 'service: a key down and up by scan code'
+    $A.FeedKey(0xA2, 0x1D, 0, 3); $A.FeedKey(0xA4, 0x38, 0, 4); $A.FeedKey(0x23, 0x4F, 1, 5); $A.FeedKey(0x23, 0x4F, 0x81, 6)
+    Check ((Until { Logged 'would press Ctrl\+Alt\+Del \(SendSAS\)' }) -and -not (Logged 'sc 4F')) 'service: Ctrl+Alt+End presses Ctrl+Alt+Del (SendSAS), End itself not injected'
+    $s1 = [SvcPipe]::Call($pipe, 'status', 2000, $false)
+    Check ($s1 -match '^ok enabled=1 paired=1 link=1 up=1 controlled=1 helper=1') "service pipe: status for a normal user: $s1"
+    $deny = foreach ($v in "pair $([Convert]::ToBase64String((New-Object byte[] 32))) - -", 'unpair', 'disable', 'enable', 'peer 1.2.3.4', 'bogus') { [SvcPipe]::Call($pipe, $v, 2000, $false) }
+    Check (@($deny | ? { $_ -ne 'refused' }).Count -eq 0 -and (Logged "refused 'pair' from .*only an elevated administrator")) 'service pipe: pairing and settings refused for a non-elevated user, and logged'
+    Check ($null -eq [SvcPipe]::Call($pipe, 'status', 2000, $true)) 'service pipe: the app talks only to the installed service in session 0'
+    Check ([SvcPipe]::Call($pipe, 'panic', 2000, $false) -eq 'ok' -and (Until { [SvcPipe]::Call($pipe, 'status', 2000, $false) -match 'controlled=0' }) -and (Until { (Logged 'sc 1D flags 10') -and (Logged 'sc 38 flags 10') })) 'service pipe: panic ends control, releases the held Ctrl and Alt'
+    $bad = [LinkProto]::Seal([Dg]::DeriveKey('zzzz-zzzz'), 0, [byte[]](1..8), (New-Object byte[] 20), 20, [LinkProto]::Version)
+    $u = New-Object Net.Sockets.UdpClient; 1..200 | % { [void]$u.Send($bad, $bad.Length, '127.0.0.1', $lp + 1) }; $u.Close(); Start-Sleep -Milliseconds 300
+    $s2 = [SvcPipe]::Call($pipe, 'status', 2000, $false)
+    Check ($s2 -match 'refused=(\d+)' -and [int]$matches[1] -ge 150 -and $s2 -match 'up=1') "service: a flood of 200 hellos under another key dropped unchecked past the rate limit, session up ($s2)"
+    $A.Stop(); [Link]::NoInject = $false
+  } finally {
+    Set-Content (Join-Path $sd 'stop') ''; [void]$sp.WaitForExit(8000)
+    Check ($sp.HasExited) 'service: stops cleanly'
+    Start-Sleep -Milliseconds 300
+    Check (-not (Get-Process DeskGlideHelper -ErrorAction SilentlyContinue | ? { $_.Path -like "$sb*" })) 'service: its helper exits with it'
+    Remove-Item -Recurse -Force $sb
+  }
   "link loopback: moves p50/p99/max $latMove, keys $latKey, heartbeat RTT $('{0:0.00}' -f $rtt) ms, loss noticed after $([int]$lossMs) ms, back after $([int]$backMs) ms"
+  "service: $svcChecks security checks, loopback with this sender ok"
   "link hotspot (10% loss, 0..50 ms jitter, 300 ms outage): cursor jumps $jumps, keys in order, recovered $([int]$recMs) ms after the outage; $hot"
 
   # monitors: each PC's input per monitor, unchecked monitors stay put, DeskGlide 3 peers have one input for all
@@ -854,6 +949,8 @@ if ($Test) {
   # pairing key at rest: DPAPI-protected for this Windows user; DeskGlide 3's plain key is migrated on the next save
   $raw = Get-Content $cfgPath -Raw
   Check ($raw -match '"key":\s*"dpapi:' -and $raw -notmatch 'a2V5' -and $C.key -eq 'a2V5') 'key protected on disk, plain in memory'
+  $C.adminKey = 'c3Zj'; $C.peerAdmin = $true; Save-Config; $raw = Get-Content $cfgPath -Raw; $C = Load-Config
+  Check ($raw -match '"adminKey":\s*"dpapi:' -and $raw -notmatch 'c3Zj' -and $C.adminKey -eq 'c3Zj' -and $C.peerAdmin) "the other PC's admin service key protected on disk too"
   Check (-not (Test-Path "$cfgPath.tmp")) 'config written atomically (no temp file left)'
   Set-Content $cfgPath '{"peer":"PC-B","key":"a2V5"}'; $C = Load-Config; Check ($C.key -eq 'a2V5') 'DeskGlide 3 plain key read'
   Save-Config; Check ((Get-Content $cfgPath -Raw) -notmatch 'a2V5' -and (Load-Config).key -eq 'a2V5') 'plain key migrated'
@@ -876,6 +973,96 @@ function Set-Startup([bool]$on, [string]$ps1 = $PSCommandPath) {
   $sc.TargetPath = "$PSHOME\powershell.exe"; $sc.Arguments = Arg-Line $ps1; $sc.WorkingDirectory = Split-Path $ps1; $sc.IconLocation = Join-Path (Split-Path $ps1) 'DeskGlide.ico'; $sc.Save()
 }
 
+# ---------------------------------------------------------------- admin control (optional, elevated)
+# DeskGlideService.cs and DeskGlideHelper.cs, compiled with the C# compiler that comes with Windows (no downloads). The
+# setup copies them into C:\Program Files\DeskGlide (only administrators can change it) and builds them there; the service
+# never runs anything from a folder a user can change. Like any installer, it trusts DeskGlide's files as they are when you
+# approve Windows' prompt.
+function Install-AdminService {
+  Write-Host 'Installing the DeskGlide service...'
+  $old = Get-Service $svcName -ErrorAction SilentlyContinue
+  if ($old -and $old.Status -ne 'Stopped') { Stop-Service $svcName -Force; $old.WaitForStatus('Stopped', '00:00:20') }
+  [void](New-Item -ItemType Directory -Force $svcDir)
+  # Program Files already lets only administrators change it; this makes sure: SYSTEM and Administrators full, Users read
+  [void](& icacls.exe $svcDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q)
+  foreach ($f in 'DeskGlide.cs', 'DeskGlideService.cs', 'DeskGlideHelper.cs') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) (Join-Path $svcDir $f) -Force }
+  Build-Service $svcDir $svcDir
+  [void](& icacls.exe $svcDir /setowner '*S-1-5-32-544' /T /Q)
+  $exe = Join-Path $svcDir 'DeskGlideService.exe'
+  if (-not $old) { [void](New-Service -Name $svcName -BinaryPathName "`"$exe`"" -DisplayName 'DeskGlide admin control' -StartupType Automatic -Description "Lets DeskGlide on your other PC control this PC's admin windows, UAC prompts and lock screen. Turn it off in DeskGlide.") }
+  [void](& sc.exe failure $svcName reset= 86400 actions= restart/5000/restart/5000/restart/60000)
+  Start-Service $svcName
+  $t0 = Get-Date; while (-not ([SvcPipe]::Call($svcName, 'status', 1000, $true)) -and ((Get-Date) - $t0).TotalSeconds -lt 15) { Start-Sleep -Milliseconds 300 }
+  if (-not [SvcPipe]::Call($svcName, 'status', 1000, $true)) { throw "The service doesn't answer. Its log: $svcData\service.log" }
+  Write-Host 'The service is running.'
+}
+# The service's own key: an ECDH exchange with the other PC under the pairing key, confirmed by the user comparing a number
+# on both screens (SvcPair). The key then goes to the service over its pipe, which takes it only from an elevated administrator.
+function Pair-AdminService {
+  $key = [Convert]::FromBase64String($SetupKey); $ip = [Net.IPAddress]::Parse($SetupPeer)
+  if ($SetupPeerName -notmatch '^[A-Za-z0-9._-]{1,63}$') { throw "bad PC name $SetupPeerName" }
+  $p = New-Object SvcPair; $mine = $p.Pub; $id = [Dg]::Hex([Dg]::Random(8)); $k = $null; $chk = $null
+  $u = New-Object Net.Sockets.UdpClient(0); $u.Client.ReceiveTimeout = 500
+  try {
+    $offer = [Text.Encoding]::UTF8.GetBytes([Dg]::Seal($key, (@{ n = $Name; adm = 'offer'; id = $id; pub = [Convert]::ToBase64String($mine) } | ConvertTo-Json -Compress)))
+    Write-Host "Pairing with $SetupPeerName ($SetupPeer). DeskGlide 5.2 or newer must be running there..."
+    $t0 = Get-Date
+    while (-not $k -and ((Get-Date) - $t0).TotalSeconds -lt 120) {
+      [void]$u.Send($offer, $offer.Length, (New-Object Net.IPEndPoint($ip, $PeerPort)))
+      $until = (Get-Date).AddSeconds(2)
+      while (-not $k -and (Get-Date) -lt $until) {
+        $ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)
+        try { $raw = $u.Receive([ref]$ep) } catch { continue }
+        $json = [Dg]::Open($key, [Text.Encoding]::UTF8.GetString($raw)); if (-not $json) { continue }
+        $m = $json | ConvertFrom-Json; if ($m.adm -ne 'answer' -or $m.id -ne $id) { continue }
+        try { $theirs = [Convert]::FromBase64String([string]$m.pub) } catch { continue }
+        $k = $p.Finish($mine, $theirs, $theirs, [ref]$chk)
+      }
+    }
+    if (-not $k) { throw "$SetupPeerName didn't answer. Check that DeskGlide 5.2 or newer runs there, then turn admin control on again." }
+    Write-Host ''; Write-Host "      $chk" -ForegroundColor Cyan; Write-Host ''
+    $yes = Read-Host "DeskGlide on $SetupPeerName shows a number now. Is it $chk? Type y and press Enter if it is"
+    if ($yes -notmatch '^\s*y') { throw "Not paired: the numbers must match. If they didn't, a program on this PC or your network may be in between." }
+    $r = [SvcPipe]::Call($svcName, "pair $([Convert]::ToBase64String($k)) $SetupPeer $SetupPeerName", 5000, $true)
+    if ($r -ne 'ok') { throw "The service didn't take the pairing: $(if ($r) { $r } else { [SvcPipe]::LastError })" }
+    $done = [Text.Encoding]::UTF8.GetBytes([Dg]::Seal($key, (@{ n = $Name; adm = 'done'; id = $id; proof = [Convert]::ToBase64String([SvcPair]::Proof($k, $id)) } | ConvertTo-Json -Compress)))
+    1..3 | % { [void]$u.Send($done, $done.Length, (New-Object Net.IPEndPoint($ip, $PeerPort))); Start-Sleep -Milliseconds 300 }
+  } finally { $u.Close(); $p.Dispose() }
+  Write-Host "Paired. $SetupPeerName can now use this PC's admin windows, UAC prompts and lock screen."
+  Write-Host ''
+  Write-Host "Ctrl+Alt+Del can't travel between PCs: Windows always handles it on the PC where it is pressed. DeskGlide can press it"
+  Write-Host "here when you press Ctrl+Alt+End on $SetupPeerName. That needs the Windows policy 'Disable or enable software Secure"
+  Write-Host "Attention Sequence' set to allow services (SoftwareSASGeneration = 1 under HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\"
+  Write-Host 'Policies\System). Other services on this PC could then press Ctrl+Alt+Del too (they already run as SYSTEM). Turning admin'
+  Write-Host 'control off puts the old value back.'
+  $sas = Read-Host 'Allow Ctrl+Alt+Del? Type y and press Enter to allow it, or just press Enter for no'
+  & (Join-Path $svcDir 'DeskGlideService.exe') -Sas $(if ($sas -match '^\s*y') { 'on' } else { 'off' })
+}
+function Remove-AdminService {
+  $exe = Join-Path $svcDir 'DeskGlideService.exe'
+  if (Test-Path -LiteralPath $exe) { & $exe -Sas off }   # the Ctrl+Alt+Del policy as it was before DeskGlide
+  $sv = Get-Service $svcName -ErrorAction SilentlyContinue
+  if ($sv) {
+    if ($sv.Status -ne 'Stopped') { Stop-Service $svcName -Force; $sv.WaitForStatus('Stopped', '00:00:20') }
+    [void](& sc.exe delete $svcName)
+  }
+  Get-Process DeskGlideHelper -ErrorAction SilentlyContinue | ? { $_.Path -eq (Join-Path $svcDir 'DeskGlideHelper.exe') } | Stop-Process -Force
+  Start-Sleep -Milliseconds 500
+  foreach ($d in $svcDir, $svcData) { if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force } }
+  $parent = Split-Path $svcData; if ((Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent -Force)) { Remove-Item -LiteralPath $parent -Force }
+  Write-Host 'Admin control removed: the service, its program folder and its key are gone.'
+}
+if ($ServiceSetup -or $ServiceRemove) {
+  $Host.UI.RawUI.WindowTitle = 'DeskGlide admin control'
+  try {
+    if (-not (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+      throw 'Admin control is set up from the DeskGlide window, which asks Windows for permission first.'
+    }
+    if ($ServiceRemove) { Remove-AdminService } else { Install-AdminService; Pair-AdminService; Write-Host ''; Write-Host 'Admin control is on.' -ForegroundColor Green }
+  } catch { Write-Host "Admin control: $($_.Exception.Message)" -ForegroundColor Red }
+  [void](Read-Host 'Press Enter to close'); return
+}
+
 if ($Install -or $Uninstall) {
   # stop running copies (also DeskGlide 1's deskglide.ps1 / deskglide-audio.ps1, which this replaces)
   Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
@@ -884,6 +1071,10 @@ if ($Install -or $Uninstall) {
   Start-Sleep -Milliseconds 500
   Restore-Muted
   if ($Uninstall) {
+    if (Test-Path -LiteralPath (Join-Path $svcDir 'DeskGlideService.exe')) {   # admin control is installed: removing it needs Windows' permission
+      'Removing admin control (Windows asks for permission)...'
+      try { Start-Process "$PSHOME\powershell.exe" "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ServiceRemove" -Verb RunAs -Wait } catch { "Admin control stays installed: $($_.Exception.Message)" }
+    }
     Set-Startup $false
     Remove-Item -LiteralPath $appDir -Recurse -Force -ErrorAction SilentlyContinue
     "DeskGlide removed. Your settings are kept in $ConfigDir"; return
@@ -943,12 +1134,14 @@ function Receive-Control {
     if ($m.n -eq $Name) { continue }            # our own broadcast
     if (-not $C.peer) { $C.peer = $m.n; $S.code = ''; Save-Config; Say "Paired with $($m.n)." info }
     if ($m.n -ne $C.peer) { continue }
+    if ($m.adm) { Admin-Pairing $m $ep; continue }   # pairing the other PC's admin control service: its own messages
     # ponytail: replay guard is "timestamp must grow"; it resets after 30 s of silence so a peer whose clock jumped back recovers
     if (((Get-Date) - $S.peerSeen).TotalSeconds -gt 30) { $S.lastT = 0 }
     if ([long]$m.t -le $S.lastT) { continue }
     $S.lastT = [long]$m.t; $S.okCtl++
     if (-not $S.peerAddr -or -not $S.peerAddr.Equals($ep.Address)) { Say "Found $($m.n) at $($ep.Address)." }
     $S.peerAddr = $ep.Address; $S.peerSeen = Get-Date; $S.peerInput = [int]$m.i
+    if ($null -ne $m.as -and [bool]$m.as -ne [bool]$C.peerAdmin) { $C.peerAdmin = [bool]$m.as; Save-Config }   # kept: the sign-in screen sends nothing
     $S.peerVer = [int]$m.ver; $S.peerScreen = if ($m.sn) { [string]$m.sn } else { [string]$m.n }
     $S.peerInputs = To-Hash $m.mi; $S.peerOffer = $m.fo; $S.peerCable = [bool]$m.vc; $S.peerClip = $m.co
     # remember the address for the next start; only replace it once it went quiet, so a peer on two adapters doesn't flip-flop
@@ -962,6 +1155,32 @@ function Receive-Control {
       $S.hkSeen = [long]$m.hk; $S.want = $null
       if ($m.ha -eq $Name) { Set-Active 'me' $S.screen } elseif ($m.ha) { Set-Active 'peer' $S.peerScreen }
     }
+  }
+}
+
+# The other PC's elevated setup pairs its admin control service with this PC (SvcPair): answer its ECDH offer and show the
+# number to compare there; once the user confirmed it there (and the service took the key), keep the service's key.
+function Admin-Pairing($m, $ep) {
+  if ($m.adm -eq 'offer') {
+    if (-not $S.adminPend -or $S.adminPend.id -ne [string]$m.id) {   # it resends its offer: the same answer each time
+      try { $theirs = [Convert]::FromBase64String([string]$m.pub) } catch { return }
+      $p = New-Object SvcPair; $mine = $p.Pub; $chk = $null
+      try { $k = $p.Finish($theirs, $mine, $theirs, [ref]$chk) } finally { $p.Dispose() }
+      if (-not $k) { return }
+      $S.adminPend = @{ id = [string]$m.id; key = $k; check = $chk; mine = $mine; at = Get-Date }
+      Say "Admin control on $($m.n): check that it shows $chk, then confirm there." info
+      if (-not $Console) { Show-Window }
+    }
+    $a = $S.adminPend
+    $b = [Text.Encoding]::UTF8.GetBytes([Dg]::Seal($S.key, (@{ n = $Name; adm = 'answer'; id = $a.id; pub = [Convert]::ToBase64String($a.mine) } | ConvertTo-Json -Compress)))
+    try { [void]$udp.Send($b, $b.Length, $ep) } catch {}
+  } elseif ($m.adm -eq 'done' -and $S.adminPend -and [string]$m.id -eq $S.adminPend.id) {
+    $proof = try { [Convert]::FromBase64String([string]$m.proof) } catch { $null }
+    if ($proof -and [Dg]::Hex($proof) -eq [Dg]::Hex([SvcPair]::Proof($S.adminPend.key, $S.adminPend.id))) {
+      $S.adminKey = $S.adminPend.key; $C.adminKey = [Convert]::ToBase64String($S.adminKey); $C.peerAdmin = $true; Save-Config
+      Say "Admin control on $($m.n) is paired with this PC." info
+    }
+    $S.adminPend = $null
   }
 }
 
@@ -1095,6 +1314,15 @@ function Poll-Clip {
 function Poll-Link {
   $on = $C.link -and $S.key -and $C.peer
   if (-not $on) { if ($S.link) { $S.link.Stop(); $S.link = $null; $S.linkWant = $null; Say 'Keyboard and mouse sharing stopped.' }; return }
+  $svc = $S.svc
+  if (Svc-On $svc) {   # admin control: DeskGlide's service receives here (and holds the port), not this app
+    if ($S.link) { $S.link.Stop(); $S.link = $null; Say "Admin control is on: DeskGlide's service receives the keyboard and mouse on this PC." }
+    if ($C.kmHost -ne $Name -and $svc.up -eq '1') {
+      $want = if ($svc.controlled -eq '1') { 'me' } else { 'peer' }
+      if ($want -ne $S.linkWant) { $S.linkWant = $want; $S.want = $want; $S.wantName = $(if ($want -eq 'me') { $S.screen } else { $S.peerScreen }); $S.since = Get-Date }
+    }
+    return
+  }
   if (-not $S.link) {
     if (((Get-Date) - $S.linkAt).TotalSeconds -lt 10) { return }   # the port was busy: try again in a while
     $S.linkAt = Get-Date
@@ -1103,7 +1331,8 @@ function Poll-Link {
     $S.link = $l; Say "Keyboard and mouse sharing on UDP port $($Port + 2)$(if ($NoInject) { ', no injection' })."
   }
   $l = $S.link
-  $l.Key = $S.key; if ($S.peerAddr) { $l.Peer = $S.peerAddr } elseif ($S.fixedIp -and -not $l.Peer) { $l.Peer = $S.fixedIp }
+  $l.Key = if ($C.peerAdmin -and $S.adminKey -and $C.kmHost -eq $Name) { $S.adminKey } else { $S.key }   # the other PC's admin service has its own key
+  if ($S.peerAddr) { $l.Peer = $S.peerAddr } elseif ($S.fixedIp -and -not $l.Peer) { $l.Peer = $S.fixedIp }
   $l.Sender = $C.kmHost -eq $Name
   $lay = (Current-Layout).show; $l.Dir = [char]$(if ($lay) { $lay.dir[0] } else { 'r' })
   $l.Speed = [Math]::Max(25, [Math]::Min(400, [int]$C.linkSpeed)); $l.Game = [bool]$C.game; $l.LockSync = [bool]$C.lockSync; $l.DualPath = $C.dualPath -ne $false
@@ -1240,6 +1469,7 @@ function Save-Muted {
 function Tick {
   $now = Get-Date
   Receive-Control
+  $S.svc = Svc-State ([SvcPipe]::Last)
   if ($C.link) { Poll-Link }   # DeskGlide Link says where the mouse is; without it, Synergy's log does
   else {
     if ($S.link) { Poll-Link }
@@ -1253,7 +1483,7 @@ function Tick {
   if ($S.want -and $S.want -ne $S.active -and ($now - $S.since).TotalMilliseconds -ge $(if ($S.link) { 250 } else { 400 })) { Set-Active $S.want $S.wantName }
   if ($showEvt.WaitOne(0)) { Show-Window }   # DeskGlide was started again: show this copy instead
   $hk = [MsgWin]::Pressed
-  if ($hk -eq 3) { [MsgWin]::Pressed = 0; if ($S.link) { $S.link.Panic() } }   # the panic key while this PC has the keyboard and mouse
+  if ($hk -eq 3) { [MsgWin]::Pressed = 0; if ($S.link) { $S.link.Panic() } elseif (Svc-On $S.svc) { [void][SvcPipe]::Call($svcName, 'panic', 500, $true) } }   # the panic key while this PC has the keyboard and mouse
   elseif ($hk) { [MsgWin]::Pressed = 0; Show-Pc $(if ($hk -eq 1) { 'peer' } else { 'me' }) }
   if ([MsgWin]::ClipChanged) { Check-Clipboard }
   if ($S.n++ % 5) { return }   # the rest twice a second
@@ -1331,6 +1561,7 @@ function Set-Key([string]$code) {
 function Unpair {
   $S.key = $null; $C.key = ''; $C.peer = ''; $C.peerAddress = ''; $S.peerAddr = $null; $S.fixedIp = $null
   $S.code = ''; $S.pairErr = ''; $S.unpairAt = $null; $S.peerInput = 0; $S.peerLinks = @()
+  $C.adminKey = ''; $C.peerAdmin = $false; $S.adminKey = $null
   Save-Config; Say 'Unpaired.'
 }
 function Use-Address([string]$text) {
@@ -1558,6 +1789,9 @@ $xaml = @'
               <CheckBox x:Name="LockToggle" Style="{StaticResource Switch}" Margin="0,12,0,0"><StackPanel>
                 <TextBlock Text="Lock both PCs together"/>
                 <TextBlock Style="{StaticResource Sub}" Text="Win+L on one PC locks the other one too."/></StackPanel></CheckBox>
+              <CheckBox x:Name="SvcToggle" Style="{StaticResource Switch}" Margin="0,12,0,0"><StackPanel>
+                <TextBlock Text="Control admin windows, UAC prompts and the lock screen on this PC" TextWrapping="Wrap"/>
+                <TextBlock x:Name="SvcWhy" Style="{StaticResource Sub}"/></StackPanel></CheckBox>
               <TextBlock Style="{StaticResource Label}" Text="Panic key: keyboard and mouse back here"/>
               <TextBox x:Name="PanicKey"/>
               <TextBlock Style="{StaticResource Sub}" Margin="0,4,0,0" Text="Works without the network. Also releases any stuck key."/>
@@ -1722,6 +1956,11 @@ $xaml = @'
           <TextBlock Style="{StaticResource Body}" Text="DeskGlide shares them with the other PC: move the mouse off the edge of the screen and keep typing there. Both PCs share this choice."/>
           <Border x:Name="KmHostWiz" Margin="0,18,0,0"/>
           <TextBlock Style="{StaticResource Sub}" Margin="0,12,0,0" Text="Using Synergy today? Quit it on both PCs once the Keyboard &amp; mouse card says Connected."/>
+          <Border x:Name="WizAdmin" Style="{StaticResource InsetBox}" Padding="16,12" Margin="0,18,0,0"><StackPanel>
+            <TextBlock FontWeight="SemiBold" Text="Optional, on this PC: admin windows and the lock screen"/>
+            <TextBlock Style="{StaticResource Sub}" Margin="0,4,0,0" Text="Windows keeps normal apps out of admin windows, UAC prompts, the lock screen and Ctrl+Alt+Del. A small DeskGlide service lets the other PC's keyboard and mouse work there too. Windows asks for permission once, then you compare a number on both PCs."/>
+            <Button x:Name="WizAdminGo" Content="Set up admin control..." HorizontalAlignment="Left" Margin="0,10,0,0"/>
+          </StackPanel></Border>
         </StackPanel>
         <StackPanel x:Name="W4" Visibility="Collapsed">
           <TextBlock Style="{StaticResource Big}" Text="Show each PC on the monitor once"/>
@@ -1840,6 +2079,8 @@ function New-Window {
   On KmMe Checked { if ($C.kmHost -ne $Name) { $C.kmHost = $Name; Changed } }
   On KmPeer Checked { if ($C.peer -and $C.kmHost -ne $C.peer) { $C.kmHost = $C.peer; Changed } }
   On LinkToggle Checked, Unchecked { if ([bool]$C.link -ne [bool]$ui.LinkToggle.IsChecked) { $C.link = -not $C.link; Changed } }
+  On SvcToggle Checked, Unchecked { $w = [bool]$ui.SvcToggle.IsChecked; if (-not $S.adminUntil -and $w -ne (Svc-On $S.svc)) { Admin-Setup $w } }
+  On WizAdminGo Click { Admin-Setup $true }
   On GameToggle Checked, Unchecked { if ([bool]$C.game -ne [bool]$ui.GameToggle.IsChecked) { $C.game = -not $C.game; Save-Config } }
   On LockToggle Checked, Unchecked { if ([bool]$C.lockSync -ne [bool]$ui.LockToggle.IsChecked) { $C.lockSync = -not $C.lockSync; Changed } }
   On Speed ValueChanged { $v = [int]$ui.Speed.Value; if ($v -ne $C.linkSpeed) { $C.linkSpeed = $v; $S.speedAt = Get-Date } }
@@ -1894,6 +2135,22 @@ function Drop-Peer {   # the side of this PC's box where the other box was let g
   $dx = $p.X - $me.X; $dy = $p.Y - $me.Y
   if ([Math]::Abs($dx) -ge [Math]::Abs($dy)) { Set-Layout $(if ($dx -lt 0) { 'left' } else { 'right' }) }
   else { Set-Layout $(if ($dy -lt 0) { 'up' } else { 'down' }) }
+}
+
+function Admin-Setup([bool]$on) {   # the admin control switch: one Windows prompt, the rest in that admin window
+  $peer = Peer-Label
+  if ($on) {
+    $addr = @($S.peerAddr, $S.fixedIp | ? { $_ })[0]
+    if (-not $S.key -or -not $C.peer -or -not $addr) { [void][Windows.MessageBox]::Show("Pair with $peer first, and keep DeskGlide running on both PCs.", 'DeskGlide'); return }
+    $text = "Windows keeps normal apps, DeskGlide included, out of admin windows, UAC prompts, the lock and sign-in screen and Ctrl+Alt+Del. To let $peer control those on this PC, DeskGlide installs a small Windows service in C:\Program Files\DeskGlide that receives the keyboard and mouse here.`n`nThe service has its own key, which programs running on this PC can't read, so they can't use it to click Yes on an admin prompt.`n`nWindows asks for permission next. In the admin window that opens, check that $peer shows the same number, then type y."
+    if ([Windows.MessageBox]::Show($text, 'DeskGlide: admin control', 'OKCancel', 'Information') -ne 'OK') { return }
+    $a = "-ServiceSetup -SetupKey $([Convert]::ToBase64String($S.key)) -SetupPeer $addr -SetupPeerName $($C.peer) -Name $Name -PeerPort $PeerPort"
+  } else {
+    if ([Windows.MessageBox]::Show("Turn admin control off? $peer then can't use this PC's admin windows, UAC prompts and lock screen. The service and its key are removed; Windows asks for permission.", 'DeskGlide: admin control', 'OKCancel', 'Question') -ne 'OK') { return }
+    $a = '-ServiceRemove'
+  }
+  try { Start-Process "$PSHOME\powershell.exe" "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $a" -Verb RunAs; $S.adminWant = $on; $S.adminUntil = (Get-Date).AddMinutes(3) }
+  catch { Say "Admin control: Windows' permission wasn't given." }
 }
 
 function Pair-Entered {
@@ -1976,8 +2233,9 @@ function Update-Ui {
   $ui.KmMe.Content = $Name; $ui.KmPeer.Content = $peer; $ui.KmPeer.IsEnabled = $paired
   $ui.KmMe.IsChecked = $C.kmHost -eq $Name; $ui.KmPeer.IsChecked = $paired -and $C.kmHost -eq $C.peer
   $ui.LinkToggle.IsChecked = [bool]$C.link; $l = $S.link; $up = $l -and $l.Up
-  $ui.LinkWhy.Text = Link-Status $C $paired $online $S.peerVer $l $S.synergy
-  $ui.LinkDot.Fill = Brush $(if ($up -and -not $S.synergy -and -not $l.InjectError) { 'Good' } elseif ($C.link) { 'Warn' } else { 'Fg2' })
+  $ui.LinkWhy.Text = Link-Status $C $paired $online $S.peerVer $l $S.synergy $S.svc
+  $svcOn = Svc-On $S.svc
+  $ui.LinkDot.Fill = Brush $(if (($up -and -not $S.synergy -and -not $l.InjectError) -or ($svcOn -and $S.svc.up -eq '1' -and $C.kmHost -ne $Name)) { 'Good' } elseif ($C.link) { 'Warn' } else { 'Fg2' })
   Show-If $ui.LinkStats $up; $tips = @()
   if ($up) {
     $ui.LinkStats.Inlines.Clear()
@@ -1989,10 +2247,15 @@ function Update-Ui {
     } else { $ui.LinkStats.Inlines.Add((New-Object Windows.Documents.Run 'Measuring the connection...')) }
     if ($l.Wireless -and $S.psave) { $tips += 'Your Wi-Fi saves power between packets; for smoother control set Power mode to Best performance or use a cable.' }
   }
+  if ($S.adminPend -and ((Get-Date) - $S.adminPend.at).TotalMinutes -lt 3) { $tips += "Admin control on $peer`: check that it shows $($S.adminPend.check), then confirm there." }
   $ui.LinkTip.Text = $tips -join "`n"; Show-If $ui.LinkTip $tips.Count
   Show-If $ui.LinkMore $C.link
   if (-not $S.speedAt -and $ui.Speed.Value -ne $C.linkSpeed) { $ui.Speed.Value = $C.linkSpeed }; $ui.SpeedPct.Text = "$($C.linkSpeed)%"
   $ui.GameToggle.IsChecked = [bool]$C.game; $ui.LockToggle.IsChecked = [bool]$C.lockSync
+  $busy = [bool]($S.adminUntil -and (Get-Date) -lt $S.adminUntil -and $S.adminWant -ne $svcOn); if (-not $busy) { $S.adminUntil = $null }
+  $ui.SvcToggle.IsChecked = if ($busy) { $S.adminWant } else { $svcOn }; $ui.SvcToggle.IsEnabled = $svcOn -or $C.kmHost -ne $Name
+  $ui.SvcWhy.Text = Admin-Status $C $S.svc (Test-Path -LiteralPath (Join-Path $svcDir 'DeskGlideService.exe')) $busy $S.adminWant ([bool]$S.adminKey)
+  Show-If $ui.WizAdmin ($C.kmHost -and $C.kmHost -ne $Name -and -not $svcOn)
 
   # sound
   $ui.AFollow.IsChecked = $C.audio -eq 'follow'; $ui.ABoth.IsChecked = $C.audio -eq 'both'; $ui.AOff.IsChecked = $C.audio -eq 'off'
@@ -2132,6 +2395,8 @@ try {
   [void]$S.msgWin.ListenClipboard(); [Files]::Key = $S.key; [Files]::Serve($Port + 1)   # files: TCP on the control port + 1
   $S.screen = if ($C.screenName) { $C.screenName } else { $Name }
   if ($C.key) { $S.key = [Convert]::FromBase64String($C.key) }
+  if ($C.adminKey) { $S.adminKey = [Convert]::FromBase64String($C.adminKey) }
+  [SvcPipe]::Watch()   # admin control: this PC's service, if installed
   if ($PairCode) { Set-Key $PairCode }
   Resolve-Peer
   Say "DeskGlide on $Name, control port $Port -> $PeerPort, audio port $AudioPort$(if ($DryRun) { ', dry run' })$(if ($NoBroadcast) { ', no broadcast' })."

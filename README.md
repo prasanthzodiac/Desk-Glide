@@ -56,6 +56,7 @@ How to record it with Snipping Tool (built into Windows 11):
 - **Microphone:** your headset microphone works in apps on the other PC too (with VB-Cable there), all the time or only while the mouse is there.
 - **Copy and paste files and folders** between the PCs: copy, move the mouse, press Ctrl+V in Explorer. Up to 2 GB by default. Text and pictures too (up to 32 MB).
 - **Lock both PCs together** with Win+L (optional), and **game mode** for games that hold the pointer.
+- **Admin control (optional):** with a small Windows service on the controlled PC, the keyboard and mouse also work in admin windows, UAC prompts and the lock and sign-in screen there, and Ctrl+Alt+End presses Ctrl+Alt+Del there. See [Admin control](#admin-control-optional).
 - **Optional:** take a monitor that shows the other PC off this PC's desktop, so windows and the pointer can't get lost on it.
 - **Layout editor:** drag the other PC's screen to where it sits, like Windows' display settings.
 - **Live latency and packet loss** of the keyboard and mouse link in the window.
@@ -83,6 +84,7 @@ What DeskGlide Link does about problems reported in the issue trackers of Deskfl
 | A version mismatch shows as a wrong key | The handshake carries the version and says which PC to update |
 | The controlled PC falls asleep | The keyboard PC stays awake only while its input went to the other PC in the last 5 minutes; the controlled PC follows its own timers, its injected input counts as use |
 | Busy CPU while idle | Idle wake-ups every 20 ms; 1 ms timing only while the other PC has control |
+| No input at UAC prompts or the lock screen, or a service any program can drive | Optional SYSTEM service with its own key that programs on the PC can't read; settings only from an elevated administrator ([Security model](#security-model)) |
 
 Also: a local panic key, Win+L on both PCs, the entry point following the pointer's position along the edge, and live latency and loss. Tested over loopback so far: from input to injection 0.4 ms (median) for pointer moves and keys, under 3.5 ms at the 99th percentile, with every key delivered once and in order at 30% packet loss each way; with 10% loss, 0 to 50 ms jitter and a 300 ms outage, no cursor jumps, every key in order, control kept, keys through about 0.2 s after the outage.
 
@@ -113,7 +115,18 @@ Install.cmd unblocks DeskGlide's files, copies them to `%LOCALAPPDATA%\DeskGlide
 5. **Headphones:** pick the PC your headphones are plugged into. Both PCs share this choice.
 6. **Done.**
 
-Everything in the guide is also in the main window.
+Everything in the guide is also in the main window. On the PC being controlled, step 3 also offers the optional [admin control](#admin-control-optional).
+
+### Admin control (optional)
+
+Windows keeps normal apps, DeskGlide included, out of admin windows, UAC prompts, the lock and sign-in screen and Ctrl+Alt+Del. To control those on the other PC too, do this once **on the PC being controlled** (the one the keyboard and mouse are *not* plugged into), with DeskGlide 5.2 running on both PCs:
+
+1. In the **Keyboard & mouse** card, turn on **Control admin windows, UAC prompts and the lock screen on this PC** (or click **Set up admin control...** in step 3 of the setup guide) and read the short explanation.
+2. Windows asks for permission (UAC): use this PC's own keyboard and mouse to click **Yes**. A DeskGlide admin window opens, installs the service and contacts the other PC.
+3. The admin window shows a six-digit number, and DeskGlide on the other PC shows one too (a notification and the Keyboard & mouse card). If they are the same, type `y` there and press Enter.
+4. It asks whether to allow **Ctrl+Alt+Del**: you press **Ctrl+Alt+End** on the keyboard PC and the controlled PC gets Ctrl+Alt+Del (as in Remote Desktop). Allowing it changes one Windows policy (below); type `y` for yes or just press Enter for no.
+
+The card then says **Admin control: on (service)**. To remove it, turn the switch off (Windows asks for permission again); Uninstall.cmd removes it too.
 
 ## Using it
 
@@ -183,12 +196,25 @@ DeskGlide finds the other PC with a network broadcast. Where broadcast doesn't r
 - **The pairing key** is stored in `config.json` encrypted with Windows DPAPI for your user account. Copying the config to another PC or user doesn't copy the pairing.
 - **Downloads:** the only thing DeskGlide downloads is its own update, from its GitHub releases, checked against the release's SHA256 before use.
 
+### Security model
+
+Admin control needs a Windows service running as SYSTEM, the most powerful account on the PC: it can type into UAC prompts and the sign-in screen. It's built so that a program running as you, without admin rights, **can't use it to gain admin rights or control**:
+
+- **Its programs live where only administrators can change them:** `C:\Program Files\DeskGlide` (users can read, not write). The setup, which runs elevated after the UAC prompt, copies DeskGlide's service sources there and compiles them there with the C# compiler that comes with Windows. The service refuses to start, and to start its helper, if the program or its folder could be changed by anyone but SYSTEM, Administrators or TrustedInstaller. Nothing runs from `%LOCALAPPDATA%` or another folder you can write to. Like any installer, the setup trusts DeskGlide's files as they are when you click Yes.
+- **It runs as LocalSystem and owns the receiving side of DeskGlide Link** on that PC: the UDP port (6993, bound exclusively), the session encryption and the reliable stream. The DeskGlide app there stops receiving and shows **Admin control: on (service)**. Sending (sharing the keyboard PC's own keyboard and mouse) stays in the normal app, with no service involved.
+- **It has its own key.** The normal pairing key is readable by programs running as you, so it isn't enough: the service's key comes from a new exchange (ECDH P-256) between the elevated setup and the other PC, and you confirm it by comparing a six-digit number on both screens. A program in the middle would make the numbers differ. The key is stored in `C:\ProgramData\DeskGlide\service`, which only SYSTEM and Administrators can open (if another program made that folder first, it's removed and made again), encrypted with DPAPI as SYSTEM, and never goes back to the normal app. The keyboard PC keeps its copy DPAPI-protected in its own settings.
+- **Only an elevated administrator can change it.** Its control pipe lets SYSTEM and Administrators in fully, the signed-in user read and write, and nobody over the network. Anyone it lets in may ask for its **status** and **panic** (release every key and end control). Pairing, unpairing, turning it on or off and settings are accepted only from a caller whose token is elevated and in the Administrators group (checked on the caller's own token); anything else is refused and logged. The app talks to the pipe only after checking that it's the service's program from Program Files running in session 0, not another program using its name.
+- **Input reaches the screen through a helper.** The service starts `DeskGlideHelper.exe` (from the same protected folder) in the session at the console, on the desktop that has the input: the normal desktop, a UAC prompt or the lock screen. They talk over two anonymous pipes the helper inherits, and it inherits nothing else, so no other program can connect to it. The helper only injects keys and mouse input the service sends, with only the flags DeskGlide uses, and never opens a network connection. It checks every 100 ms which desktop has the input and moves to a new one on a fresh thread; the service starts exactly one helper and starts it again after a session change or a crash.
+- **Ctrl+Alt+Del** is pressed by the service with SendSAS, only if you allowed it in the setup. That sets the Windows policy *Disable or enable software Secure Attention Sequence* (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`, `SoftwareSASGeneration` = 1) so that services may press it; other services could too, but they already run as SYSTEM. DeskGlide remembers the value from before and puts it back when admin control is turned off.
+- **Network input counts only from the paired PC's authenticated session.** Packets from other sessions are dropped before any decryption, connection attempts (hellos) are limited to 20 a second, and everything else is checked with the service's key before anything happens.
+- **Removing it** (turning the switch off, or Uninstall.cmd), elevated: the service is stopped and deleted, `C:\Program Files\DeskGlide` and `C:\ProgramData\DeskGlide\service` are removed, and the Ctrl+Alt+Del policy is restored.
+
 ## Limits
 
 - **Windows only,** both PCs.
 - **Unsigned:** DeskGlide is a showcase project without a code-signing certificate, so Windows SmartScreen or your antivirus may warn when you run Install.cmd. Install.cmd unblocks only DeskGlide's own files.
-- **Lock screen, UAC prompts and Ctrl+Alt+Del:** DeskGlide runs as your user, so it can't type on the other PC's secure desktop: when that PC shows its lock screen or an admin prompt, use its own keyboard (the Keyboard & mouse card says when Windows refuses input). Ctrl+Alt+Del can't be sent. That needs a Windows service running as SYSTEM, which isn't included yet: done safely it has to hold the network session and keys itself, so no program on the PC can use it to click "Yes" on an admin prompt.
-- **Admin windows:** Windows doesn't let a normal app type into a window that runs as administrator (Task Manager, installers). The card says when one is in front on the controlled PC.
+- **Lock screen, UAC prompts, admin windows and Ctrl+Alt+Del:** without [admin control](#admin-control-optional), DeskGlide runs as your user, so it can't type into admin windows (Task Manager, installers) or on the other PC's secure desktop (lock screen, UAC prompts), and Ctrl+Alt+Del can't be sent; the card says when Windows refuses input. With admin control they work, Ctrl+Alt+Del as Ctrl+Alt+End. Setting it up needs one UAC prompt on the controlled PC, which you answer with that PC's own mouse.
+- **Admin control** has been tested with the service's logic in a test mode (as the user, no injection, over loopback, also with a DeskGlide 5.1 sender) and its security checks; not yet installed on a second PC, so UAC prompts, the lock screen and Ctrl+Alt+Del are untested in practice. It can't detect games on the controlled PC (game mode needs the normal app there), and Lock both PCs together doesn't lock a PC whose service receives. While it's on, that PC can't be the keyboard PC: turn it off first. Auto-update doesn't touch the installed service (that needs Windows' permission): after an update, turn admin control off and on again to rebuild it.
 - **Games** that hold the pointer need game mode (above).
 - **Keyboard layouts:** keys are sent as scan codes, so both PCs should use the same layout.
 - **Pen tablets** and other absolute pointing devices only click on the other PC; they don't move its pointer.
@@ -207,7 +233,7 @@ DeskGlide finds the other PC with a network broadcast. Where broadcast doesn't r
 | `inputOverride` | `0` | This PC's monitor input, if automatic detection gets it wrong: `15` = DisplayPort 1, `16` = DisplayPort 2, `17` = HDMI 1, `18` = HDMI 2 |
 | `screenName` | computer name | This PC's screen name in Synergy, if it isn't the Windows computer name |
 
-Network ports: UDP `6991` (finding each other, control), UDP `6990` (sound and microphone), TCP `6992` (files, text and pictures), UDP `6993` (keyboard and mouse).
+Network ports: UDP `6991` (finding each other, control), UDP `6990` (sound and microphone), TCP `6992` (files, text and pictures), UDP `6993` (keyboard and mouse; with admin control, the service holds it on the controlled PC).
 
 ## Upgrading from DeskGlide 4 (from Synergy to DeskGlide Link)
 
@@ -224,7 +250,7 @@ Do it on **both** PCs: DeskGlide 4 encrypts sound, so a DeskGlide 3 PC can't pla
 
 ## Uninstall
 
-Double-click **Uninstall.cmd**. It stops DeskGlide, unmutes any app it muted, removes it from Startup and deletes `%LOCALAPPDATA%\DeskGlide`. Your settings stay in `%APPDATA%\DeskGlide`, and received files in `Downloads\DeskGlide`.
+Double-click **Uninstall.cmd**. If admin control is installed, it first removes it (Windows asks for permission). It stops DeskGlide, unmutes any app it muted, removes it from Startup and deletes `%LOCALAPPDATA%\DeskGlide`. Your settings stay in `%APPDATA%\DeskGlide`, and received files in `Downloads\DeskGlide`.
 
 ## Troubleshooting
 
@@ -244,7 +270,7 @@ Click **Open log** at the bottom of the window to see what DeskGlide saw and did
 
 ## For maintainers
 
-- `powershell -ExecutionPolicy Bypass -File .\DeskGlide.ps1 -Test` runs the self-check: log parsing, pairing, encryption and tamper checks, audio packets, a real encrypted file and clipboard transfer over loopback, monitor plans, hotkeys, settings sync, DPAPI migration, install, update download and swap, and DeskGlide Link: packets and tampering, coalescing, modifiers, AltGr, release-all, edges, entry points, DPI, the reliable stream, absolute coordinates on 100/125/150% layouts, heartbeat, loss and backoff, round trip and resend timeout, adapter choice and a second path, the hook watch, keeping awake, connection quality, Wi-Fi power saving and made-up Raw Input and hook events, then two engines over loopback UDP (crossing, keys, panic key, game mode, 30% packet loss, a hotspot with loss, jitter and an outage, losing and regaining the link, a restart, a version mismatch) with latency figures. No input is injected and no hook is installed.
+- `powershell -ExecutionPolicy Bypass -File .\DeskGlide.ps1 -Test` runs the self-check: log parsing, pairing, encryption and tamper checks, audio packets, a real encrypted file and clipboard transfer over loopback, monitor plans, hotkeys, settings sync, DPAPI migration, install, update download and swap, and DeskGlide Link: packets and tampering, coalescing, modifiers, AltGr, release-all, edges, entry points, DPI, the reliable stream, absolute coordinates on 100/125/150% layouts, heartbeat, loss and backoff, round trip and resend timeout, adapter choice and a second path, the hook watch, keeping awake, connection quality, Wi-Fi power saving and made-up Raw Input and hook events, then two engines over loopback UDP (crossing, keys, panic key, game mode, 30% packet loss, a hotspot with loss, jitter and an outage, losing and regaining the link, a restart, a version mismatch) with latency figures. Then admin control: it builds the service and helper into a temp folder, runs `DeskGlideService.exe -SelfTest` (the pipe's authorization matrix, ACLs, refusing user-writable folders, key storage, the Ctrl+Alt+Del policy on a test key under HKCU, the helper's frames, the pairing exchange), then runs the service in its test mode (`-Console`, as you, temp folder, own pipe, `-NoInject`) receiving from an engine over loopback: moves, keys, Ctrl+Alt+End, status, refused admin commands, panic and a hello flood. No input is injected, no hook is installed, nothing is installed and nothing elevated runs.
 - `Make-Release.ps1` builds `release\DeskGlide-<version>.zip` and `release\SHA256SUMS.txt` from the files at the top of the repository (no `.git`, no `docs`). Upload both to a release tagged `v<version>`.
 - Auto-update is off until `$UpdateRepo` in `DeskGlide.ps1` names the GitHub repository (`owner/repo`).
 - Screenshots: `DeskGlide.ps1 -Shot out.png -Theme light|dark -ShowWindow` renders the window off screen.
@@ -253,6 +279,7 @@ Click **Open log** at the bottom of the window to see what DeskGlide saw and did
 
 - Windows 11 with Synergy and an MSI monitor (DisplayPort + HDMI)
 - DeskGlide Link: two engines and two DeskGlide windows on one Windows 11 PC over loopback
+- Admin control: the service's logic in its test mode on one Windows 11 PC over loopback, with DeskGlide 5.2 and 5.1 senders (not installed as a service yet)
 - Sound between two Windows PCs on the same Wi-Fi network
 
 ## Credits

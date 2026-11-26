@@ -1104,6 +1104,11 @@ public class Link {
   public volatile bool DualPath = true;       // send on a second adapter too when the other PC is reachable through two
   public volatile int DropPct, JitterMs;      // self-test: lose this share of sent packets; delay each by 0..JitterMs (in order)
   public volatile bool TestBlocked;           // self-test: "a game holds the pointer here"
+  // DeskGlide's SYSTEM service (DeskGlideService.cs): input goes to its helper on the input desktop instead of SendInput here.
+  // 1 key (vk, sc, flags), 2 mouse (x, y, data, flags; x and y in pixels when ABSOLUTE), 3 lock this PC
+  public Action<int, int, int, int, int> Out;
+  public Action Sas;                          // the service: Ctrl+Alt+End from the other PC presses Ctrl+Alt+Del here
+  public int Refused;                         // hellos over the rate limit, dropped unchecked
   // ---- read by DeskGlide.ps1 ----
   public volatile bool Up, Active, Controlled, Uipi, Wireless;   // Active: this PC's keyboard and mouse drive the other PC; Controlled: the reverse
   public volatile string VersionMsg = "", InjectError = "";
@@ -1144,6 +1149,7 @@ public class Link {
   readonly Held held = new Held(); int lastX = int.MinValue, lastY, rxSumX, rxSumY; bool rxRel, rxFresh; uint exec; IPAddress ifFor;   // receiver
   volatile IPAddress Peer2; Socket sock2; volatile IPAddress[] peerAddrs; IPAddress[] myAddrs = new IPAddress[0]; int firstIf = -1; long addrsAt = -100000;
   IntPtr qos; long lastDue, outageUntil; Thread delayer;
+  const int MaxHellos = 20; long helloWin; int hellos;   // hellos checked per second (normally at most a few)
   class Delayed { public long Due; public byte[] P; public Socket S; public IPEndPoint To; }
   readonly ConcurrentQueue<Delayed> delayq = new ConcurrentQueue<Delayed>();
 
@@ -1151,6 +1157,7 @@ public class Link {
   public void Start(int port, int peerPort) {
     this.peerPort = peerPort; running = true;
     sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+    sock.ExclusiveAddressUse = true;   // no other program can bind this port on a more specific address and read the input
     sock.Bind(new IPEndPoint(IPAddress.Any, port));
     try { sock.IOControl(-1744830452, new byte[4], null); } catch {}   // SIO_UDP_CONNRESET off: ignore "port unreachable"
     sock.SendBufferSize = sock.ReceiveBufferSize = 1 << 20;   // a Wi-Fi stall doesn't overflow them
@@ -1197,7 +1204,7 @@ public class Link {
         wall = DateTime.UtcNow;
         if (kick) { kick = false; ifFor = null; addrsAt = -100000; Kick("the network changed"); }
         if (endPending) { endPending = false; EndControl(peerName + " started a new session"); }
-        if (panic) { panic = false; if (Active) Return(-1, true, "panic key"); else ReleaseLocal(); }
+        if (panic) { panic = false; if (Active) Return(-1, true, "panic key"); else { if (Controlled) EndControl("panic key"); ReleaseLocal(); } }
         if (lockEvt) { lockEvt = false; if (Active) Return(-1, true, "this PC locked"); if (LockSync && Up && Ms - lockedAt > 3000) { Rel(new[] { (byte)'X' }); Note("this PC locked: locking " + peerName + " too"); } }
         Ev e; while (evq.TryDequeue(out e)) Process(e);
         if (dirty && Us - flushedUs >= 1000) Flush();   // at most one mouse packet per millisecond
@@ -1212,7 +1219,7 @@ public class Link {
     bool wantRaw = Sender && !NoInject;
     if (wantRaw != rawOn && win != null) { rawOn = wantRaw; PostMessage(win.Handle, 0x8002, (IntPtr)(wantRaw ? 1 : 0), IntPtr.Zero); }
     if (!Sender && Active) Return(-1, true, "this PC is no longer the keyboard PC");
-    if (Controlled && !NoInject && now - uipiAt >= 500) { uipiAt = now; Uipi = ElevatedFront(); }
+    if (Controlled && !NoInject && Out == null && now - uipiAt >= 500) { uipiAt = now; Uipi = ElevatedFront(); }   // the service's helper runs as SYSTEM: no UIPI
     byte[] key = Key; IPAddress peer = Peer;
     if (key == null) return;
     if (key != helloKeyFor) { lock (gate) { helloKey = Dg.SessionKey(key, "link hello", LinkProto.Empty); helloKeyFor = key; } NewSession("a new pairing"); }
@@ -1351,11 +1358,11 @@ public class Link {
     Put(d, 5, ++mSeq); SendSession(d); lastM = d; lastMAt = Ms; mTail = 0;
   }
   void Cursor(out int x, out int y) {
-    if (NoInject) { x = Sender ? Geo.F(cx) : lastX; y = Sender ? Geo.F(cy) : lastY; return; }
+    if (NoInject || Out != null) { x = Sender ? Geo.F(cx) : lastX; y = Sender ? Geo.F(cy) : lastY; return; }   // the service sits in session 0: its last injected position
     PT p; GetCursorPos(out p); x = p.x; y = p.y;
   }
   bool Blocked() {   // a game holds the pointer here: ClipCursor, or a full-screen Direct3D app
-    if (NoInject) return TestBlocked;
+    if (NoInject || Out != null) return TestBlocked;   // ponytail: the service can't see the user's games; game mode needs the user-mode receiver
     Mon[] ms = local; if (ms.Length == 0) return false;
     int vx, vy, vw, vh; Geo.Bounds(ms, out vx, out vy, out vw, out vh); RC c;
     if (GetClipCursor(out c) && (c.l > vx || c.t > vy || c.r < vx + vw || c.b < vy + vh)) return true;
@@ -1457,12 +1464,15 @@ public class Link {
     byte[] hk = helloKey; int ver, kind; byte[] nonce;
     if (hk == null || n < 12 || p[0] != 'D' || p[1] != 'L') return;
     if (p[3] == 0) {
+      long now = Ms; if (now - helloWin >= 1000) { helloWin = now; hellos = 0; }
+      if (++hellos > MaxHellos) { Refused++; return; }   // connection attempts: a flood is dropped before any crypto
       byte[] h = LinkProto.Open(hk, p, n, out ver, out kind, out nonce);
       if (h == null || h.Length < 16) return;   // not paired with this PC
       if (ver != LinkProto.Version) { VersionMsg = LinkProto.VersionText(ver, Encoding.UTF8.GetString(h, 16, h.Length - 16)); return; }
       Hello(h, nonce, src); return;
     }
-    byte[] sk = sessKey, pn = peerNonce; if (sk == null) return;
+    byte[] sk = sessKey, pn = peerNonce; if (sk == null || pn == null) return;
+    for (int i = 0; i < 8; i++) if (p[4 + i] != pn[i]) return;   // not this session's nonce: dropped before any crypto
     byte[] b = LinkProto.Open(sk, p, n, out ver, out kind, out nonce);
     if (b == null || ver != LinkProto.Version || kind != 1 || !Same(nonce, pn)) return;
     if (!src.Equals(Peer) && !src.Equals(Peer2)) { Note(peerName + " is now at " + src); Peer = src; }
@@ -1544,27 +1554,31 @@ public class Link {
       case 'K': if (Controlled && d.Length >= 5) KeyIn(d[1], d[2], d[3], d[4]); break;
       case 'B': if (Controlled && d.Length >= 12) { if (d[3] == 0) InjMove(I(d, 4), I(d, 8)); InjButton(d[1], d[2] != 0, d[3] == 0); } break;
       case 'W': if (Controlled && d.Length >= 4) InjWheel(d[1] != 0, BitConverter.ToInt16(d, 2)); break;
-      case 'X': if (LockSync) { lockedAt = Ms; Note("locked together with " + peerName); if (NoInject) Would("lock"); else LockWorkStation(); } break;
+      case 'X': if (LockSync) { lockedAt = Ms; Note("locked together with " + peerName); if (NoInject) Would("lock"); else if (Out != null) Out(3, 0, 0, 0, 0); else LockWorkStation(); } break;
     }
   }
 
   // ---------- receiver: injection (never fatal: a refusal is counted and shown) ----------
   void KeyIn(int sc, int fl, int vk, int want) {
+    // Ctrl+Alt+Del always stays on the PC it's pressed on, so Ctrl+Alt+End (as in Remote Desktop) means it here; only the service can press it
+    if (Sas != null && sc == 0x4F && (fl & 2) != 0 && (want & 0x0C) != 0 && (want & 0x30) != 0) { if ((fl & 1) == 0) Sas(); return; }
     lock (injGate) {
       foreach (int c in KeyMap.Reconcile(want, HaveMods())) { int b = c & 0xFF; SendKey(KeyMap.Sc[b], KeyMap.Ext[b], KeyMap.Vk[b], (c & 0x100) == 0); }
       SendKey(sc, (fl & 2) != 0, vk, (fl & 1) != 0);
     }
   }
   int HaveMods() {
-    if (NoInject) return held.Mods();
+    if (NoInject || Out != null) return held.Mods();   // ponytail: the service knows only what it injected, not keys held on this PC's own keyboard
     int m = 0; for (int b = 0; b < 8; b++) if ((GetAsyncKeyState(KeyMap.Vk[b]) & 0x8000) != 0) m |= 1 << b; return m;
   }
   void SendKey(int sc, bool ext, int vk, bool up) {
     bool byVk = sc == 0 || vk == 0x13 || vk == 3;   // ponytail: Pause/Break has no usable scan code; those go by virtual key
     if (!Active) held.Key(byVk ? 0x10000 | vk : sc | (ext ? 0x100 : 0), up);   // the sender's own releases aren't the receiver's
     if (NoInject) { Would("key " + (byVk ? "vk" + vk.ToString("X2") : sc.ToString("X2")) + (ext ? " ext" : "") + (up ? " up" : " down")); return; }
+    int kf = (byVk ? 0 : 8) | (ext ? 1 : 0) | (up ? 2 : 0);   // KEYEVENTF_SCANCODE, EXTENDEDKEY, KEYUP
+    if (Out != null) { Out(1, byVk ? vk : 0, byVk ? 0 : sc, kf, 0); return; }
     var i = new INPUT { type = 1 }; i.u.k.vk = (ushort)(byVk ? vk : 0); i.u.k.sc = (ushort)(byVk ? 0 : sc);
-    i.u.k.flags = (uint)((byVk ? 0 : 8) | (ext ? 1 : 0) | (up ? 2 : 0)); i.u.k.extra = (IntPtr)OwnTag;   // KEYEVENTF_SCANCODE, EXTENDEDKEY, KEYUP
+    i.u.k.flags = (uint)kf; i.u.k.extra = (IntPtr)OwnTag;
     Inject(i);
   }
   void InjMove(int x, int y) {
@@ -1572,7 +1586,11 @@ public class Link {
     if (x == lastX && y == lastY) return;
     lastX = x; lastY = y;
     if (NoInject) { Would("move " + x + "," + y); return; }
-    SendMouse(NormX(x), NormY(y), 0, 0x8000 | 0x4000 | 1);   // ABSOLUTE | VIRTUALDESK | MOVE: no pointer acceleration
+    MouseAt(x, y, 0, 1);   // MOVE
+  }
+  // ABSOLUTE | VIRTUALDESK: no pointer acceleration. The service's helper normalizes on its own desktop; the service can't.
+  void MouseAt(int x, int y, uint data, uint flags) {
+    if (Out != null) Out(2, x, y, (int)data, (int)(flags | 0x8000 | 0x4000)); else SendMouse(NormX(x), NormY(y), data, flags | 0x8000 | 0x4000);
   }
   // Over the virtual desktop exactly as Windows normalizes it: read now, on this PerMonitorV2 thread (physical pixels)
   static int NormX(int x) { return Geo.Norm(x, GetSystemMetrics(76), GetSystemMetrics(78)); }   // SM_XVIRTUALSCREEN, SM_CXVIRTUALSCREEN
@@ -1585,7 +1603,7 @@ public class Link {
       held.Button(b, down);
       if (NoInject) { Would("button " + b + (down ? " down" : " up")); return; }
       uint data = b == 3 ? 1u : b == 4 ? 2u : 0u, fl = down ? BtnDown[b] : BtnUp[b];   // X buttons: XBUTTON1 / XBUTTON2
-      if (here && lastX != int.MinValue) SendMouse(NormX(lastX), NormY(lastY), data, fl | 0x8000 | 0x4000 | 1); else SendMouse(0, 0, data, fl);
+      if (here && lastX != int.MinValue) MouseAt(lastX, lastY, data, fl | 1); else SendMouse(0, 0, data, fl);
     }
   }
   void InjWheel(bool h, int delta) { if (NoInject) Would((h ? "hwheel " : "wheel ") + delta); else SendMouse(0, 0, (uint)delta, h ? 0x1000u : 0x800u); }
@@ -1596,6 +1614,7 @@ public class Link {
     }
   }
   void SendMouse(int dx, int dy, uint data, uint flags) {
+    if (Out != null) { Out(2, dx, dy, (int)data, (int)flags); return; }
     var i = new INPUT { type = 0 }; i.u.m.dx = dx; i.u.m.dy = dy; i.u.m.data = data; i.u.m.flags = flags; i.u.m.extra = (IntPtr)OwnTag; Inject(i);
   }
   void Inject(INPUT i) {
@@ -1790,4 +1809,69 @@ public static class Clip {
       ResultKind = h[1]; Result = o;
     }
   }
+}
+
+// DeskGlide's optional SYSTEM service (DeskGlideService.cs), seen from the app: one line out, one line back over its control
+// pipe. Status and panic work for anyone; everything else the service accepts only from an elevated administrator.
+public static class SvcPipe {
+  public const string Name = "DeskGlideService";
+  public static string Exe { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"DeskGlide\DeskGlideService.exe"); } }
+  // The reply, or null if nothing answered. service: the pipe's server must be DeskGlideService.exe from Program Files running
+  // in session 0, not a program that took the pipe's name first; false only for the self-test's console-mode service.
+  // Identification level: the service can check who asks, but can't act as the caller.
+  public static string Call(string pipe, string line, int timeoutMs, bool service) {
+    try {
+      using (var c = new System.IO.Pipes.NamedPipeClientStream(".", pipe, System.IO.Pipes.PipeDirection.InOut, System.IO.Pipes.PipeOptions.None, System.Security.Principal.TokenImpersonationLevel.Identification)) {
+        c.Connect(timeoutMs);
+        if (service && !ServerIs(c.SafePipeHandle.DangerousGetHandle(), Exe)) { LastError = "the pipe's server isn't DeskGlide's service"; return null; }
+        var b = Encoding.UTF8.GetBytes(line.Replace("\n", " ") + "\n"); c.Write(b, 0, b.Length); c.Flush();
+        var t = System.Threading.Tasks.Task.Run(() => new StreamReader(c, Encoding.UTF8).ReadLine());
+        return t.Wait(timeoutMs + 2000) ? t.Result : null;
+      }
+    } catch (Exception e) { LastError = e.Message; return null; }
+  }
+  public static volatile string LastError;
+  public static bool ServerIs(IntPtr pipe, string exe) {
+    uint pid, sess; if (!GetNamedPipeServerProcessId(pipe, out pid) || !ProcessIdToSessionId(pid, out sess) || sess != 0) return false;   // only services run in session 0
+    IntPtr p = OpenProcess(0x1000, false, pid); if (p == IntPtr.Zero) return false;   // PROCESS_QUERY_LIMITED_INFORMATION
+    try { var s = new StringBuilder(1024); int n = s.Capacity; return QueryFullProcessImageName(p, 0, s, ref n) && string.Equals(s.ToString(), exe, StringComparison.OrdinalIgnoreCase); }
+    finally { CloseHandle(p); }
+  }
+  // The app polls the service's status on its own thread, so a missing or busy service never stalls the window
+  public static volatile string Last; static Thread watch;
+  public static void Watch() {
+    if (watch != null) return;
+    watch = new Thread(() => { while (true) { Last = File.Exists(Exe) ? Call(Name, "status", 500, true) : null; Thread.Sleep(2000); } });
+    watch.IsBackground = true; watch.Start();
+  }
+  [DllImport("kernel32.dll")] static extern bool GetNamedPipeServerProcessId(IntPtr pipe, out uint pid);
+  [DllImport("kernel32.dll")] static extern bool ProcessIdToSessionId(uint pid, out uint session);
+  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr p, int flags, StringBuilder name, ref int size);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+}
+
+// Pairing the other PC's service: an ECDH P-256 exchange carried in control messages (signed with the pairing key), checked
+// by the user comparing a six-digit number on both PCs. Programs running as the user can read the pairing key, so it alone
+// must not be enough: a program in the middle would show a different number.
+public class SvcPair : IDisposable {
+  readonly ECDiffieHellmanCng ec = new ECDiffieHellmanCng(256);
+  public byte[] Pub { get { return ec.PublicKey.ToByteArray(); } }
+  // The service's key and the number to compare, from the offer's and the answer's public keys and the other side's; null if
+  // theirs isn't a P-256 public key
+  public byte[] Finish(byte[] offer, byte[] answer, byte[] theirs, out string check) {
+    check = null;
+    if (offer == null || answer == null || theirs == null || theirs.Length != 72) return null;
+    try {
+      ec.KeyDerivationFunction = ECDiffieHellmanKeyDerivationFunction.Hash; ec.HashAlgorithm = CngAlgorithm.Sha256;
+      byte[] z; using (var k = ECDiffieHellmanCngPublicKey.FromByteArray(theirs, CngKeyBlobFormat.EccPublicBlob)) z = ec.DeriveKeyMaterial(k);
+      byte[] both = Files.Cat(offer, answer);
+      string n = (BitConverter.ToUInt32(Dg.SessionKey(z, "service check", both), 0) % 1000000).ToString("000000");
+      check = n.Substring(0, 3) + " " + n.Substring(3);
+      return Dg.SessionKey(z, "service link", both);
+    } catch { return null; }
+  }
+  // Sent by the PC with the service once the user confirmed there: shows it holds the same key
+  public static byte[] Proof(byte[] key, string id) { return Dg.SessionKey(key, "service paired", Encoding.UTF8.GetBytes(id ?? "")); }
+  public void Dispose() { ec.Dispose(); }
 }
