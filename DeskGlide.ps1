@@ -1,4 +1,4 @@
-# DeskGlide: two PCs, one monitor, one keyboard and mouse (shared by Synergy for now), one pair of headphones.
+# DeskGlide: two PCs, one monitor, one keyboard and mouse (shared by DeskGlide Link), one pair of headphones.
 # The same files run on both PCs as a tray app with a window. Install.cmd adds it to Startup, Uninstall.cmd removes it.
 #   -Test        self-check of the pure logic (no network, no monitor, no audio)
 #   -Console     output to this console instead of the tray, for debugging
@@ -7,6 +7,7 @@ param(
   [switch]$Console, [switch]$Test, [switch]$Install, [switch]$Uninstall, [switch]$ShowWindow,
   # hidden, for debugging and for running two copies on one PC:
   [switch]$DryRun,                        # never send a DDC command, only print it
+  [switch]$NoInject,                      # DeskGlide Link: no hooks, no Raw Input, no SendInput; log what it would inject
   [string]$PairCode,                      # pair at startup without the window
   [int]$Port = 6991, [int]$PeerPort = 0,  # control/discovery UDP port to listen on / to send to
   [int]$AudioPort = 6990,
@@ -19,12 +20,13 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '4.0'
-$Proto = 4   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it
+$Version = '5.0'
+$Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = ''   # 'owner/repo' on GitHub for auto-update; empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
 Add-Type -Path "$PSScriptRoot\DeskGlide.cs" -ReferencedAssemblies System.Drawing, System.Core, System.IO.Compression, System.IO.Compression.FileSystem, System.Windows.Forms
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, PresentationFramework, PresentationCore, WindowsBase, WindowsFormsIntegration, System.Security
+if ($NoInject) { [Link]::NoInject = $true }
 $cfgPath   = Join-Path $ConfigDir 'config.json'
 $mutedPath = Join-Path $ConfigDir 'muted.txt'   # apps we muted, so a crash or kill doesn't leave them muted
 $logPath   = Join-Path $ConfigDir 'deskglide.log'
@@ -49,7 +51,8 @@ function Load-Config {
   $c = @{ peer = ''; key = ''; peerAddress = ''; input = 0; inputOverride = 0; monitor = $true; audio = 'follow'; hp = ''; vol = 100
           paused = $false; syncAt = 0; synergyLog = ''; screenName = ''; onSwitch = ''; layout = $null
           kmHost = ''; inputs = @{}; monOff = @(); detach = $false
-          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048; mic = 'off'; updateAt = 0 }
+          hotkeyPeer = 'Ctrl+Alt+Right'; hotkeyMe = 'Ctrl+Alt+Left'; files = $true; fileLimitMB = 2048; mic = 'off'; updateAt = 0
+          link = -not (Test-Path $cfgPath); linkSpeed = 100; game = $false; lockSync = $false; panicKey = 'Ctrl+Alt+Pause' }   # Link: on for new installs
   if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).psobject.Properties | % { $c[$_.Name] = $_.Value } }
   $c.inputs = To-Hash $c.inputs; $c.monOff = @($c.monOff | ? { $_ })
   if ($c.Contains('headphones')) {   # DeskGlide 2 had a per-PC flag; now it's one shared value: the name of the PC with the headphones
@@ -63,7 +66,7 @@ function Load-Config {
 function Save-Config {   # the pairing key goes to disk only encrypted for this Windows user (DPAPI)
   [void](New-Item -ItemType Directory -Force $ConfigDir)
   $o = $C.Clone(); $o.key = Protect-Key $C.key
-  $o | ConvertTo-Json | Set-Content $cfgPath -Encoding UTF8
+  $o | ConvertTo-Json | Set-Content "$cfgPath.tmp" -Encoding UTF8; Move-Item -Force "$cfgPath.tmp" $cfgPath   # atomic: a crash never leaves half a file
 }
 # The pairing key (base64) <-> 'dpapi:<base64 blob>' in config.json, readable only by this Windows user on this PC.
 $dpapiExtra = [Text.Encoding]::UTF8.GetBytes('DeskGlide pairing key')
@@ -161,20 +164,24 @@ function Merge-Settings($cfg, $m) {
   if ($m.kh) { $cfg.kmHost = [string]$m.kh }          # DeskGlide 4 settings: a DeskGlide 3 peer doesn't send them, keep ours
   if ($null -ne $m.mo) { $cfg.monOff = @($m.mo | ? { $_ }) }
   if ($m.mc) { $cfg.mic = [string]$m.mc }
+  if ($null -ne $m.lk) { $cfg.link = [bool]$m.lk }   # DeskGlide 5: keyboard and mouse sharing, and locking both PCs together
+  if ($null -ne $m.ls) { $cfg.lockSync = [bool]$m.ls }
   $true
 }
 # h is for DeskGlide 2 peers (it had a per-PC headphones flag); ly is DeskGlide's layout; l is Synergy's, from the server
 # DeskGlide 4 adds ver, sn (screen name), kh (the PC the keyboard and mouse are plugged into),
 # mi (this PC's input on each monitor), mo (monitors that don't follow the mouse) and hk/ha (a hotkey press, for 10 s:
 # its time and the PC it showed), fo (files copied here: { id; n = how many; b = bytes; names }), mc (microphone mode) and
-# vc (VB-Cable is installed here)
+# vc (VB-Cable is installed here). DeskGlide 5 adds lk (DeskGlide Link on), ls (lock both PCs together) and co (text or a
+# picture copied here: { id; k = 'text' or 'png'; b = bytes })
 function State-Json($cfg) {
   @{ n = $Name; t = $S.t; s = $S.server; sa = ($S.active -eq 'me'); i = (My-Input); h = ($cfg.hp -eq $Name)
      m = $cfg.monitor; am = $cfg.audio; p = $cfg.paused; st = $cfg.syncAt; hp = $cfg.hp; v = $cfg.vol; ly = $cfg.layout
      l = @($(if ($S.server) { $S.links | % { "$($_.from) $($_.dir) $($_.to)" } }))
      ver = $Proto; sn = $S.screen; kh = $cfg.kmHost; mi = $cfg.inputs; mo = @($cfg.monOff)
      hk = $(if ((Now-Ms) - [long]$S.hk -lt 10000) { $S.hk } else { 0 }); ha = $S.hkTo
-     fo = $(if ($cfg.files) { $S.offer } else { $null }); mc = $cfg.mic; vc = ($S.cable -ge 0) } | ConvertTo-Json -Compress -Depth 4
+     fo = $(if ($cfg.files) { $S.offer } else { $null }); mc = $cfg.mic; vc = ($S.cable -ge 0)
+     lk = [bool]$cfg.link; ls = [bool]$cfg.lockSync; co = $S.clipOffer } | ConvertTo-Json -Compress -Depth 4
 }
 # The notice for files on the clipboard: small, so it fits in the state message; the names are only for the window
 function File-Offer([string]$id, [string[]]$paths, [long]$bytes) {
@@ -189,7 +196,7 @@ function Offer-Text($o) {   # "report.pdf", "3 items: a, b, c", with the size
 
 # ---------- hotkeys ----------
 # 'Ctrl+Alt+Right' -> @{ text = 'Ctrl+Alt+Right'; mods; vk } for RegisterHotKey, or $null.
-# At least one modifier; keys: arrows, A-Z, 0-9, F1-F24.
+# At least one modifier; keys: arrows, A-Z, 0-9, F1-F24, Pause, ScrollLock.
 function Parse-Hotkey([string]$text) {
   $parts = @(($text -replace '\s', '') -split '\+' | ? { $_ })
   if ($parts.Count -lt 2) { return }
@@ -204,6 +211,8 @@ function Parse-Hotkey([string]$text) {
     '^(left|right|up|down)$' { $n = $k.Substring(0, 1).ToUpper() + $k.Substring(1).ToLower(); @{ vk = @{ Left = 0x25; Up = 0x26; Right = 0x27; Down = 0x28 }[$n]; n = $n } }
     '^[a-z0-9]$' { @{ vk = [int][char]$k.ToUpper(); n = $k.ToUpper() } }
     '^f([1-9]|1\d|2[0-4])$' { @{ vk = 0x6F + [int]$matches[1]; n = $k.ToUpper() } }
+    '^(pause|break)$' { @{ vk = 0x13; n = 'Pause' } }
+    '^scrolllock$' { @{ vk = 0x91; n = 'ScrollLock' } }
   }
   if (-not $key) { return }
   @{ text = (($names + $key.n) -join '+'); mods = $mods; vk = $key.vk }
@@ -277,6 +286,28 @@ function Audio-Status($cfg, [bool]$paired, [bool]$online, [string]$active, [int]
   "This PC's sound plays in the headphones on $peer while the mouse is here."
 }
 
+# DeskGlide Link's state in plain words. $l: the engine (or $null), $synergy: Synergy runs on this PC.
+function Link-Status($cfg, [bool]$paired, [bool]$online, [int]$peerVer, $l, [bool]$synergy) {
+  $peer = if ($cfg.peer) { $cfg.peer } else { 'the other PC' }
+  if (-not $cfg.link) { return 'Off. Synergy shares the keyboard and mouse, and DeskGlide follows its log.' }
+  if (-not $paired) { return 'Pair with your other PC first.' }
+  if (-not $cfg.kmHost) { return 'Choose the PC your keyboard and mouse are plugged into.' }
+  if ($synergy) { return 'Synergy is running on this PC. Quit it (and its service), so only DeskGlide moves the mouse.' }
+  if ($online -and $peerVer -lt 5) { return "Update DeskGlide on $peer to share the keyboard and mouse." }
+  if (-not $l) { return 'Starting...' }
+  if ($l.VersionMsg) { return $l.VersionMsg }
+  if (-not $l.Up) { return "Waiting for $peer..." }
+  if ($l.Controlled -and $l.Uipi) { return "An admin window is in front on this PC. Windows doesn't let $peer type into it: use this PC's own keyboard there, or click another window." }
+  if ($l.InjectError) { return $l.InjectError }
+  $panic = if ($cfg.panicKey) { ", or press $($cfg.panicKey)" } else { '' }
+  if ($cfg.kmHost -eq $Name) {
+    if ($l.Active) { return "Your keyboard and mouse are on $peer. Move back across the edge$panic." }
+    return "Connected. Move the mouse off the screen edge toward $peer to use it."
+  }
+  if ($l.Controlled) { return "The keyboard and mouse of $peer are on this PC." }
+  "Connected. The keyboard and mouse of $peer come here when its pointer crosses the edge."
+}
+
 # What this PC's audio threads do: send and recv are 0, Sound (1) or Mic (2); dev is the waveOut device to play into (-1 = default).
 # The headphones PC receives the other PC's sound and sends its microphone; the other PC sends sound and plays the mic into VB-Cable.
 function Audio-Modes($cfg, [bool]$online, [string]$active, [int]$peerVer, [bool]$peerCable, [int]$cable) {
@@ -322,7 +353,9 @@ $S = @{ key = $null; server = $false; log = ''; pos = 0; screen = ''; active = $
         cable = -1; cableAt = [DateTime]::MinValue; peerCable = $false
         offer = $null; peerOffer = $null; fetchedId = ''; pasted = ''; fileMsg = ''; fileErr = $false; fileSaved = @()
         hk = [long]0; hkTo = ''; hkSeen = [long]0; lastSa = $null; hkSig = ''; hkErr = ''; msgWin = $null
-        mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{} }
+        mons = @(); monSig = ''; monRows = @{}; monAt = [DateTime]::MinValue; peerInputs = @{}
+        link = $null; linkAt = [DateTime]::MinValue; linkWant = $null; synergy = $false; synAt = [DateTime]::MinValue; speedAt = $null
+        clipOffer = $null; peerClip = $null; clipGot = ''; clipSig = ''; clipSetAt = [DateTime]::MinValue }
 $tray = $null; $win = $null; $ui = @{}; $icons = @(); $logos = @()
 
 function My-Input { if ($C.inputOverride) { [int]$C.inputOverride } else { [int]$C.input } }
@@ -463,7 +496,25 @@ if ($Test) {
   Check ((Merge-Settings $PA (Msg $PB 'PC-B')) -and $PA.kmHost -eq 'PC-B') 'keyboard PC synced'
   $v3 = Msg $PA 'PC-A'; 'ver', 'kh', 'sn', 'mi', 'mo' | % { $v3.psobject.Properties.Remove($_) }; $v3.st = 99
   Check ((Merge-Settings $PB $v3) -and $PB.kmHost -eq 'PC-B') 'DeskGlide 3 message cleared the keyboard PC'
-  Check ((Msg $PA 'PC-A').ver -eq 4) 'state message has ver 4'
+  Check ((Msg $PA 'PC-A').ver -eq 5) 'state message has ver 5'
+  # DeskGlide Link settings: on/off and lock sync are shared; a DeskGlide 4 message (no lk) keeps ours
+  $PA.link = $true; $PA.lockSync = $true; $PB.link = $false; $PA.syncAt = 800
+  Check ((Merge-Settings $PB (Msg $PA 'PC-A')) -and $PB.link -and $PB.lockSync) 'Link on and lock sync synced'
+  $v4 = Msg $PA 'PC-A'; 'lk', 'ls' | % { $v4.psobject.Properties.Remove($_) }; $v4.st = 900; $PB.link = $true
+  Check ((Merge-Settings $PB $v4) -and $PB.link) 'DeskGlide 4 message turned Link off'
+  $PA.syncAt = 5; $PB.syncAt = 99   # as the tests below expect
+  $S.clipOffer = @{ id = 'c1'; k = 'text'; b = 5 }; Check ((Msg $PA 'PC-A').co.k -eq 'text') 'clipboard offer in the state message'; $S.clipOffer = $null
+  # Link status, in plain words
+  $L5 = @{ peer = 'PC-B'; link = $true; kmHost = 'PC-A'; panicKey = 'Ctrl+Alt+Pause' }; $Name = 'PC-A'
+  $eng = [pscustomobject]@{ Up = $true; Active = $false; Controlled = $false; Uipi = $false; VersionMsg = ''; InjectError = '' }
+  Check ((Link-Status $L5 $true $true 5 $eng $false) -match '^Connected. Move the mouse') 'link status: ready here'
+  $eng.Active = $true; Check ((Link-Status $L5 $true $true 5 $eng $false) -match 'are on PC-B.*Ctrl\+Alt\+Pause') 'link status: on the other PC'
+  $Name = 'PC-B'; $eng.Active = $false; $eng.Controlled = $true; $eng.Uipi = $true; Check ((Link-Status $L5 $true $true 5 $eng $false) -match 'admin window') 'link status: admin window in front'; $Name = 'PC-A'
+  Check ((Link-Status $L5 $true $true 4 $eng $false) -match 'Update DeskGlide on PC-B' -and (Link-Status $L5 $true $true 5 $eng $true) -match 'Synergy is running') 'link status: old peer, Synergy running'
+  $eng.Up = $false; Check ((Link-Status $L5 $true $true 5 $eng $false) -match 'Waiting for PC-B') 'link status: waiting'
+  $eng.VersionMsg = 'DeskGlide on PC-B is older.'; Check ((Link-Status $L5 $true $true 5 $eng $false) -eq 'DeskGlide on PC-B is older.') 'link status: version mismatch'
+  $L5.kmHost = ''; Check ((Link-Status $L5 $true $true 5 $eng $false) -match 'Choose the PC') 'link status: no keyboard PC'
+  $L5.link = $false; Check ((Link-Status $L5 $true $true 5 $null $false) -match '^Off') 'link status: off'
 
   # hotkeys: RegisterHotKey values
   $k = Parse-Hotkey 'Ctrl+Alt+Right'; Check ($k.mods -eq 3 -and $k.vk -eq 0x27 -and $k.text -eq 'Ctrl+Alt+Right') 'hotkey: default'
@@ -471,6 +522,7 @@ if ($Test) {
   $k = Parse-Hotkey 'Win+Alt+k'; Check ($k.mods -eq 9 -and $k.vk -eq 0x4B -and $k.text -eq 'Win+Alt+K') 'hotkey: letter'
   $k = Parse-Hotkey 'Ctrl+F12'; Check ($k.vk -eq 0x7B -and $k.text -eq 'Ctrl+F12') 'hotkey: F12'
   Check ((Parse-Hotkey 'Alt+F24').vk -eq 0x87 -and (Parse-Hotkey 'Ctrl+7').vk -eq 0x37) 'hotkey: F24 and digits'
+  $k = Parse-Hotkey 'Ctrl+Alt+Pause'; Check ($k.vk -eq 0x13 -and $k.mods -eq 3 -and $k.text -eq 'Ctrl+Alt+Pause' -and (Parse-Hotkey 'ctrl+break').vk -eq 0x13 -and (Parse-Hotkey 'Shift+ScrollLock').vk -eq 0x91) 'hotkey: the panic key'
   Check ($null -eq (Parse-Hotkey 'Right') -and $null -eq (Parse-Hotkey 'Ctrl+Ctrl+Right') -and $null -eq (Parse-Hotkey 'Ctrl+Alt+PgUp') -and $null -eq (Parse-Hotkey 'Hyper+Right') -and $null -eq (Parse-Hotkey 'Ctrl+F25') -and $null -eq (Parse-Hotkey '')) 'hotkey: rejects'
   $PA.hkTo = ''; $S.hk = Now-Ms; $S.hkTo = 'PC-B'; $hm = Msg $PA 'PC-A'
   Check ($hm.hk -eq $S.hk -and $hm.ha -eq 'PC-B') 'hotkey press in the state message'
@@ -721,8 +773,10 @@ if ($Test) {
 
   $Name = 'PC-A'; $ConfigDir = Join-Path $env:TEMP "deskglide-test-$PID"; $cfgPath = Join-Path $ConfigDir 'config.json'
   [void](New-Item -ItemType Directory -Force $ConfigDir)
+  Check ((Load-Config).link -and (Load-Config).panicKey -eq 'Ctrl+Alt+Pause') 'new install: keyboard and mouse sharing on'
   Set-Content $cfgPath '{"peer":"PC-B","key":"a2V5","input":15,"headphones":true,"syncAt":5,"audio":"both"}'
   $C = Load-Config
+  Check (-not $C.link) 'upgrade: keyboard and mouse sharing stays off until turned on (Synergy keeps working)'
   Check ($C.hp -eq 'PC-A' -and $C.syncAt -gt 5 -and -not $C.Contains('headphones') -and $C.key -eq 'a2V5' -and $C.peer -eq 'PC-B' -and $C.audio -eq 'both' -and $C.vol -eq 100) 'upgrade from DeskGlide 2 (headphones here)'
   Set-Content $cfgPath '{"peer":"PC-B","key":"a2V5","headphones":false,"syncAt":5}'
   $C = Load-Config; Check ($C.hp -eq '' -and $C.syncAt -eq 5 -and $C.key -eq 'a2V5') 'upgrade from DeskGlide 2 (headphones elsewhere)'
@@ -732,6 +786,7 @@ if ($Test) {
   # pairing key at rest: DPAPI-protected for this Windows user; DeskGlide 3's plain key is migrated on the next save
   $raw = Get-Content $cfgPath -Raw
   Check ($raw -match '"key":\s*"dpapi:' -and $raw -notmatch 'a2V5' -and $C.key -eq 'a2V5') 'key protected on disk, plain in memory'
+  Check (-not (Test-Path "$cfgPath.tmp")) 'config written atomically (no temp file left)'
   Set-Content $cfgPath '{"peer":"PC-B","key":"a2V5"}'; $C = Load-Config; Check ($C.key -eq 'a2V5') 'DeskGlide 3 plain key read'
   Save-Config; Check ((Get-Content $cfgPath -Raw) -notmatch 'a2V5' -and (Load-Config).key -eq 'a2V5') 'plain key migrated'
   Set-Content $cfgPath '{"peer":"PC-B","key":"dpapi:AAAA"}'; $u = Load-Config; Check ($u.key -eq '' -and $u.peer -eq '') 'unreadable key means unpaired, no crash'
@@ -826,14 +881,14 @@ function Receive-Control {
     if (-not $S.peerAddr -or -not $S.peerAddr.Equals($ep.Address)) { Say "Found $($m.n) at $($ep.Address)." }
     $S.peerAddr = $ep.Address; $S.peerSeen = Get-Date; $S.peerInput = [int]$m.i
     $S.peerVer = [int]$m.ver; $S.peerScreen = if ($m.sn) { [string]$m.sn } else { [string]$m.n }
-    $S.peerInputs = To-Hash $m.mi; $S.peerOffer = $m.fo; $S.peerCable = [bool]$m.vc
+    $S.peerInputs = To-Hash $m.mi; $S.peerOffer = $m.fo; $S.peerCable = [bool]$m.vc; $S.peerClip = $m.co
     # remember the address for the next start; only replace it once it went quiet, so a peer on two adapters doesn't flip-flop
     if ($S.fixedIp -and $S.fixedIp.Equals($ep.Address)) { $S.fixedSeen = Get-Date }
     elseif (((Get-Date) - $S.fixedSeen).TotalSeconds -gt 10) { $C.peerAddress = "$($ep.Address)"; $S.fixedIp = $ep.Address; $S.fixedSeen = Get-Date; Save-Config }
     if ($m.s) { $S.peerLinks = @($m.l | % { $w = "$_" -split ' '; if ($w.Count -eq 3 -and $opp[$w[1]]) { [pscustomobject]@{ from = $w[0]; dir = $w[1]; to = $w[2] } } }) }
     if (Merge-Settings $C $m) { Save-Config; Update-Menu }
     # follow the server when where the mouse is changes there (not every message, so a hotkey here isn't undone by a stale one)
-    if ($m.s -and -not $S.server -and [bool]$m.sa -ne $S.lastSa) { $S.lastSa = [bool]$m.sa; if ($m.sa) { Set-Active 'peer' $m.n } else { Set-Active 'me' $Name } }
+    if ($m.s -and -not $S.server -and -not $C.link -and [bool]$m.sa -ne $S.lastSa) { $S.lastSa = [bool]$m.sa; if ($m.sa) { Set-Active 'peer' $m.n } else { Set-Active 'me' $Name } }
     if ([long]$m.hk -gt $S.hkSeen) {   # a hotkey on the other PC
       $S.hkSeen = [long]$m.hk; $S.want = $null
       if ($m.ha -eq $Name) { Set-Active 'me' $S.screen } elseif ($m.ha) { Set-Active 'peer' $S.peerScreen }
@@ -847,7 +902,7 @@ function Set-Active($new, [string]$screen) {
   Say "Mouse is on $(if ($new -eq 'me') { 'this PC' } elseif ($C.peer) { $C.peer } else { $screen })."
   if ($S.server) { Send-State }   # tell the peer right away; it wakes its screen when the mouse arrives there
   if ($new -eq 'me' -and $old) { [Dg]::WakeDisplay() }   # so the monitor doesn't switch to a sleeping screen
-  if ($new -eq 'me') { Reattach-Monitors; Fetch-Files }
+  if ($new -eq 'me') { Reattach-Monitors; Fetch-Files; Fetch-Clip }
   # The PC on screen sends the switch: many monitors ignore DDC from an input they aren't showing.
   if ($old -eq 'me' -and $new -eq 'peer' -and $C.monitor -and -not $C.paused) { Switch-Monitor }
   if ($C.onSwitch) {
@@ -867,17 +922,18 @@ function Show-Pc([string]$who) {   # hotkey: the monitor and sound go to $who ('
 function Apply-Hotkeys {   # (re)registers both hotkeys; says which ones another program already has
   if (-not $S.msgWin) { return }
   $bad = @()
-  foreach ($h in @(@(1, $C.hotkeyPeer), @(2, $C.hotkeyMe))) {
+  foreach ($h in @(@(1, $C.hotkeyPeer), @(2, $C.hotkeyMe), @(3, $C.panicKey))) {
     $k = Parse-Hotkey $h[1]
-    if (-not $k) { [void]$S.msgWin.SetHotkey($h[0], 0, 0) }
-    elseif (-not $S.msgWin.SetHotkey($h[0], [uint32]$k.mods, [uint32]$k.vk)) { $bad += $k.text }
+    if (-not $k) { [void]$S.msgWin.SetHotkey($h[0], 0, 0); continue }
+    $vk = if ($k.vk -eq 0x13 -and ($k.mods -band 2)) { 3 } else { $k.vk }   # Ctrl+Pause arrives as Break
+    if (-not $S.msgWin.SetHotkey($h[0], [uint32]$k.mods, [uint32]$vk)) { $bad += $k.text }
   }
   $S.hkErr = if ($bad.Count) { "$($bad -join ' and ') $(if ($bad.Count -gt 1) { 'are' } else { 'is' }) in use by another program. Choose another key." } else { '' }
   if ($bad.Count) { Say $S.hkErr }
 }
 function Set-HotkeyText([string]$which, [string]$text) {   # from the Settings card
   $k = Parse-Hotkey $text
-  if (-not $k) { $S.hkErr = "`"$text`" isn't a hotkey DeskGlide understands. Use Ctrl, Alt, Shift or Win with an arrow, a letter, a digit or F1-F24, like Ctrl+Alt+Right."; return }
+  if (-not $k) { $S.hkErr = "`"$text`" isn't a hotkey DeskGlide understands. Use Ctrl, Alt, Shift or Win with an arrow, a letter, a digit, F1-F24 or Pause, like Ctrl+Alt+Right."; return }
   if ($C[$which] -eq $k.text) { $S.hkErr = ''; return }
   $C[$which] = $k.text; Save-Config; Apply-Hotkeys
 }
@@ -913,10 +969,17 @@ function Start-Update {   # the footer link
 }
 
 # ---------- files: copy on one PC, paste on the other ----------
-function Check-Clipboard {   # the clipboard changed: offer copied files to the other PC
+function Check-Clipboard {   # the clipboard changed: offer copied files (and with Link, text and pictures) to the other PC
   [MsgWin]::ClipChanged = $false
+  $list = @(); $text = $null; $img = $null
+  try {
+    if ([Windows.Forms.Clipboard]::ContainsFileDropList()) { $list = @([Windows.Forms.Clipboard]::GetFileDropList()) }
+    elseif ($S.link -and ((Get-Date) - $S.clipSetAt).TotalSeconds -gt 1) {   # not the change DeskGlide just made
+      if ([Windows.Forms.Clipboard]::ContainsText()) { $text = [Windows.Forms.Clipboard]::GetText() } elseif ([Windows.Forms.Clipboard]::ContainsImage()) { $img = [Windows.Forms.Clipboard]::GetImage() }
+    } elseif ($S.link) { return }
+  } catch { return }   # busy: next change
+  Offer-Clip $text $img
   if (-not $C.files) { return }
-  $list = @(); try { if ([Windows.Forms.Clipboard]::ContainsFileDropList()) { $list = @([Windows.Forms.Clipboard]::GetFileDropList()) } } catch { return }   # busy: next change
   if (($list -join '|') -eq $S.pasted -and $list.Count) { return }   # the files DeskGlide just put there
   if (-not $list.Count) { if ($S.offer) { $S.offer = $null; [Files]::Offer($null); Send-State }; return }
   $limit = [long]$C.fileLimitMB * 1MB
@@ -930,6 +993,59 @@ function Check-Clipboard {   # the clipboard changed: offer copied files to the 
   $S.fileErr = $false; $S.fileMsg = "Copied here: $(Offer-Text $S.offer). Move the mouse to $(Peer-Label) and paste."
   Say "Offering $(Offer-Text $S.offer)"; Send-State
 }
+function Offer-Clip($text, $img) {   # text or a picture for the other PC, pulled when the mouse gets there
+  $kind = ''; $bytes = $null
+  if ($text) { $kind = 'text'; $bytes = [Text.Encoding]::UTF8.GetBytes($text) }
+  elseif ($img) { $ms = New-Object IO.MemoryStream; $img.Save($ms, [Drawing.Imaging.ImageFormat]::Png); $img.Dispose(); $kind = 'png'; $bytes = $ms.ToArray() }
+  $sig = if ($bytes) { [Dg]::Hex(([Security.Cryptography.SHA256]::Create()).ComputeHash($bytes)) } else { '' }
+  if ($sig -eq $S.clipSig) { return }
+  $S.clipSig = $sig
+  if ($bytes -and [Clip]::Offer($kind, $bytes)) { $S.clipOffer = @{ id = [Clip]::OfferId; k = $kind; b = $bytes.Length } }
+  elseif (-not $S.clipOffer) { return } else { [void][Clip]::Offer('', $null); $S.clipOffer = $null }   # nothing, or over 32 MB: stays here
+  Send-State
+}
+function Fetch-Clip {   # the mouse arrived here (Link): pull the text or picture copied on the other PC
+  $o = $S.peerClip
+  if (-not $S.link -or -not $o -or -not $o.id -or $o.id -eq $S.clipGot -or [Clip]::Status -eq 'busy' -or -not $S.peerAddr) { return }
+  $S.clipGot = [string]$o.id; [Clip]::Fetch("$($S.peerAddr)", $PeerPort + 1, $S.key, [string]$o.id)
+}
+function Poll-Clip {
+  $st = [Clip]::Status
+  if ($st -eq '' -or $st -eq 'busy') { return }
+  [Clip]::Status = ''
+  if ($st -ne 'ok') { if ($st -ne 'error: gone') { Say "Couldn't get the clipboard from $(Peer-Label): $($st -replace '^error: ')" }; return }
+  $b = [Clip]::Result; $S.clipSetAt = Get-Date
+  try {
+    if ([Clip]::ResultKind -eq 'png') { [Windows.Forms.Clipboard]::SetImage([Drawing.Image]::FromStream((New-Object IO.MemoryStream (, $b)))) }
+    else { [Windows.Forms.Clipboard]::SetText([Text.Encoding]::UTF8.GetString($b)) }
+    Say "Clipboard from $(Peer-Label): $(if ([Clip]::ResultKind -eq 'png') { 'a picture' } else { 'text' }), $(Size-Text $b.Length)."
+  } catch { Say "The clipboard was busy; copy it again on $(Peer-Label)." }
+}
+
+# ---------- DeskGlide Link: start and stop the engine, hand it the settings, follow where it says the mouse is ----------
+function Poll-Link {
+  $on = $C.link -and $S.key -and $C.peer
+  if (-not $on) { if ($S.link) { $S.link.Stop(); $S.link = $null; $S.linkWant = $null; Say 'Keyboard and mouse sharing stopped.' }; return }
+  if (-not $S.link) {
+    if (((Get-Date) - $S.linkAt).TotalSeconds -lt 10) { return }   # the port was busy: try again in a while
+    $S.linkAt = Get-Date
+    $l = New-Object Link; $l.Name = $Name
+    try { $l.Start($Port + 2, $PeerPort + 2) } catch { Say "Keyboard and mouse sharing can't use UDP port $($Port + 2): $($_.Exception.Message)" error; return }
+    $S.link = $l; Say "Keyboard and mouse sharing on UDP port $($Port + 2)$(if ($NoInject) { ', no injection' })."
+  }
+  $l = $S.link
+  $l.Key = $S.key; if ($S.peerAddr) { $l.Peer = $S.peerAddr } elseif ($S.fixedIp -and -not $l.Peer) { $l.Peer = $S.fixedIp }
+  $l.Sender = $C.kmHost -eq $Name
+  $lay = (Current-Layout).show; $l.Dir = [char]$(if ($lay) { $lay.dir[0] } else { 'r' })
+  $l.Speed = [Math]::Max(25, [Math]::Min(400, [int]$C.linkSpeed)); $l.Game = [bool]$C.game; $l.LockSync = [bool]$C.lockSync
+  $pk = Parse-Hotkey $C.panicKey; $l.PanicMods = $(if ($pk) { $pk.mods } else { 0 }); $l.PanicVk = $(if ($pk) { $pk.vk } else { 0 })
+  $msg = $null; while ($l.Log.TryDequeue([ref]$msg)) { Say "Link: $msg" }
+  if ($NoInject) { while ($l.Injected.TryDequeue([ref]$msg)) { Say "Link would inject: $($msg -replace '^\d+\|')" } }
+  # where the mouse is: the keyboard PC always knows; the other PC only while connected (a lost link doesn't move it)
+  $want = if ($l.Sender) { if ($l.Active) { 'peer' } else { 'me' } } elseif ($l.Up) { if ($l.Controlled) { 'me' } else { 'peer' } }
+  if ($want -and $want -ne $S.linkWant) { $S.linkWant = $want; $S.want = $want; $S.wantName = $(if ($want -eq 'me') { $S.screen } else { $S.peerScreen }); $S.since = Get-Date }
+}
+
 function Fetch-Files {   # the mouse arrived here: pull the other PC's copied files
   $o = $S.peerOffer
   if (-not $C.files -or -not $o -or -not $o.id -or $o.id -eq $S.fetchedId -or [Files]::Status -eq 'busy' -or -not $S.peerAddr) { return }
@@ -1054,16 +1170,21 @@ function Save-Muted {
 function Tick {
   $now = Get-Date
   Receive-Control
-  if ($S.server -and (Test-Path -LiteralPath $S.log)) {
-    $text, $S.pos = Read-Lines $S.log $S.pos
-    $t = Get-Target $text
-    if ($t) { $S.want = $(if ($t -eq $S.screen) { 'me' } else { 'peer' }); $S.wantName = $t; $S.since = $now }
-    # wait 400 ms after the last switch so a bounce at the screen edge doesn't flicker the monitor
-    if ($S.want -and $S.want -ne $S.active -and ($now - $S.since).TotalMilliseconds -ge 400) { Set-Active $S.want $S.wantName }
+  if ($C.link) { Poll-Link }   # DeskGlide Link says where the mouse is; without it, Synergy's log does
+  else {
+    if ($S.link) { Poll-Link }
+    if ($S.server -and (Test-Path -LiteralPath $S.log)) {
+      $text, $S.pos = Read-Lines $S.log $S.pos
+      $t = Get-Target $text
+      if ($t) { $S.want = $(if ($t -eq $S.screen) { 'me' } else { 'peer' }); $S.wantName = $t; $S.since = $now }
+    }
   }
+  # wait a moment after the last switch so a bounce at the screen edge doesn't flicker the monitor
+  if ($S.want -and $S.want -ne $S.active -and ($now - $S.since).TotalMilliseconds -ge $(if ($S.link) { 250 } else { 400 })) { Set-Active $S.want $S.wantName }
   if ($showEvt.WaitOne(0)) { Show-Window }   # DeskGlide was started again: show this copy instead
   $hk = [MsgWin]::Pressed
-  if ($hk) { [MsgWin]::Pressed = 0; Show-Pc $(if ($hk -eq 1) { 'peer' } else { 'me' }) }
+  if ($hk -eq 3) { [MsgWin]::Pressed = 0; if ($S.link) { $S.link.Panic() } }   # the panic key while this PC has the keyboard and mouse
+  elseif ($hk) { [MsgWin]::Pressed = 0; Show-Pc $(if ($hk -eq 1) { 'peer' } else { 'me' }) }
   if ([MsgWin]::ClipChanged) { Check-Clipboard }
   if ($S.n++ % 5) { return }   # the rest twice a second
 
@@ -1071,11 +1192,13 @@ function Tick {
   if (($now - $S.lastSend).TotalSeconds -ge 2) { Send-State }
   if (($now - $S.roleAt).TotalSeconds -ge 60) {
     $S.roleAt = $now
-    if (-not $S.server) { Detect-Role }
+    if (-not $S.server -and -not $C.link) { Detect-Role }
     if ($C.peerAddress -and -not $S.fixedIp) { Resolve-Peer }
   }
   if ($S.n % 30 -eq 1) { Read-Layout }   # every 3 s
-  Poll-Fetch; [Files]::Key = $S.key
+  Poll-Fetch; Poll-Clip; [Files]::Key = $S.key
+  if ($C.link -and -not $Shot -and ($now - $S.synAt).TotalSeconds -ge 10) { $S.synAt = $now; $S.synergy = [bool](Get-Process -ErrorAction SilentlyContinue | ? { $_.ProcessName -match '^(synergy|deskflow|barrier|input-leap)' }) }
+  if ($S.speedAt -and ($now - $S.speedAt).TotalMilliseconds -ge 400) { $S.speedAt = $null; Save-Config }   # speed slider: save when it stops
   Poll-Update
   Check-Switch
   if ($S.volAt -and ($now - $S.volAt).TotalMilliseconds -ge 400) { $S.volAt = $null; Changed }   # slider: sync when it stops moving
@@ -1125,7 +1248,7 @@ function Tick {
   if ($Shot -and $S.shownAt -and ($now - $S.shownAt).TotalSeconds -ge 4) { Save-Shot; [Windows.Forms.Application]::Exit() }
   if ($Console -and ($now - $S.statAt).TotalSeconds -ge 5) {
     $S.statAt = $now
-    Write-Host ("{0:HH:mm:ss} [{1}] control ok {2} bad {3} | audio sent {4} ok {5} bad {6}" -f $now, ($status -replace "`n", ', '), $S.okCtl, $S.badCtl, [Dg]::Sent, [Dg]::Got, [Dg]::Bad)
+    Write-Host ("{0:HH:mm:ss} [{1}] control ok {2} bad {3} | audio sent {4} ok {5} bad {6}{7}" -f $now, ($status -replace "`n", ', '), $S.okCtl, $S.badCtl, [Dg]::Sent, [Dg]::Got, [Dg]::Bad, $(if ($S.link) { ' | link {0}, rtt {1:0.00} ms, loss {2:0}%' -f $(if ($S.link.Up) { 'up' } else { 'down' }), $S.link.Rtt, $S.link.Loss }))
   }
 }
 
@@ -1343,12 +1466,32 @@ $xaml = @'
         <StackPanel Grid.Column="2">
           <Border Style="{StaticResource CardBox}"><StackPanel>
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE765;"/><TextBlock Style="{StaticResource H}" Text="Keyboard &amp; mouse"/></StackPanel>
-            <TextBlock Style="{StaticResource Label}" Margin="0,0,0,5" Text="Keyboard and mouse are plugged into"/>
-            <Border Style="{StaticResource InsetBox}"><UniformGrid Rows="1">
+            <CheckBox x:Name="LinkToggle" Style="{StaticResource Switch}"><StackPanel>
+              <TextBlock Text="Share them with the other PC"/>
+              <TextBlock Style="{StaticResource Sub}" Text="Move the mouse off the screen edge and keep typing there. Encrypted, DeskGlide's own (no Synergy)."/></StackPanel></CheckBox>
+            <TextBlock Style="{StaticResource Label}" Text="Keyboard and mouse are plugged into"/>
+            <Border x:Name="KmHostMain"><Border x:Name="KmPanel" Style="{StaticResource InsetBox}"><UniformGrid Rows="1">
               <RadioButton x:Name="KmMe" GroupName="km" Style="{StaticResource Seg}"/>
               <RadioButton x:Name="KmPeer" GroupName="km" Style="{StaticResource Seg}"/>
-            </UniformGrid></Border>
-            <TextBlock Style="{StaticResource Sub}" Margin="0,10,0,0" Text="Sharing them is coming in DeskGlide Link. Until then Synergy shares them, and DeskGlide follows Synergy's log."/>
+            </UniformGrid></Border></Border>
+            <Border Style="{StaticResource InsetBox}" Padding="12,9" Margin="0,14,0,0"><Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
+              <Ellipse x:Name="LinkDot" Width="8" Height="8" Margin="0,6,10,0" VerticalAlignment="Top"/>
+              <StackPanel Grid.Column="1"><TextBlock x:Name="LinkWhy" Style="{StaticResource Body}"/><TextBlock x:Name="LinkStats" Style="{StaticResource Sub}" Margin="0,4,0,0"/></StackPanel>
+            </Grid></Border>
+            <StackPanel x:Name="LinkMore">
+              <Grid Margin="0,16,0,0"><TextBlock Text="Pointer speed on the other PC" TextTrimming="CharacterEllipsis" Margin="0,0,44,0"/><TextBlock x:Name="SpeedPct" HorizontalAlignment="Right" Foreground="{DynamicResource Fg2}"/></Grid>
+              <Slider x:Name="Speed" Minimum="25" Maximum="400" SmallChange="5" LargeChange="25" IsMoveToPointEnabled="True" Margin="0,6,0,0"/>
+              <CheckBox x:Name="GameToggle" Style="{StaticResource Switch}" Margin="0,14,0,0"><StackPanel>
+                <TextBlock Text="Game mode"/>
+                <TextBlock Style="{StaticResource Sub}" Text="When a game on the other PC holds the pointer, send raw movement. Come back with the panic key."/></StackPanel></CheckBox>
+              <CheckBox x:Name="LockToggle" Style="{StaticResource Switch}" Margin="0,12,0,0"><StackPanel>
+                <TextBlock Text="Lock both PCs together"/>
+                <TextBlock Style="{StaticResource Sub}" Text="Win+L on one PC locks the other one too."/></StackPanel></CheckBox>
+              <TextBlock Style="{StaticResource Label}" Text="Panic key: keyboard and mouse back here"/>
+              <TextBox x:Name="PanicKey"/>
+              <TextBlock Style="{StaticResource Sub}" Margin="0,4,0,0" Text="Works without the network. Also releases any stuck key."/>
+            </StackPanel>
           </StackPanel></Border>
           <Border Style="{StaticResource CardBox}"><StackPanel>
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12"><TextBlock Style="{StaticResource Glyph}" Text="&#xE7F6;"/><TextBlock Style="{StaticResource H}" Text="Sound"/></StackPanel>
@@ -1475,7 +1618,7 @@ $xaml = @'
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
           <Rectangle x:Name="D1" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/><Rectangle x:Name="D2" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/>
           <Rectangle x:Name="D3" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/><Rectangle x:Name="D4" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/>
-          <Rectangle x:Name="D5" Width="28" Height="4" RadiusX="2" RadiusY="2"/>
+          <Rectangle x:Name="D5" Width="28" Height="4" RadiusX="2" RadiusY="2" Margin="0,0,6,0"/><Rectangle x:Name="D6" Width="28" Height="4" RadiusX="2" RadiusY="2"/>
         </StackPanel>
       </StackPanel>
     </DockPanel>
@@ -1487,13 +1630,15 @@ $xaml = @'
           <TextBlock Style="{StaticResource Body}" Text="Two PCs, one monitor, one keyboard and mouse. Move the mouse off the edge of one PC's screen and everything else follows it to the other PC."/>
           <Grid Margin="0,22,0,0">
             <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/></Grid.ColumnDefinitions>
-            <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+            <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
             <TextBlock Style="{StaticResource Glyph}" Text="&#xE7F4;" FontSize="20" Margin="0,0,16,14"/>
             <TextBlock Grid.Column="1" Style="{StaticResource Body}" Text="The monitor switches to the PC that has the mouse." Margin="0,0,0,14"/>
             <TextBlock Grid.Row="1" Style="{StaticResource Glyph}" Text="&#xE7F6;" FontSize="20" Margin="0,0,16,14"/>
             <TextBlock Grid.Row="1" Grid.Column="1" Style="{StaticResource Body}" Text="Your headphones play that PC's sound, or both PCs at once." Margin="0,0,0,14"/>
-            <TextBlock Grid.Row="2" Style="{StaticResource Glyph}" Text="&#xE71B;" FontSize="20" Margin="0,0,16,0"/>
-            <TextBlock Grid.Row="2" Grid.Column="1" Style="{StaticResource Body}" Text="The two PCs find each other on your network. You pair them once with a code."/>
+            <TextBlock Grid.Row="2" Style="{StaticResource Glyph}" Text="&#xE765;" FontSize="20" Margin="0,0,16,14"/>
+            <TextBlock Grid.Row="2" Grid.Column="1" Style="{StaticResource Body}" Text="One keyboard and mouse for both PCs, shared by DeskGlide itself." Margin="0,0,0,14"/>
+            <TextBlock Grid.Row="3" Style="{StaticResource Glyph}" Text="&#xE71B;" FontSize="20" Margin="0,0,16,0"/>
+            <TextBlock Grid.Row="3" Grid.Column="1" Style="{StaticResource Body}" Text="The two PCs find each other on your network. You pair them once with a code."/>
           </Grid>
           <TextBlock Style="{StaticResource Sub}" Margin="0,22,0,0" Text="Setup takes about a minute. Install DeskGlide on both PCs and run this setup on both."/>
         </StackPanel>
@@ -1503,6 +1648,12 @@ $xaml = @'
           <Border x:Name="PairHostWiz" Margin="0,18,0,0"/>
         </StackPanel>
         <StackPanel x:Name="W3" Visibility="Collapsed">
+          <TextBlock Style="{StaticResource Big}" Text="Which PC are your keyboard and mouse plugged into?"/>
+          <TextBlock Style="{StaticResource Body}" Text="DeskGlide shares them with the other PC: move the mouse off the edge of the screen and keep typing there. Both PCs share this choice."/>
+          <Border x:Name="KmHostWiz" Margin="0,18,0,0"/>
+          <TextBlock Style="{StaticResource Sub}" Margin="0,12,0,0" Text="Using Synergy today? Quit it on both PCs once the Keyboard &amp; mouse card says Connected."/>
+        </StackPanel>
+        <StackPanel x:Name="W4" Visibility="Collapsed">
           <TextBlock Style="{StaticResource Big}" Text="Show each PC on the monitor once"/>
           <TextBlock Style="{StaticResource Body}" Text="Move your mouse to each PC once and wait a few seconds. If the screen doesn't follow, press the monitor's input button. DeskGlide asks the monitor which input each PC uses."/>
           <Border Style="{StaticResource InsetBox}" Padding="16,12" Margin="0,18,0,0"><Grid>
@@ -1513,13 +1664,13 @@ $xaml = @'
           </Grid></Border>
           <TextBlock x:Name="W3Msg" Style="{StaticResource Sub}" Margin="0,12,0,0"/>
         </StackPanel>
-        <StackPanel x:Name="W4" Visibility="Collapsed">
+        <StackPanel x:Name="W5" Visibility="Collapsed">
           <TextBlock Style="{StaticResource Big}" Text="Where are your headphones plugged in?"/>
           <TextBlock Style="{StaticResource Body}" Text="The other PC sends its sound there over your network. Both PCs share this choice, and you can change it later."/>
           <Border x:Name="HpHostWiz" Margin="0,18,0,0"/>
           <TextBlock Style="{StaticResource Sub}" Margin="0,12,0,0" Text="No headphones? Click Next, and set Sound to Off later."/>
         </StackPanel>
-        <StackPanel x:Name="W5" Visibility="Collapsed">
+        <StackPanel x:Name="W6" Visibility="Collapsed">
           <TextBlock Style="{StaticResource Glyph}" Text="&#xE73E;" FontSize="40" HorizontalAlignment="Left" Margin="0,0,0,14"/>
           <TextBlock Style="{StaticResource Big}" Text="You're all set"/>
           <TextBlock x:Name="Summary" Style="{StaticResource Body}"/>
@@ -1573,7 +1724,7 @@ function New-Window {
   $script:logos = 0..3 | % { [Windows.Media.Imaging.BitmapFrame]::Create((New-Object IO.MemoryStream (, [Dg]::IconPng(176, $_))), 'None', 'OnLoad') }
   $ui.WizLogo.Source = $logos[0]; $ui.BigLogo.Source = $logos[0]
   $ui.Ver.Text = "DeskGlide $Version  -  $Name$(if ($DryRun) { '  -  dry run' })"
-  if ($Shot) { $win.WindowStartupLocation = 'Manual'; $win.Left = -20000; $win.Top = 0; if ($S.key) { $win.Height = 1180 }; $win.ShowActivated = $false; $win.ShowInTaskbar = $false }   # drawn off screen, never takes focus
+  if ($Shot) { $win.WindowStartupLocation = 'Manual'; $win.Left = -20000; $win.Top = 0; if ($S.key) { $win.Height = 1500 }; $win.ShowActivated = $false; $win.ShowInTaskbar = $false }   # drawn off screen, never takes focus
 
   On MonToggle Checked, Unchecked { if ($C.monitor -ne [bool]$ui.MonToggle.IsChecked) { $C.monitor = -not $C.monitor; Changed } }
   On PauseToggle Checked, Unchecked { if ($C.paused -ne [bool]$ui.PauseToggle.IsChecked) { $C.paused = -not $C.paused; Changed } }
@@ -1618,7 +1769,13 @@ function New-Window {
   On Help Click { $md = Join-Path $PSScriptRoot 'README.md'; if (Test-Path 'Registry::HKEY_CLASSES_ROOT\.md') { Start-Process $md } else { Start-Process notepad.exe "`"$md`"" } }
   On KmMe Checked { if ($C.kmHost -ne $Name) { $C.kmHost = $Name; Changed } }
   On KmPeer Checked { if ($C.peer -and $C.kmHost -ne $C.peer) { $C.kmHost = $C.peer; Changed } }
-  On WizNext Click { if ($S.wiz -ge 5) { Show-Wizard 0 } else { Show-Wizard ($S.wiz + 1) } }
+  On LinkToggle Checked, Unchecked { if ([bool]$C.link -ne [bool]$ui.LinkToggle.IsChecked) { $C.link = -not $C.link; Changed } }
+  On GameToggle Checked, Unchecked { if ([bool]$C.game -ne [bool]$ui.GameToggle.IsChecked) { $C.game = -not $C.game; Save-Config } }
+  On LockToggle Checked, Unchecked { if ([bool]$C.lockSync -ne [bool]$ui.LockToggle.IsChecked) { $C.lockSync = -not $C.lockSync; Changed } }
+  On Speed ValueChanged { $v = [int]$ui.Speed.Value; if ($v -ne $C.linkSpeed) { $C.linkSpeed = $v; $S.speedAt = Get-Date } }
+  On PanicKey LostFocus { Set-HotkeyText 'panicKey' $ui.PanicKey.Text }
+  On PanicKey KeyDown { if ($args[1].Key -eq 'Return') { Set-HotkeyText 'panicKey' $ui.PanicKey.Text } }
+  On WizNext Click { if ($S.wiz -ge 6) { Show-Wizard 0 } else { Show-Wizard ($S.wiz + 1) } }
   On WizBack Click { Show-Wizard ($S.wiz - 1) }
   On WizSkip Click { Show-Wizard 0 }
   # drag the other PC's screen around this one, like Windows' display settings
@@ -1684,17 +1841,17 @@ function Show-Window {
 
 function Show-Wizard([int]$step) {
   $S.wiz = $step; $in = $step -gt 0
-  foreach ($p in @(@($ui.PairPanel, $ui.PairHostWiz, $ui.PairHostMain), @($ui.HpPanel, $ui.HpHostWiz, $ui.HpHostMain))) {   # the wizard borrows these from the main view
+  foreach ($p in @(@($ui.PairPanel, $ui.PairHostWiz, $ui.PairHostMain), @($ui.HpPanel, $ui.HpHostWiz, $ui.HpHostMain), @($ui.KmPanel, $ui.KmHostWiz, $ui.KmHostMain))) {   # the wizard borrows these from the main view
     $to = if ($in) { $p[1] } else { $p[2] }
     if ($p[0].Parent -ne $to) { $p[0].Parent.Child = $null; $to.Child = $p[0] }
   }
   Show-If $ui.Wiz $in; Show-If $ui.Main (-not $in)
   if (-not $in) { $S.wizDone = $true; return }
-  for ($i = 1; $i -le 5; $i++) { Show-If $ui["W$i"] ($i -eq $step); $ui["D$i"].SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ($i -le $step) { 'Accent' } else { 'Line2' })) }
+  for ($i = 1; $i -le 6; $i++) { Show-If $ui["W$i"] ($i -eq $step); $ui["D$i"].SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ($i -le $step) { 'Accent' } else { 'Line2' })) }
   $ui.WizBack.Visibility = if ($step -gt 1) { 'Visible' } else { 'Hidden' }
-  $ui.WizSkip.Visibility = if ($step -lt 5) { 'Visible' } else { 'Hidden' }
-  $ui.WizNext.Content = switch ($step) { 1 { 'Get started' } 5 { 'Finish' } default { 'Next' } }
-  $ui.WizStep.Text = "Step $step of 5"
+  $ui.WizSkip.Visibility = if ($step -lt 6) { 'Visible' } else { 'Hidden' }
+  $ui.WizNext.Content = switch ($step) { 1 { 'Get started' } 6 { 'Finish' } default { 'Next' } }
+  $ui.WizStep.Text = "Step $step of 6"
 }
 
 function Update-Ui {
@@ -1706,7 +1863,7 @@ function Update-Ui {
   # header
   $ui.Logo.Source = $logos[$S.iconState]
   $ui.Title.Text = if (-not $S.key) { 'Not paired' } elseif ($pairing) { 'Pairing...' } elseif ($online) { "Connected to $peer" } else { "Looking for $peer..." }
-  $mouse = switch ($S.active) { 'me' { "The mouse is on this PC ($Name)." } 'peer' { "The mouse is on $(if ($paired) { $peer } else { $S.activeName })." } default { 'Waiting for Synergy to report where the mouse is.' } }
+  $mouse = switch ($S.active) { 'me' { "The mouse is on this PC ($Name)." } 'peer' { "The mouse is on $(if ($paired) { $peer } else { $S.activeName })." } default { if ($C.link) { 'Waiting for keyboard and mouse sharing to connect.' } else { 'Waiting for Synergy to report where the mouse is.' } } }
   $ui.Sub.Text = if ($C.paused) { "Paused: the monitor and sound stay as they are. $mouse" } elseif (-not $S.key) { 'Pair with your other PC to get started.' } elseif ($pairing) { 'Waiting for the other PC...' } elseif (-not $online) { "Make sure $peer is on, running DeskGlide, and on the same network (or set its address in Settings)." } else { $mouse }
   $ui.Dot.Fill = Brush $(if ($C.paused -or -not $S.key) { 'Fg2' } elseif ($online) { 'Good' } else { 'Warn' })
 
@@ -1729,8 +1886,8 @@ function Update-Ui {
   $ui.LayoutCap.Text = if (-not $paired) { 'Pair with your other PC to place its screen.' }
     elseif ($lay) { "Move the mouse off the $($edge[$lay.dir]) edge of $Name to reach $peer." }
     else { "Drag $peer's screen to the side of this PC where it sits, or pick a side below." }
-  $differs = $L.own -and $L.syn -and $L.syn.dir -ne $L.own.dir
-  $ui.LayoutMsg.Text = if ($differs) { "Synergy's layout differs; DeskGlide will apply its own layout when keyboard/mouse sharing moves into DeskGlide." } else { '' }
+  $differs = -not $C.link -and $L.own -and $L.syn -and $L.syn.dir -ne $L.own.dir
+  $ui.LayoutMsg.Text = if ($differs) { "Synergy's layout differs. Turn on keyboard and mouse sharing to use this one." } else { '' }
   Show-If $ui.LayoutMsg $differs
 
   # monitor
@@ -1748,6 +1905,13 @@ function Update-Ui {
   # keyboard & mouse
   $ui.KmMe.Content = $Name; $ui.KmPeer.Content = $peer; $ui.KmPeer.IsEnabled = $paired
   $ui.KmMe.IsChecked = $C.kmHost -eq $Name; $ui.KmPeer.IsChecked = $paired -and $C.kmHost -eq $C.peer
+  $ui.LinkToggle.IsChecked = [bool]$C.link; $l = $S.link; $up = $l -and $l.Up
+  $ui.LinkWhy.Text = Link-Status $C $paired $online $S.peerVer $l $S.synergy
+  $ui.LinkDot.Fill = Brush $(if ($up -and -not $S.synergy -and -not $l.InjectError) { 'Good' } elseif ($C.link) { 'Warn' } else { 'Fg2' })
+  Show-If $ui.LinkStats $up; if ($up) { $ui.LinkStats.Text = 'Latency (round trip) {0}   Packet loss {1:0.#}%' -f $(if ($l.Rtt -ge 0) { '{0:0.0} ms' -f $l.Rtt } else { '...' }), $l.Loss }
+  Show-If $ui.LinkMore $C.link
+  if (-not $S.speedAt -and $ui.Speed.Value -ne $C.linkSpeed) { $ui.Speed.Value = $C.linkSpeed }; $ui.SpeedPct.Text = "$($C.linkSpeed)%"
+  $ui.GameToggle.IsChecked = [bool]$C.game; $ui.LockToggle.IsChecked = [bool]$C.lockSync
 
   # sound
   $ui.AFollow.IsChecked = $C.audio -eq 'follow'; $ui.ABoth.IsChecked = $C.audio -eq 'both'; $ui.AOff.IsChecked = $C.audio -eq 'off'
@@ -1799,10 +1963,10 @@ function Update-Ui {
   $ui.StartupToggle.IsChecked = Test-Path $lnk; $ui.PauseToggle.IsChecked = $C.paused; $ui.DetachToggle.IsChecked = $C.detach
   $ui.HkMsg.Text = if ($S.hkErr) { $S.hkErr } else { 'The mouse stays where it is.' }
   $ui.HkMsg.Foreground = Brush $(if ($S.hkErr) { 'Bad' } else { 'Fg2' })
-  foreach ($p in @(@('LogPath', 'synergyLog'), @('AddrSet', 'peerAddress'), @('Script', 'onSwitch'), @('HkPeer', 'hotkeyPeer'), @('HkMe', 'hotkeyMe'), @('FileLimit', 'fileLimitMB'))) {
+  foreach ($p in @(@('LogPath', 'synergyLog'), @('AddrSet', 'peerAddress'), @('Script', 'onSwitch'), @('HkPeer', 'hotkeyPeer'), @('HkMe', 'hotkeyMe'), @('FileLimit', 'fileLimitMB'), @('PanicKey', 'panicKey'))) {
     if (-not $ui[$p[0]].IsKeyboardFocused) { $ui[$p[0]].Text = $C[$p[1]] }
   }
-  $ui.RoleText.Text = if ($S.server) { "This PC is the Synergy server. Log: $($S.log)" } elseif ($C.synergyLog -and -not (Test-Path -LiteralPath $C.synergyLog)) { "This file doesn't exist." } else { "This PC is a Synergy client.$(if (-not $C.synergyLog) { " Empty means Synergy 3's log." })" }
+  $ui.RoleText.Text = if ($C.link) { 'Not used: DeskGlide shares the keyboard and mouse itself.' } elseif ($S.server) { "This PC is the Synergy server. Log: $($S.log)" } elseif ($C.synergyLog -and -not (Test-Path -LiteralPath $C.synergyLog)) { "This file doesn't exist." } else { "This PC is a Synergy client.$(if (-not $C.synergyLog) { " Empty means Synergy 3's log." })" }
   $ui.AddrHint.Text = if ($S.addrErr) { $S.addrErr } elseif ($C.peerAddress -and -not $S.fixedIp) { "Can't find $($C.peerAddress) yet." } else { 'Only for PCs on different networks. Filled in once connected.' }
   $ui.AddrHint.Foreground = Brush $(if ($S.addrErr) { 'Bad' } else { 'Fg2' })
 
@@ -1816,7 +1980,8 @@ function Update-Ui {
     $ui.PeerTick.Text = if ($pi) { $tick } else { $wait }; $ui.PeerTick.Foreground = Brush $(if ($pi) { 'Good' } else { 'Fg2' })
     $ui.W3Msg.Text = if ($mi -and $pi) { 'Both inputs learned. The monitor now follows your mouse.' } elseif (-not $mi) { 'Move the mouse to this PC and wait a few seconds.' } else { "Now move the mouse to $peer. If the screen doesn't follow, press the monitor's input button." }
     $hpText = if ($C.hp) { "Headphones: on $(if ($C.hp -eq $Name) { 'this PC' } else { $C.hp })." } else { 'Headphones: not set. Choose them in the Sound card any time.' }
-    $ui.Summary.Text = "$(if ($paired) { "Paired with $peer." } else { 'Not paired yet. Pair in the Pairing card.' })`nMonitor: this PC on $(Input-Name $mi), $peer on $(Input-Name $pi).`n$hpText"
+    $kmText = if ($C.kmHost) { "Keyboard and mouse: plugged into $(if ($C.kmHost -eq $Name) { 'this PC' } else { $C.kmHost }), shared $(if ($C.link) { 'by DeskGlide' } else { 'by Synergy' })." } else { 'Keyboard and mouse: not set. Choose in the Keyboard & mouse card.' }
+    $ui.Summary.Text = "$(if ($paired) { "Paired with $peer." } else { 'Not paired yet. Pair in the Pairing card.' })`n$kmText`nMonitor: this PC on $(Input-Name $mi), $peer on $(Input-Name $pi).`n$hpText"
   }
 }
 
@@ -1882,7 +2047,7 @@ try {
   $udp.EnableBroadcast = $true
   [void]$udp.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null)   # SIO_UDP_CONNRESET off: ignore ICMP "port unreachable"
   [Dg]::StartAudio($AudioPort)
-  $S.msgWin = New-Object MsgWin; Apply-Hotkeys
+  $S.msgWin = New-Object MsgWin; if (-not $Shot) { Apply-Hotkeys }
   [void]$S.msgWin.ListenClipboard(); [Files]::Key = $S.key; [Files]::Serve($Port + 1)   # files: TCP on the control port + 1
   $S.screen = if ($C.screenName) { $C.screenName } else { $Name }
   if ($C.key) { $S.key = [Convert]::FromBase64String($C.key) }
@@ -1910,6 +2075,7 @@ try {
   try { Add-Content -LiteralPath $logPath $msg } catch {}
   if ($Console) { throw } else { [void][Windows.Forms.MessageBox]::Show($msg, 'DeskGlide', 'OK', 'Error') }
 } finally {
+  if ($S.link) { $S.link.Stop() }   # gives the keyboard and mouse back and releases every key
   [Dg]::SendMode = 0; [Dg]::RecvMode = 0
   if ([Dg]::Detached) { [void][Dg]::Reattach() }   # never leave a monitor off the desktop
   if ([Dg]::Muted.Count) { [Dg]::MuteOthers($false, $PID) }
