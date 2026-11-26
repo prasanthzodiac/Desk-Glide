@@ -98,6 +98,29 @@ Both tools dropped file drag-and-drop, so for files use something Windows alread
 - **Nearby sharing** (built into Windows 10 and 11): turn it on under Settings > System > Nearby sharing on both computers. Then right-click a file, choose **Share**, and pick the other computer.
 - **Shared folder:** right-click a folder, choose **Properties > Sharing > Share**, then open it from the other computer as `\\COMPUTER-NAME\FolderName`. Good for files you move every day.
 
+## Hear both computers in one pair of headphones
+
+`deskglide-audio.ps1` sends one computer's sound over your network to the computer your headphones are plugged into. You hear both computers mixed together. There's nothing to install.
+
+1. On the computer **with the headphones**, find its address with `ipconfig` (for example `192.168.1.20`) and run:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\deskglide-audio.ps1 -Receive
+   ```
+   If Windows Firewall asks, allow it on **Private networks**.
+2. On the **other** computer, run:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\deskglide-audio.ps1 -Send 192.168.1.20
+   ```
+3. Play something on the other computer. The receiver prints `receiving from <address>` and you hear it.
+
+Good to know:
+
+- Delay is about 50–100 ms on a wired or home Wi-Fi network: fine for music and video, noticeable in games. For zero delay, a small hardware audio mixer is the better tool.
+- Sound is sent uncompressed (about 1.5 Mbit/s) and **not encrypted**, so use it on your own network only. On the receiver, `-From <sender address>` ignores audio from any other computer.
+- It uses UDP port `6990`. Change it with `-Port` on both computers.
+- It records the sender's default playback device as of when it started. If you change the default device there, restart the sender. If that device is unplugged, it reconnects to the new default by itself.
+- Surround sound is sent as stereo (front left and right only).
+
 ## Options
 
 | Option | Default | What it does |
