@@ -241,6 +241,8 @@ Double-click **Uninstall.cmd**. If admin control is installed, it first removes 
 
 Click **Open log** at the bottom of the window to see what DeskGlide saw and did.
 
+- **An empty terminal window titled "DeskGlide" (5.3.4 and older):** Windows 11 opened DeskGlide's hidden PowerShell in Windows Terminal, and closing that window closed DeskGlide. Since 5.3.5 DeskGlide starts through Windows' hidden console host and fixes its own shortcuts the first time it runs, so update and the window is gone.
+
 - **"Looking for ...":** the PCs can't reach each other. Allow PowerShell through Windows Firewall on Private networks on both, use the same network (not a guest Wi-Fi), or set the other PC's address.
 - **The monitor doesn't switch:** click **Test**. It says whether each monitor answers and which inputs DeskGlide knows. "Not learned yet": show that PC on the monitor once. Wrong input: set `inputOverride`.
 - **"Didn't accept the switch":** turn on DDC/CI in the monitor's menu. Some monitors only accept input changes with the input set to manual rather than auto.

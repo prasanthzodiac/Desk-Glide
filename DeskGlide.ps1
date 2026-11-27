@@ -23,7 +23,7 @@ param(
   [string]$Shot                           # save a screenshot of the window to this .png, then quit
 )
 $ErrorActionPreference = 'Stop'
-$Version = '5.3.4'
+$Version = '5.3.5'
 $Proto = 5   # 'ver' in the state message; DeskGlide 3 sends none, so new features stay off with it; 5 = DeskGlide Link
 $UpdateRepo = 'prasanthzodiac/Desk-Glide'   # 'owner/repo' on GitHub for auto-update (its latest release); empty = no update checks
 if (-not $PeerPort) { $PeerPort = $Port }
@@ -42,14 +42,27 @@ $opp       = @{ left = 'right'; right = 'left'; up = 'down'; down = 'up' }
 $appDir   = Join-Path $DataDir 'app'
 $appFiles = 'DeskGlide.ps1', 'DeskGlide.cs', 'DeskGlideService.cs', 'DeskGlideHelper.cs', 'DeskGlide.ico', 'README.md', 'LICENSE', 'Install.cmd', 'Uninstall.cmd'
 function Arg-Line([string]$ps1) { "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ps1`"" }
+# Started from Explorer (Startup folder, shortcuts), a console program opens in Windows 11's default terminal, which
+# ignores -WindowStyle Hidden: an empty "DeskGlide" window that ends DeskGlide when closed. conhost --headless gives
+# PowerShell a console with no window at all, whatever the default terminal is.
+$hiddenHost = Join-Path $env:windir 'System32\conhost.exe'
+function Hidden-Args([string]$ps1) { "--headless `"$PSHOME\powershell.exe`" $(Arg-Line $ps1)" }
 function Ensure-Icon { if (-not (Test-Path $icoPath)) { [Dg]::SaveIco($icoPath, 0, [int[]](16, 24, 32, 48, 256)) } }
 function New-Lnk([string]$path, [string]$ps1, [string]$extra) {   # a shortcut that runs DeskGlide hidden (a second start only shows the window)
   Ensure-Icon
   $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
-  $sc.TargetPath = "$PSHOME\powershell.exe"; $sc.Arguments = (Arg-Line $ps1) + $extra; $sc.WorkingDirectory = Split-Path $ps1
+  $sc.TargetPath = $hiddenHost; $sc.Arguments = (Hidden-Args $ps1) + $extra; $sc.WorkingDirectory = Split-Path $ps1
   $sc.IconLocation = Join-Path (Split-Path $ps1) 'DeskGlide.ico'; $sc.Description = 'DeskGlide: one keyboard, mouse and monitor for two PCs'; $sc.Save()
 }
 function Set-Startup([bool]$on, [string]$ps1 = $PSCommandPath) { if ($on) { New-Lnk $lnk $ps1 '' } else { Remove-Item $lnk -ErrorAction SilentlyContinue } }
+# Shortcuts from DeskGlide 5.3.4 and older start PowerShell directly (a terminal window on Windows 11). An update only
+# swaps the files, so the installed app re-points its own shortcuts at the hidden host when it starts. Returns how many.
+function Repair-Lnks([string]$ps1 = $PSCommandPath) {
+  $sh = New-Object -ComObject WScript.Shell; $n = 0
+  if ((Test-Path $lnk) -and $sh.CreateShortcut($lnk).TargetPath -ne $hiddenHost) { New-Lnk $lnk $ps1 ''; $n++ }
+  foreach ($l in $appLnks) { if ((Test-Path $l) -and $sh.CreateShortcut($l).TargetPath -ne $hiddenHost) { New-Lnk $l $ps1 ' -ShowWindow'; $n++ } }
+  $n
+}
 $svcName = 'DeskGlideService'; $svcDir = Join-Path $env:ProgramFiles 'DeskGlide'; $svcData = Join-Path $env:ProgramData 'DeskGlide\service'
 function Build-Service([string]$src, [string]$out) {
   $csc = "$env:windir\Microsoft.NET\Framework64\v4.0.30319\csc.exe"; if (-not (Test-Path $csc)) { $csc = "$env:windir\Microsoft.NET\Framework\v4.0.30319\csc.exe" }
@@ -284,7 +297,7 @@ try {
 } catch {
   foreach ($f in $names) { if (Test-Path -LiteralPath (Join-Path $bak $f)) { Copy-Item -LiteralPath (Join-Path $bak $f) (Join-Path $To $f) -Force } }
 }
-if (-not $NoStart) { Start-Process "$PSHOME\powershell.exe" "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $To 'DeskGlide.ps1')`" -ShowWindow" -WindowStyle Hidden }
+if (-not $NoStart) { Start-Process "$env:windir\System32\conhost.exe" "--headless `"$PSHOME\powershell.exe`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $To 'DeskGlide.ps1')`" -ShowWindow" -WindowStyle Hidden }   # no terminal window
 '@
 
 # ---------- edges, for DeskGlide Link (keyboard and mouse sharing, next version) ----------
@@ -987,7 +1000,14 @@ if ($Test) {
   Check ((Arg-Line "$to\DeskGlide.ps1") -eq "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$to\DeskGlide.ps1`"") 'startup arguments'
   Check ($appDir -eq (Join-Path $DataDir 'app')) 'app folder'
   New-Lnk "$to\t.lnk" "$to\DeskGlide.ps1" ' -ShowWindow'; $sc = (New-Object -ComObject WScript.Shell).CreateShortcut("$to\t.lnk")
-  Check ($sc.TargetPath -eq "$PSHOME\powershell.exe" -and $sc.Arguments -eq "$(Arg-Line "$to\DeskGlide.ps1") -ShowWindow" -and $sc.IconLocation -like "$to\DeskGlide.ico*") "app shortcut opens the window: $($sc.Arguments)"
+  Check ($sc.TargetPath -eq $hiddenHost -and $sc.Arguments -eq "$(Hidden-Args "$to\DeskGlide.ps1") -ShowWindow" -and $sc.IconLocation -like "$to\DeskGlide.ico*") "app shortcut opens the window, through the hidden host: $($sc.TargetPath) $($sc.Arguments)"
+  Check ((Test-Path $hiddenHost) -and (Hidden-Args 'x.ps1') -eq "--headless `"$PSHOME\powershell.exe`" $(Arg-Line 'x.ps1')") 'hidden host: conhost --headless runs PowerShell with no window'
+  # an old-style shortcut (PowerShell directly) is repaired; a new one is left alone
+  $lnkKeep = $lnk; $appKeep = $appLnks; $lnk = "$to\startup.lnk"; $appLnks = @("$to\menu.lnk")
+  $o = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk); $o.TargetPath = "$PSHOME\powershell.exe"; $o.Arguments = Arg-Line "$to\DeskGlide.ps1"; $o.Save()
+  $n1 = Repair-Lnks "$to\DeskGlide.ps1"; $n2 = Repair-Lnks "$to\DeskGlide.ps1"
+  Check ($n1 -eq 1 -and $n2 -eq 0 -and (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath -eq $hiddenHost -and -not (Test-Path "$to\menu.lnk")) "old shortcuts repaired once, missing ones not created: $n1 then $n2"
+  $lnk = $lnkKeep; $appLnks = $appKeep
   Check (@($appLnks).Count -eq 2 -and ($appLnks | ? { $_ -like '*\DeskGlide.lnk' }).Count -eq 2) 'app shortcuts: Start menu and Desktop'
   Remove-Item -Recurse $to
 
@@ -1137,7 +1157,7 @@ if ($Install -or $Uninstall) {
   $files | ? { $_ -is [string] -and (Test-Path -LiteralPath $_) } | % { Unblock-File -LiteralPath $_ }
   $app = Join-Path $appDir 'DeskGlide.ps1'
   Set-Startup $true $app; $appLnks | % { New-Lnk $_ $app ' -ShowWindow' }
-  Start-Process "$PSHOME\powershell.exe" "$(Arg-Line $app) -ShowWindow" -WindowStyle Hidden
+  Start-Process $hiddenHost "$(Hidden-Args $app) -ShowWindow" -WindowStyle Hidden
   "DeskGlide is installed in $appDir and running. Its window is open, and its icon is in the taskbar tray. Open it again from the Start menu or the Desktop shortcut."; return
 }
 
@@ -1301,7 +1321,7 @@ function Poll-Update {
   if ($j.Status -ne 'ok') { $S.upd = $null; $S.updMsg = "The update didn't download: $($j.Status -replace '^error: ')"; Say $S.updMsg error; return }
   # downloaded, SHA256 checked and extracted: hand over to the updater and quit
   $updater = Join-Path $DataDir 'update\update.ps1'; [IO.File]::WriteAllText($updater, $updaterText)
-  Start-Process "$PSHOME\powershell.exe" "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$updater`" -Wait $PID -From `"$($u.dir)`" -To `"$PSScriptRoot`" -Files $($appFiles -join ',')" -WindowStyle Hidden
+  Start-Process $hiddenHost "$(Hidden-Args $updater) -Wait $PID -From `"$($u.dir)`" -To `"$PSScriptRoot`" -Files $($appFiles -join ',')" -WindowStyle Hidden
   Say "Installing DeskGlide $($S.newer.ver); it restarts in a moment."
   [Windows.Forms.Application]::Exit()
 }
@@ -2433,6 +2453,7 @@ try {
   if (-not $owned) { [void]$showEvt.Set(); if ($Console) { 'DeskGlide is already running; showing its window.' }; return }
   Set-Content $logPath "DeskGlide $Version started $(Get-Date)$(if ($DryRun) { ' [dry run]' })"
   Save-Config   # writes the upgraded format
+  if ($PSScriptRoot -eq $appDir -and -not $Shot) { try { $fixed = Repair-Lnks; if ($fixed) { Say "Updated $fixed shortcut(s): DeskGlide no longer opens a terminal window." } } catch {} }
   [Dg]::AppId('DeskGlide')
 
   if (-not $Console) {
